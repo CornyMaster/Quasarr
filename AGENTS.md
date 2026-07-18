@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Quasarr connects JDownloader2 with Radarr, Sonarr, Lidarr, and Magazarr. It also decrypts links protected by CAPTCHAs. The primary audience is users who want to run the *arr stack with JDownloader2 instead of a traditional usenet downloader while automating as much of the flow as possible.
+Quasarr connects JDownloader2 with Radarr, Sonarr, Lidarr, and Magazarr. It also handles links protected by CAPTCHAs: protected crypters are solved in the user's browser via Tampermonkey userscripts served by the Quasarr Web UI — Quasarr performs no server-side CAPTCHA solving. The primary audience is users who want to run the *arr stack with JDownloader2 instead of a traditional usenet downloader while automating as much of the flow as possible.
 
 Quasarr acts as the bridge between the *arr apps and JDownloader2 by exposing itself as both a `Newznab Indexer` and a `SABnzbd client`. It is not a real usenet indexer, does not know what NZB files are, and should not be treated as one.
 
@@ -20,7 +20,7 @@ Treat these as the first-class product goals:
 
 - Connecting the *arr stack with JDownloader2
 - Autonomously controlling JDownloader2 to support that integration
-- Handling protected-link and anti-CAPTCHA mechanics so the workflow is as automated as possible
+- Handling protected links via the standardized userscript CAPTCHA flow so the workflow is as automated as possible
 - Supporting related filtering, categorization, and notifications only when they strengthen the core automation flow
 
 `SponsorsHelper` is an optional premium companion for enhanced anti-CAPTCHA automation. It is not the main product and should not be actively advertised beyond a mention in `README.md`.

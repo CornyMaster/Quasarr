@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Receives a grab request from the SABnzbd-emulating API, picks the matching source module, extracts hoster/crypter links, classifies them, and either pushes plain links to JDownloader's linkgrabber, auto-decrypts hide-crypter containers, or parks protected links for the CAPTCHA UI. Also renders the merged JDownloader + DB package state back as a SABnzbd queue/history.
+Receives a grab request from the SABnzbd-emulating API, picks the matching source module, extracts hoster/crypter links, classifies them, and either pushes plain links to JDownloader's linkgrabber, auto-decrypts hide-crypter containers, or parks protected links for the userscript-based CAPTCHA UI. Also renders the merged JDownloader + DB package state back as a SABnzbd queue/history.
 
 ## Ownership
 
@@ -47,4 +47,4 @@ Product-wide policy — do not redesign it; per-source specifics live in the Per
 ## Child DOX Index
 
 - `quasarr/downloads/sources/AGENTS.md` — per-source download plug-in contract (`Source` class, `initials`, `get_download_links`, `DownloadRelease` shape) and shared helpers
-- `quasarr/downloads/linkcrypters/AGENTS.md` — crypter decryption toolkits (hide auto-decrypt, filecrypt CAPTCHA flows, AL solver)
+- `quasarr/downloads/linkcrypters/AGENTS.md` — crypter decryption toolkits (hide auto-decrypt, AL solver)
