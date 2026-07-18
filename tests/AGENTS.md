@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Hermetic unit tests for Quasarr, built exclusively on the standard-library `unittest` framework. Covers download-link extraction, search-source behavior, the filecrypt CAPTCHA/PoW flows, mirror filtering, download orchestration, notifications, SponsorsHelper helpers, release matching, and the SQLite layer.
+Hermetic unit tests for Quasarr, built exclusively on the standard-library `unittest` framework. Covers download-link extraction, search-source behavior, the userscript CAPTCHA routing, mirror filtering, download orchestration, notifications, SponsorsHelper helpers, release matching, and the SQLite layer.
 
 ## Ownership
 

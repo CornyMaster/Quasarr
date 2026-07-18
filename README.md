@@ -2,7 +2,7 @@
 
 <img src="https://raw.githubusercontent.com/rix1337/Quasarr/main/Quasarr.png" data-canonical-src="https://raw.githubusercontent.com/rix1337/Quasarr/main/Quasarr.png" width="64" height="64" />
 
-Quasarr connects JDownloader with Radarr, Sonarr, Lidarr and Magazarr. It also decrypts links protected by
+Quasarr connects JDownloader with Radarr, Sonarr, Lidarr and Magazarr. It also handles links protected by
 CAPTCHAs.
 
 [![PyPI version](https://badge.fury.io/py/quasarr.svg)](https://badge.fury.io/py/quasarr)
@@ -14,9 +14,10 @@ indexers. It simply does not know what NZB files are.
 
 Quasarr includes a solution to quickly and easily decrypt protected links.
 [Active monthly Sponsors get access to SponsorsHelper to do so automatically.](https://github.com/rix1337/Quasarr?tab=readme-ov-file#sponsorshelper)
-Alternatively, follow the link from the console output (or notification) to solve CAPTCHAs manually.
-Quasarr will confidently handle the rest. Some CAPTCHA types require [Tampermonkey](https://www.tampermonkey.net/) to be
-installed in your browser.
+Alternatively, follow the link from the console output (or notification) to solve CAPTCHAs in your browser.
+This requires [Tampermonkey](https://www.tampermonkey.net/) and the matching Quasarr userscript — the CAPTCHA page
+guides you through installing both once. Solve the CAPTCHA on the crypter's own page and the userscript sends the
+links back, so Quasarr can confidently handle the rest.
 
 If a link crypter's CAPTCHAs become temporarily unsolvable, you can disable it under **Web UI → Link Protection**.
 Affected releases then fail so your *arr app grabs an alternative instead of stalling.
@@ -273,9 +274,8 @@ Most feature requests can be satisfied by:
       Development environment setup for pull requests also lives in [CONTRIBUTING.md](CONTRIBUTING.md).
     - Always reach out on Discord before starting work on a new feature to prevent waste of time.
     - Please follow the existing code style and project structure.
-    - Anti-bot measures must be circumvented fully by Quasarr. Thus, you will need to provide a working solution for new
-      CAPTCHA types by integrating it in the Quasarr Web UI.
-      The simplest CAPTCHA bypass involves creating a Tampermonkey user script.
+    - CAPTCHA solving for new link crypters is done via Tampermonkey userscripts. You will need to provide a working
+      userscript that integrates with the Quasarr Web UI's CAPTCHA flow.
     - Please provide proof of functionality (screenshots/examples) when submitting your pull request.
 
 # SponsorsHelper

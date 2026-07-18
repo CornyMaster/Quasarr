@@ -16,7 +16,7 @@ The shared-services layer consumed by every other subsystem: cross-process state
 - `radarr_api.py` / `sonarr_api.py` — minimal clients cached in shared_state via `set_client`/`get_client`; IMDb and free-title lookup, IMDb→TMDB/TVDB resolution (`get_tmdb_id`/`get_tvdb_id`), plus library-feed seeds `get_wanted_imdb_ids` / `get_wanted_episodes` (wanted = missing + cutoff-unmet, missing first, capped at the passed `limit`, paging past filtered entries; the movie helper skips not-yet-released titles and the episode helper skips not-yet-aired ones). All return safe empties when the client is unconfigured.
 - `statistics.py` — DB-backed counters, constructed inline at call sites
 - `version.py` — `__version__`, the single source of version truth
-- `obfuscated.py` — obfuscated userscripts and captcha-service endpoint values; consumed only by `api/captcha`
+- `obfuscated.py` — generated obfuscated userscripts; consumed only by `api/captcha`; regenerated only through the private Quasarr-UserScripts generator repo
 - `cloudflare.py` — challenge detection, thread-safe process-local 24-hour per-netloc FlareSolverr gating, lazy per-operation browser sessions, response wrappers, and get/post/session helpers
 - `html_templates.py` / `html_images.py` — UI page shell, base64 image constants, and language-flag emoji/SVG fallback assets for setup UI
 - `hostname_issues.py` — DB-backed source health tracker (`mark_/clear_/get_hostname_issue`)

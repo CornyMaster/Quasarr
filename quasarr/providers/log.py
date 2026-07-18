@@ -67,7 +67,7 @@ _context_replace = {
     "sponsors_helper": "💖",  # /quasarr/api/sponsors_helper/*
     "downloads": "📥",  # /quasarr/downloads/*
     "linkcrypters": "🔐",  # /quasarr/linkcrypters/*
-    "filecrypt": "🛡️",  # /quasarr/linkcrypters/filecrypt.py
+    "filecrypt": "🛡️",  # /quasarr/storage/setup/filecrypt.py
     "hide": "👻",  # /quasarr/linkcrypters/hide.py
     "packages": "📦",  # /quasarr/api/packages/*
     "providers": "🔌",  # /quasarr/providers/*

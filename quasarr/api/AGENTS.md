@@ -6,7 +6,7 @@ The single Bottle app serving (1) the Newznab-indexer and SABnzbd-client emulati
 
 ## Ownership
 
-Submodules are packages with all code in their `__init__.py`: `arr/` (emulation core), `captcha/` (manual decryption pages, userscript flows, solver proxying), `config/` (settings endpoints), `jdownloader/` (page-fragment helpers, registers no routes), `packages/` (package list UI), `sponsors_helper/`, `statistics/`.
+Submodules are packages with all code in their `__init__.py`: `arr/` (emulation core), `captcha/` (userscript-based CAPTCHA pages and the quick-transfer return path), `config/` (settings endpoints), `jdownloader/` (page-fragment helpers, registers no routes), `packages/` (package list UI), `sponsors_helper/`, `statistics/`.
 
 ## Local Contracts
 
@@ -19,7 +19,8 @@ Submodules are packages with all code in their `__init__.py`: `arr/` (emulation 
 - Client identity comes exclusively from the User-Agent header (`extract_client_type` and the category resolvers in `providers/utils.py`).
 - Every successful CAPTCHA flow ends in `downloads.submit_final_download_urls(..., remove_protected=True, notification_details=...)` and increments the matching `StatsHelper` counters; manual flows identify their solution method and SponsorsHelper passes solver details. Terminal submission failures increment failed counters and update the same tracked release notification. SponsorsHelper disable persists the advanced notification case/silence state so a later manual solution evaluates the next transition correctly.
 - SponsorsHelper routes use trailing slashes; most require an active helper (HTTP 402 otherwise), tracked via `helper_last_seen` with a 300s timeout; `to_decrypt/` only hands out packages matching the helper's advertised `supported_urls`.
-- The external CAPTCHA-solver host and all userscript bodies come only from `quasarr.providers.obfuscated`; source hostnames come only from `Config("Hostnames")` at runtime.
+- All userscript bodies come only from `quasarr.providers.obfuscated`; source hostnames come only from `Config("Hostnames")` at runtime.
+- Every protected crypter (filecrypt, keeplinks, tolink, junkies) is served the same standardized userscript page via `render_userscript_section`; hide auto-decrypts without a page. There is no server-side CAPTCHA solving — the userscript solves on the crypter's own page and returns links through `GET /captcha/quick-transfer` (manual paste via `POST /captcha/bypass-submit` is the only fallback).
 
 ## Work Guidance
 
