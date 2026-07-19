@@ -65,6 +65,15 @@ load_dotenv(override=True)
 
 
 def run():
+    # Start the worker processes the same way on every platform. "fork" hands
+    # children a copy of the parent's memory, including objects bound to the
+    # parent process (file locks, open handles), and Python deprecates forking a
+    # multi-threaded process. macOS and Python 3.14 already default to "spawn";
+    # pinning it keeps Docker on the same, safer path instead of drifting with
+    # the interpreter default. Children re-import from the installed package, so
+    # a slow /config volume does not affect worker startup.
+    multiprocessing.set_start_method("spawn", force=True)
+
     with multiprocessing.Manager() as manager:
         shared_state_dict = manager.dict()
         shared_state_lock = manager.Lock()
