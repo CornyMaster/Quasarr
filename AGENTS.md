@@ -2,13 +2,13 @@
 
 ## Project Overview
 
-Quasarr connects JDownloader2 with Radarr, Sonarr, Lidarr, and Magazarr. It also handles links protected by CAPTCHAs: protected crypters are solved in the user's browser via Tampermonkey userscripts served by the Quasarr Web UI — Quasarr performs no server-side CAPTCHA solving. The primary audience is users who want to run the *arr stack with JDownloader2 instead of a traditional usenet downloader while automating as much of the flow as possible.
+Quasarr connects JDownloader2 with Radarr, Sonarr, Lidarr, and Magazarr. It also handles links protected by CAPTCHAs: protected crypters are solved in the user's browser via Tampermonkey userscripts served by the Quasarr Web UI - Quasarr performs no server-side CAPTCHA solving. The primary audience is users who want to run the *arr stack with JDownloader2 instead of a traditional usenet downloader while automating as much of the flow as possible.
 
 Quasarr acts as the bridge between the *arr apps and JDownloader2 by exposing itself as both a `Newznab Indexer` and a `SABnzbd client`. It is not a real usenet indexer, does not know what NZB files are, and should not be treated as one.
 
 ## Instruction File: AGENTS.md Is Canonical
 
-The AGENTS.md hierarchy — this root file plus the child AGENTS.md files indexed under `# DOX framework` below — is the single source of truth for agent instructions and documentation in this repository. `CLAUDE.md` exists only as a pointer file containing the literal text `@AGENTS.md`, which lets Claude-based toolchains load these instructions through their normal discovery mechanism.
+The AGENTS.md hierarchy - this root file plus the child AGENTS.md files indexed under `# DOX framework` below - is the single source of truth for agent instructions and documentation in this repository. `CLAUDE.md` exists only as a pointer file containing the literal text `@AGENTS.md`, which lets Claude-based toolchains load these instructions through their normal discovery mechanism.
 
 The root `README.md` is meant to introduce the Quasarr project to users. It is not a working reference for agents and should be ignored for planning and implementation unless the task explicitly asks for changes to `README.md` or asks about its content. The root `CONTRIBUTING.md` is the GitHub-facing contributor setup guide; keep it in sync when commands in the Development Workflow section change.
 
@@ -48,7 +48,7 @@ Develop from a source checkout; `uv tool install quasarr` is for end users only.
 - Setup: `uv sync --group dev` (add `--group build` only when build artifacts are needed)
 - Create a local `.env` from `.env.example`; set at least `INTERNAL_ADDRESS` (`EXTERNAL_ADDRESS`, `USER`, `PASS`, `AUTH`, and `TZ` are optional but commonly used locally). On first start Quasarr writes `Quasarr.conf` to store the config path.
 - Run from source: `uv run Quasarr.py`
-- Dev services (JDownloader + flaresolverr-next): `CONFIG_VOLUMES=/path/to/config docker compose -f docker/dev-services-compose.yml up` — `CONFIG_VOLUMES` is mandatory; legacy installations can use `docker-compose -f ...` instead
+- Dev services (JDownloader + flaresolverr-next): `CONFIG_VOLUMES=/path/to/config docker compose -f docker/dev-services-compose.yml up` - `CONFIG_VOLUMES` is mandatory; legacy installations can use `docker-compose -f ...` instead
 - Simulate Radarr/Sonarr/Lidarr/Magazarr against a running instance: `uv run cli_tester.py` (preferred over standing up a full *arr stack)
 - Unit tests: `uv run python -X utf8 -m unittest discover -s tests`
 - Lint: `uv run ruff check .`
@@ -58,7 +58,7 @@ CI enforces the same gate via `uv run pre-commit.py --ci` in `PullRequests.yml`;
 
 ## Commits And Pull Requests
 
-Match the dominant history pattern: a single-line, imperative, capitalized subject with no body — short enough to scan, broad enough to summarize the whole change (do not undersell a multi-file change by naming one small part). No trailing period, no contributor emoji (automated tooling may add one); a trailing `(#123)` reference is fine. Optional prefixes seen in history: `chore:` for maintenance (still describe the main work after the prefix), `chore(deps):` for dependency-only updates, `fix:` (plain `Fix ...` is equally fine — pick one style and keep the subject specific), `refactor:` only for genuine no-behavior-change refactors.
+Match the dominant history pattern: a single-line, imperative, capitalized subject with no body - short enough to scan, broad enough to summarize the whole change (do not undersell a multi-file change by naming one small part). No trailing period, no contributor emoji (automated tooling may add one); a trailing `(#123)` reference is fine. Optional prefixes seen in history: `chore:` for maintenance (still describe the main work after the prefix), `chore(deps):` for dependency-only updates, `fix:` (plain `Fix ...` is equally fine - pick one style and keep the subject specific), `refactor:` only for genuine no-behavior-change refactors.
 
 Add a body only when the subject genuinely cannot carry the change: list only the defining changes in short concrete bullets, and explain why only when it is not obvious from the diff. The PR description, not the commit body, carries the user-visible summary and test plan.
 
@@ -82,7 +82,7 @@ Do not commit real credentials, `.env` files, API keys, or actual source hostnam
 
 Runtime configuration rules:
 
-- Treat configuration as sensitive — webhook URLs and tokens count as credentials; start local setup from `.env.example`.
+- Treat configuration as sensitive - webhook URLs and tokens count as credentials; start local setup from `.env.example`.
 - Source hostnames are always configured by the user at runtime (web UI or hostname import) and live AES-encrypted in the runtime config outside the repository.
 - `INTERNAL_ADDRESS` must be valid for local development and Docker runs. Set `EXTERNAL_ADDRESS`, `USER`, `PASS`, and `AUTH` when exposing the UI beyond a trusted local network.
 - Keep Docker config volumes persistent so generated state survives restarts.
@@ -181,6 +181,6 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Child DOX Index
 
-- `quasarr/AGENTS.md` — application package: layout, entrypoint and constants contracts, cross-cutting Python conventions; indexes the five subsystem docs (`api/`, `downloads/`, `search/`, `providers/`, `storage/`)
-- `tests/AGENTS.md` — unit-test suite: unittest-only contract, hermetic mocking rules, synthetic-hostname rules, exact run command
-- `docker/AGENTS.md` — container build and compose assets: restart-loop ENTRYPOINT contract, end-user and dev compose files
+- `quasarr/AGENTS.md` - application package: layout, entrypoint and constants contracts, cross-cutting Python conventions; indexes the five subsystem docs (`api/`, `downloads/`, `search/`, `providers/`, `storage/`)
+- `tests/AGENTS.md` - unit-test suite: unittest-only contract, hermetic mocking rules, synthetic-hostname rules, exact run command
+- `docker/AGENTS.md` - container build and compose assets: restart-loop ENTRYPOINT contract, end-user and dev compose files

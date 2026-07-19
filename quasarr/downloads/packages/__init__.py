@@ -152,7 +152,7 @@ def get_links_status(package, all_links, is_archive=False):
             break
 
     # Collect link IDs to clean up, but only when a healthy mirror can still
-    # finish the package — otherwise the error path marks the release failed.
+    # finish the package, otherwise the error path marks the release failed.
     # Offline links are removed via JD's DELETE_OFFLINE filter (linkgrabber);
     # not-downloadable and file-error links keep availability "online" / are in
     # the download list, so DELETE_OFFLINE skips them and they are removed by id.
@@ -532,7 +532,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
             # Links can go offline, flip to "Not downloadable!", or hit a file
             # error after auto-start, while they sit in the downloader list. The
             # linkgrabber's DELETE_OFFLINE cleanup never runs here, so remove all
-            # three kinds by id (when a healthy mirror exists) — otherwise the
+            # three kinds by id (when a healthy mirror exists), otherwise the
             # dead link holds the package at all_finished=false forever.
             removable_linkids = (
                 link_details["offline_mirror_linkids"]

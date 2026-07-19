@@ -1,4 +1,4 @@
-# quasarr/providers/sessions/ — Per-Source Sessions
+# quasarr/providers/sessions/ - Per-Source Sessions
 
 ## Purpose
 
@@ -6,14 +6,14 @@ Authenticated `requests.Session` modules for login-required sources. Every new l
 
 ## Ownership
 
-- `al.py` — FlareSolverr-backed session with JSON-envelope expiry; `fetch_via_flaresolverr` / `fetch_via_requests_session` helpers, both re-persisting cookies after each call
-- `dd.py` / `nx.py` — simple login sessions; blank stored credentials on a rejected login
-- `dl.py` — CSRF login flow; its fetch helper re-persists cookies after each call
+- `al.py` - FlareSolverr-backed session with JSON-envelope expiry; `fetch_via_flaresolverr` / `fetch_via_requests_session` helpers, both re-persisting cookies after each call
+- `dd.py` / `nx.py` - simple login sessions; blank stored credentials on a rejected login
+- `dl.py` - CSRF login flow; its fetch helper re-persists cookies after each call
 
 ## Local Contracts
 
 - Module shape: module-level `hostname = "<xx>"` shorthand; `create_and_persist_session(shared_state)` and `retrieve_and_validate_session(shared_state)` returning `requests.Session` or `None` (creating + persisting on miss).
-- Sessions persist as `base64(pickle(Session))` in DB table `sessions`, keyed by shorthand. AL wraps the pickle in a JSON envelope `{token, created_at}` with expiry — changing any serialization format requires that style of invalidate-and-recreate migration.
+- Sessions persist as `base64(pickle(Session))` in DB table `sessions`, keyed by shorthand. AL wraps the pickle in a JSON envelope `{token, created_at}` with expiry - changing any serialization format requires that style of invalidate-and-recreate migration.
 - Guard with `utils.is_site_usable`; call `mark_hostname_issue(hostname, "session", msg)` on failure and `clear_hostname_issue(hostname)` on success.
 
 ## Work Guidance

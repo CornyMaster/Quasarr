@@ -2,7 +2,7 @@
 # Quasarr
 # Project by https://github.com/rix1337
 #
-# MX — download twin.
+# MX: download twin.
 # Original contribution by Riourik (https://github.com/riourik), PR #360.
 
 from quasarr.downloads.mirror_filters import normalize_mirror_token

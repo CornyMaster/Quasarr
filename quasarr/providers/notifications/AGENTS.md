@@ -1,4 +1,4 @@
-# quasarr/providers/notifications/ — Notifications
+# quasarr/providers/notifications/ - Notifications
 
 ## Purpose
 
@@ -10,7 +10,7 @@ Multi-provider user notifications (Discord webhook, Telegram bot) with a single 
 
 ## Local Contracts
 
-- For sending product notifications, callers use `send_notification(shared_state, title, case, imdb_id=, details=, source=)` plus the `NotificationType` enum for `case`; it reads `shared_state.values["notification_settings"]` (refreshed by `storage/setup/notifications.py`) and fans out to providers independently — provider failures are isolated, and it returns True if any provider succeeded. Known exceptions to that funnel: `storage/setup/notifications.py` (the settings UI/test flow) calls `build_notification_message` and the provider `send`/`inspect_destination` functions directly, and `api/__init__.py` imports the notification-type label helpers.
+- For sending product notifications, callers use `send_notification(shared_state, title, case, imdb_id=, details=, source=)` plus the `NotificationType` enum for `case`; it reads `shared_state.values["notification_settings"]` (refreshed by `storage/setup/notifications.py`) and fans out to providers independently - provider failures are isolated, and it returns True if any provider succeeded. Known exceptions to that funnel: `storage/setup/notifications.py` (the settings UI/test flow) calls `build_notification_message` and the provider `send`/`inspect_destination` functions directly, and `api/__init__.py` imports the notification-type label helpers.
 - Adding a notification type = new `NotificationType` enum value + label in `notification_types.py` + branch in `message_builder.build_notification_message`.
 - Adding a provider = `AbstractNotificationFormatter` subclass implementing the four `render_*` methods + `send(shared_state, message, silent) -> bool` + wiring in `__init__.send_notification` + adding it to `NOTIFICATION_PROVIDERS` in `quasarr/constants/__init__.py` + credential fields, validation, and toggle/silent defaults in `storage/setup/notifications.py`.
 - Message dataclasses are frozen; entries are passed as tuples.

@@ -13,7 +13,7 @@ Locking contract:
   instances per logical operation if cross-process freshness matters.
 - Lock order: the config lock may be held while acquiring the
   database lock (via `_get_encryption_params` -> `DataBase`). Never
-  the reverse — see `sqlite_database.py`.
+  the reverse. See `sqlite_database.py`.
 - Methods that mutate `self._config` from disk must replace it with a
   fresh `RawConfigParser()` before reading; `configparser.read()`
   merges rather than replaces, so deletions by other processes would

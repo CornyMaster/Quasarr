@@ -14,7 +14,7 @@ Locking contract:
   not inherit the parent's lock.
 - Lock order: the database lock is always the *inner* lock when
   both config and database locks are involved. Never call into
-  `quasarr.storage.config` from inside a DataBase method — that
+  `quasarr.storage.config` from inside a DataBase method, because that
   would invert the order and risks AB-BA deadlock across processes.
 """
 

@@ -99,7 +99,7 @@ def send_notification(
     """
     Send a notification to all configured providers (Discord, Telegram).
 
-    Each provider is attempted independently — a failure in one does not block others.
+    Each provider is attempted independently. A failure in one does not block others.
 
     :param shared_state: Shared state object containing configuration.
     :param title: Title of the notification.

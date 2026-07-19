@@ -112,7 +112,7 @@ def get_wanted_imdb_ids(shared_state, limit=50):
     """Return IMDb IDs of monitored movies Radarr wants as a list.
 
     Covers both missing movies (no file) and cutoff-unmet ones (present but
-    below the quality cutoff), missing first, capped at ``limit`` — so a huge
+    below the quality cutoff), missing first, capped at ``limit``, so a huge
     monitored library does not translate into a huge number of feed lookups.
     Movies not yet released to cinemas are skipped; pages are walked (bounded by
     ``_WANTED_MAX_PAGES``) so a wanted list front-loaded with announced titles

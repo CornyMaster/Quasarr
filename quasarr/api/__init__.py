@@ -389,7 +389,7 @@ def get_api(shared_state_dict, shared_state_lock):
                         </div>
                     </div>
                     <p class="api-hint setting-row-hint">
-                        Disable while filecrypt CAPTCHAs are unsolvable — affected releases fail so *arr grabs an alternative. Applies to new grabs only.
+                        Disable while filecrypt CAPTCHAs are unsolvable. Affected releases fail so *arr grabs an alternative. Applies to new grabs only.
                     </p>
                     <div id="filecrypt-status" class="notification-status"></div>
                     <p>{render_button("Save Filecrypt Setting", "primary", {"onclick": "saveFilecryptSettings()", "type": "button", "id": "filecryptSaveBtn"})}</p>
