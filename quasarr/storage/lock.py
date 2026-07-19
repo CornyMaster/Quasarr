@@ -13,15 +13,19 @@ _locks_guard = threading.Lock()
 
 
 class ProcessLocalFileLock:
-    """FileLock handle that rebuilds its instance after a fork.
+    """FileLock handle that rebuilds its instance per process.
 
-    `quasarr/__init__.py` forks its worker processes after the storage modules
-    are imported, so the `FileLock` created at import time is inherited by every
-    child. filelock refuses to acquire an inherited instance
-    ("was inherited across fork; construct a new instance"), which killed the
-    forked workers. Resolving the instance per PID keeps the module-level
-    `lock = get_lock(...)` bindings valid in parent and children alike, while a
-    process that keeps reusing its own instance keeps filelock's reentrancy.
+    Cross-process exclusion is NOT weakened by this. It never came from sharing
+    one `FileLock` object: it comes from the OS lock on the lock FILE, which
+    every process opens by the same path. A per-process instance is what
+    filelock itself requires - it refuses to acquire an instance created in
+    another process ("was inherited across fork; construct a new instance"),
+    which is what killed the workers when they inherited the import-time
+    instance. Resolving per PID keeps the module-level `lock = get_lock(...)`
+    bindings valid everywhere, while a process reusing its own instance keeps
+    filelock's reentrancy for nested `@with_lock` calls.
+
+    `test_separate_processes_still_exclude_each_other` pins the guarantee.
     """
 
     def __init__(self, lock_file):
