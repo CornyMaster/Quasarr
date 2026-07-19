@@ -1,4 +1,4 @@
-# quasarr/downloads/ — Download Side
+# quasarr/downloads/ - Download Side
 
 ## Purpose
 
@@ -6,10 +6,10 @@ Receives a grab request from the SABnzbd-emulating API, picks the matching sourc
 
 ## Ownership
 
-- `__init__.py` — orchestrator: source selection, link classification, package IDs, the `submit_final_download_urls()` funnel, `fail()` bookkeeping
-- `mirror_filters.py` — canonical mirror-token normalization and the final pre-JDownloader whitelist filter
-- `packages/` — SABnzbd-shaped queue/history aggregation, archive/extraction tracking, auto-start, deletion
-- `sources/` and `linkcrypters/` — see Child DOX Index
+- `__init__.py` - orchestrator: source selection, link classification, package IDs, the `submit_final_download_urls()` funnel, `fail()` bookkeeping
+- `mirror_filters.py` - canonical mirror-token normalization and the final pre-JDownloader whitelist filter
+- `packages/` - SABnzbd-shaped queue/history aggregation, archive/extraction tracking, auto-start, deletion
+- `sources/` and `linkcrypters/` - see Child DOX Index
 
 ## Local Contracts
 
@@ -26,12 +26,12 @@ Receives a grab request from the SABnzbd-emulating API, picks the matching sourc
 
 ### Mirror-Selection Policy
 
-Product-wide policy — do not redesign it; per-source specifics live in the Per-Source Notes of `quasarr/downloads/sources/AGENTS.md`.
+Product-wide policy - do not redesign it; per-source specifics live in the Per-Source Notes of `quasarr/downloads/sources/AGENTS.md`.
 
 - HARD RULE: Quasarr never verifies whether a direct hoster link is online and never fetches a hoster URL to probe liveness. Resolving and verifying hoster links is JDownloader's job (paid, hoster-specific handling Quasarr cannot and should not replicate). Never add a tier that fetches a direct hoster URL to test it.
-- Selection picks the best link set from the source's own signals only. Tier 1: online-certified crypted container, cheapest crypter first — a green hide container (auto-resolves, no CAPTCHA) before a green filecrypt container (may cost a CAPTCHA). Tier 2: direct links carrying a green signal — best effort only, because the signal really certifies the container. Tier 3 (last resort): the first offline-flagged mirror, so the release still fails cleanly into the blacklist-and-retry path.
+- Selection picks the best link set from the source's own signals only. Tier 1: online-certified crypted container, cheapest crypter first - a green hide container (auto-resolves, no CAPTCHA) before a green filecrypt container (may cost a CAPTCHA). Tier 2: direct links carrying a green signal - best effort only, because the signal really certifies the container. Tier 3 (last resort): the first offline-flagged mirror, so the release still fails cleanly into the blacklist-and-retry path.
 - If a source exposes no online signal at all: newest mirror first (when recency is known), then first/arbitrary mirror.
-- A link that turns out dead is not a selection bug; it is absorbed by the *arr blacklist-and-retry flow. Rationale (measured on WX): direct links agree with their container ~95% of the time; the trade is deliberate — an online download that costs a CAPTCHA beats a fast download that is dead.
+- A link that turns out dead is not a selection bug; it is absorbed by the *arr blacklist-and-retry flow. Rationale (measured on WX): direct links agree with their container ~95% of the time; the trade is deliberate - an online download that costs a CAPTCHA beats a fast download that is dead.
 - A human manually clicking a still-online link will always beat the automated choice for a single release; that is not a signal Quasarr can generalize from and not a reason to start probing links.
 
 ## Work Guidance
@@ -46,5 +46,5 @@ Product-wide policy — do not redesign it; per-source specifics live in the Per
 
 ## Child DOX Index
 
-- `quasarr/downloads/sources/AGENTS.md` — per-source download plug-in contract (`Source` class, `initials`, `get_download_links`, `DownloadRelease` shape) and shared helpers
-- `quasarr/downloads/linkcrypters/AGENTS.md` — crypter decryption toolkits (hide auto-decrypt, AL solver)
+- `quasarr/downloads/sources/AGENTS.md` - per-source download plug-in contract (`Source` class, `initials`, `get_download_links`, `DownloadRelease` shape) and shared helpers
+- `quasarr/downloads/linkcrypters/AGENTS.md` - crypter decryption toolkits (hide auto-decrypt, AL solver)

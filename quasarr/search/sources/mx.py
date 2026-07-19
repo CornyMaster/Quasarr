@@ -2,7 +2,7 @@
 # Quasarr
 # Project by https://github.com/rix1337
 #
-# MX — French DDL source.
+# MX: French DDL source.
 # Original contribution by Riourik (https://github.com/riourik), PR #360.
 #
 # Flow (IMDb-driven):
@@ -307,7 +307,7 @@ class Source(AbstractSearchSource):
         base_cat = get_base_search_category_id(search_category)
         if base_cat == SEARCH_CAT_MOVIES:
             if radarr_api.get_client(shared_state) is None:
-                warn("[mx] movie feed needs Radarr configured — skipping")
+                warn("[mx] movie feed needs Radarr configured, skipping")
                 return []
             seeds = [
                 (imdb_id, None, None)
@@ -317,7 +317,7 @@ class Source(AbstractSearchSource):
             ]
         elif base_cat == SEARCH_CAT_SHOWS:
             if sonarr_api.get_client(shared_state) is None:
-                warn("[mx] show feed needs Sonarr configured — skipping")
+                warn("[mx] show feed needs Sonarr configured, skipping")
                 return []
             seeds = [
                 (ep["imdb_id"], ep["season"], ep["episode"])
@@ -359,7 +359,7 @@ class Source(AbstractSearchSource):
             )
             warn(f"[mx] feed: all {failures} lookups failed")
 
-        debug(f"[mx] feed: {len(releases)} releases — {time.time() - start_time:.2f}s")
+        debug(f"[mx] feed: {len(releases)} releases in {time.time() - start_time:.2f}s")
         return releases
 
     def search(
@@ -399,7 +399,7 @@ class Source(AbstractSearchSource):
             warn(f"[mx] search error: {e}")
 
         debug(
-            f"[mx] {len(releases)} releases for {imdb_id} — "
+            f"[mx] {len(releases)} releases for {imdb_id} in "
             f"{time.time() - start_time:.2f}s"
         )
         return releases

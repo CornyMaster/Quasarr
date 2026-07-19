@@ -354,7 +354,7 @@ def _derive_mirror(url):
 def _extract_season_from_synonyms(soup):
     """
     Returns the first season found as "Season N" in the Synonym(s) <td>, or None.
-    Only scans the synonyms cell—no fallback to whole document.
+    Only scans the synonyms cell, no fallback to whole document.
     """
     syn_td = None
     for tr in soup.select("tr"):

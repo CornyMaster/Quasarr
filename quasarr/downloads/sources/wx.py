@@ -27,7 +27,7 @@ def _collect_online_direct_links(release, mirrors, shared_state):
     'links' field (plain hoster URLs, no crypter/CAPTCHA needed).
 
     Uses the same filecrypt status badges (options.check) that WX itself uses
-    to display green/red status on their site — identical to the crypted-links
+    to display green/red status on their site, identical to the crypted-links
     path. HEAD-probing the hoster URLs directly is unreliable: premium hosters
     return HTTP 200 (or redirect to a login page that also resolves 200) for
     deleted files, making every mirror look online regardless of actual state.
@@ -51,7 +51,7 @@ def _collect_online_direct_links(release, mirrors, shared_state):
         if not clean:
             continue
 
-        # All parts for the same hoster share one badge — probe once, apply to all.
+        # All parts for the same hoster share one badge, so probe once and apply to all.
         status_url = check_urls.get(hoster)
         for u in clean:
             links_with_status.append([u, hoster, status_url])

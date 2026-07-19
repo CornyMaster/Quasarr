@@ -13,7 +13,7 @@ Locking contract:
   instances per logical operation if cross-process freshness matters.
 - Lock order: the config lock may be held while acquiring the
   database lock (via `_get_encryption_params` -> `DataBase`). Never
-  the reverse — see `sqlite_database.py`.
+  the reverse. See `sqlite_database.py`.
 - Methods that mutate `self._config` from disk must replace it with a
   fresh `RawConfigParser()` before reading; `configparser.read()`
   merges rather than replaces, so deletions by other processes would
@@ -31,7 +31,7 @@ from Cryptodome.Random import get_random_bytes
 from Cryptodome.Util.Padding import pad
 
 from quasarr.providers import shared_state
-from quasarr.providers.log import info, warn
+from quasarr.providers.log import error, info, warn
 from quasarr.search.sources.helpers import get_hostnames
 from quasarr.storage.lock import get_lock, with_lock
 from quasarr.storage.sqlite_database import DataBase
@@ -239,9 +239,25 @@ class Config(object):
             if value.startswith("secret|"):
                 crypt_key, crypt_iv = self._get_encryption_params()
                 cipher = AES.new(crypt_key, AES.MODE_CBC, crypt_iv)
-                decrypted_payload = (
-                    cipher.decrypt(base64.b64decode(value[7:])).decode("utf-8").strip()
-                )
+                try:
+                    decrypted_payload = (
+                        cipher.decrypt(base64.b64decode(value[7:]))
+                        .decode("utf-8")
+                        .strip()
+                    )
+                except Exception as e:
+                    # The key lives in Quasarr.db, so an ini restored without its
+                    # matching database decrypts to garbage. Report it as unset
+                    # instead of raising: setup then asks for the value again,
+                    # rather than the process dying in the Docker restart loop.
+                    # The stored ciphertext is left untouched so restoring the
+                    # right Quasarr.db still recovers the value.
+                    error(
+                        f'Could not decrypt "{key}" in section "{self._section}" of Quasarr.ini: {e}. '
+                        "It was encrypted with a different Quasarr.db. Restore the Quasarr.db that "
+                        "belongs to this Quasarr.ini, or set the value again in the Web UI."
+                    )
+                    return ""
                 final_payload = "".join(
                     filter(lambda c: c in string.printable, decrypted_payload)
                 )

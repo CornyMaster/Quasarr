@@ -7,12 +7,14 @@ Locking contract:
 - Every public method takes the module-level `lock`, including
   `__init__` (which can create the table on first use) and
   `maintain` (which runs PRAGMA / VACUUM).
-- The lock is reentrant on the cached `FileLock` instance returned
-  by `get_lock("database")`, so nested calls in the same process
-  (e.g. `__init__` then `retrieve`) do not self-deadlock.
+- The lock is reentrant on the per-process `FileLock` instance behind
+  the handle returned by `get_lock("database")`, so nested calls in the
+  same process (e.g. `__init__` then `retrieve`) do not self-deadlock.
+  The handle rebuilds that instance after a fork, so forked workers do
+  not inherit the parent's lock.
 - Lock order: the database lock is always the *inner* lock when
   both config and database locks are involved. Never call into
-  `quasarr.storage.config` from inside a DataBase method — that
+  `quasarr.storage.config` from inside a DataBase method, because that
   would invert the order and risks AB-BA deadlock across processes.
 """
 

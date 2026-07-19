@@ -15,7 +15,7 @@ indexers. It simply does not know what NZB files are.
 Quasarr includes a solution to quickly and easily decrypt protected links.
 [Active monthly Sponsors get access to SponsorsHelper to do so automatically.](https://github.com/rix1337/Quasarr?tab=readme-ov-file#sponsorshelper)
 Alternatively, follow the link from the console output (or notification) to solve CAPTCHAs in your browser.
-This requires [Tampermonkey](https://www.tampermonkey.net/) and the matching Quasarr userscript — the CAPTCHA page
+This requires [Tampermonkey](https://www.tampermonkey.net/) and the matching Quasarr userscript. The CAPTCHA page
 guides you through installing both once. Solve the CAPTCHA on the crypter's own page and the userscript sends the
 links back, so Quasarr can confidently handle the rest.
 
@@ -38,7 +38,7 @@ Affected releases then fail so your *arr app grabs an alternative instead of sta
 > ⚠️ Quasarr requires at least one valid hostname to start. It does not provide or endorse any specific sources, but
 > community-maintained lists are available:
 
-🔗 **[https://quasarr-hostnames.pages.dev](https://quasarr-hostnames.pages.dev)** — community guide for finding hostnames
+🔗 **[https://quasarr-hostnames.pages.dev](https://quasarr-hostnames.pages.dev)**: community guide for finding hostnames
 
 📋 Alternatively, browse community suggestions via [pastebin search](https://pastebin.com/search?q=hostnames+quasarr) (
 login required).
@@ -234,16 +234,16 @@ Configure notifications in **Web UI → Notifications Configuration**:
 <details>
 <summary>Configure Telegram Bot</summary>
 
-1. **Create a bot** — Open Telegram and search for [@BotFather](https://t.me/BotFather). Send `/newbot` and follow the prompts to choose a name and username for your bot.
-2. **Copy the token** — BotFather will reply with an HTTP API token (e.g. `123456789:ABCdefGHI...`). This is your `TELEGRAM_BOT_TOKEN`.
-3. **Start a chat with the bot** — Open a chat with your new bot and send any message (e.g. `/start`). This is required so the bot can send messages back to you.
-4. **Get your chat ID** — Open the following URL in a browser (replace `<TOKEN>` with your bot token):
+1. **Create a bot**: Open Telegram and search for [@BotFather](https://t.me/BotFather). Send `/newbot` and follow the prompts to choose a name and username for your bot.
+2. **Copy the token**: BotFather will reply with an HTTP API token (e.g. `123456789:ABCdefGHI...`). This is your `TELEGRAM_BOT_TOKEN`.
+3. **Start a chat with the bot**: Open a chat with your new bot and send any message (e.g. `/start`). This is required so the bot can send messages back to you.
+4. **Get your chat ID**: Open the following URL in a browser (replace `<TOKEN>` with your bot token):
    ```
    https://api.telegram.org/bot<TOKEN>/getUpdates
    ```
    Look for `"chat":{"id":` in the JSON response. That number is your `TELEGRAM_CHAT_ID`.
    > **Tip:** For a group chat, add the bot to the group first, send a message in the group, then call `getUpdates`.
-5. **Configure Quasarr** — Open **Notifications** in Quasarr UI.
+5. **Configure Quasarr**: Open **Notifications** in Quasarr UI.
 6. Paste both values into **Telegram → Bot Token / Chat ID**.
 7. Click **Save Notification Settings** and then **Send Telegram Test**.
   

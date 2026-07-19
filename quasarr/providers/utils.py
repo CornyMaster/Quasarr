@@ -1036,7 +1036,7 @@ def match_in_title(title: str, season: int = None, episode: int = None) -> bool:
             if not e_start:
                 return True
             else:
-                # title did specify an episode — skip this match
+                # title did specify an episode, so skip this match
                 continue
 
         # episode was requested, so title must supply one
@@ -1348,7 +1348,7 @@ def is_valid_release(
         if is_xxx_search:
             return True
 
-        # unknown search source — reject by default
+        # unknown search source, so reject by default
         debug(f"Skipping {title!r} as search category is unknown: {search_category!r}")
         return False
 

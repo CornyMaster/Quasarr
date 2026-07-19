@@ -49,7 +49,7 @@ class WxDirectLinksTests(unittest.TestCase):
         """
         online_badge_urls: set of badge URLs that should be considered green/online.
         When None, no badge checking is performed (all hosters without a badge URL
-        are treated as online — mirrors the check_links_online_status contract).
+        are treated as online, mirroring the check_links_online_status contract).
         """
 
         def fake_session_get(url, **kwargs):
@@ -61,7 +61,7 @@ class WxDirectLinksTests(unittest.TestCase):
             """
             Simulate check_links_online_status using badge URL presence as the
             online/offline signal.  Mirrors that have no badge URL (status_url
-            is None) are always included — matching the real implementation's
+            is None) are always included, matching the real implementation's
             conservative contract.
             """
             if online_badge_urls is None:
@@ -313,7 +313,7 @@ class WxDirectLinksTests(unittest.TestCase):
 
     def test_best_mirror_with_most_online_hosters_wins(self):
         """
-        M1 has 1 hoster, M2 has 2 hosters — M2 should be selected.
+        M1 has 1 hoster, M2 has 2 hosters, so M2 should be selected.
         Without badge URLs (options.check empty), all hosters are treated as
         online; hoster count alone decides the winner.
         """
