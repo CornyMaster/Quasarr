@@ -18,13 +18,21 @@ Locking contract:
   fresh `RawConfigParser()` before reading; `configparser.read()`
   merges rather than replaces, so deletions by other processes would
   otherwise be reverted on writeback.
+- All ini writes go through `_write_ini_atomically` (temp file +
+  `os.replace`). The lock serializes read-modify-write between
+  processes; the atomic replace guarantees no observer, including a
+  process killed mid-write or a reader outside the lock, ever sees a
+  truncated Quasarr.ini.
 """
 
 import base64
 import configparser
+import contextlib
+import os
 import re
 import shutil
 import string
+import tempfile
 
 from Cryptodome.Cipher import AES
 from Cryptodome.Random import get_random_bytes
@@ -37,6 +45,34 @@ from quasarr.storage.lock import get_lock, with_lock
 from quasarr.storage.sqlite_database import DataBase
 
 lock = get_lock("config")
+
+
+def _write_ini_atomically(configfile, config):
+    """Replace the ini in one step instead of truncating it in place.
+
+    `open(path, "w")` empties the file before the new content lands, so a
+    process killed inside that window leaves a truncated Quasarr.ini and any
+    reader outside the file lock can observe one. Writing to a sibling temp
+    file and `os.replace()`-ing it in guarantees every observer sees either
+    the complete old or the complete new file; the file lock still serializes
+    the read-modify-write itself.
+    """
+    directory = os.path.dirname(os.path.abspath(configfile))
+    fd, tmp_path = tempfile.mkstemp(prefix=".Quasarr.ini.", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            config.write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(tmp_path, os.stat(configfile).st_mode)
+        except OSError:
+            pass  # first write: no existing file to copy permissions from
+        os.replace(tmp_path, configfile)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
 
 
 class Config(object):
@@ -101,8 +137,7 @@ class Config(object):
         for key, _key_type, value in self._DEFAULT_CONFIG[section]:
             self._config.set(section, key, value)
 
-        with open(self._configfile, "w") as configfile:
-            self._config.write(configfile)
+        _write_ini_atomically(self._configfile, self._config)
 
     @classmethod
     def _get_supported_keys(cls, section):
@@ -154,8 +189,7 @@ class Config(object):
                 config.remove_option(section, key)
 
         try:
-            with open(configfile, "w") as config_handle:
-                config.write(config_handle)
+            _write_ini_atomically(configfile, config)
 
             verify_config = configparser.RawConfigParser()
             verify_config.read(configfile)
@@ -219,8 +253,7 @@ class Config(object):
         ]
 
     def _write_config(self):
-        with open(self._configfile, "w") as configfile:
-            self._config.write(configfile)
+        _write_ini_atomically(self._configfile, self._config)
 
     def _get_from_config(self, scope, key):
         res = [param[2] for param in scope if param[0] == key]
