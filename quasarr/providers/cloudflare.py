@@ -99,7 +99,15 @@ class LazyFlareSolverrSession:
         self.shared_state = shared_state
         self.session_id = None
 
-    def get(self, url, headers, timeout, request_get=requests.get):
+    def get(
+        self,
+        url,
+        headers,
+        timeout,
+        request_get=requests.get,
+        document_start_js=None,
+        execute_js=None,
+    ):
         if not _is_cloudflare_gated(url):
             response = request_get(url, headers=headers, timeout=timeout)
             if response.status_code != 403 and not is_cloudflare_challenge(
@@ -132,11 +140,19 @@ class LazyFlareSolverrSession:
         # caller's HTTP budget for the initial request, but never give an
         # actual FlareSolverr solve less than the existing session budget.
         solver_timeout = max(timeout, SESSION_REQUEST_TIMEOUT_SECONDS)
+        # Only forward the flaresolverr-next JS extras when a caller asked for them,
+        # so existing call sites (and their test doubles) keep the original signature.
+        extra_js = {}
+        if document_start_js:
+            extra_js["document_start_js"] = document_start_js
+        if execute_js:
+            extra_js["execute_js"] = execute_js
         response = flaresolverr_get(
             self.shared_state,
             url,
             timeout=solver_timeout,
             session_id=self.session_id,
+            **extra_js,
         )
         if (
             response is None
@@ -293,12 +309,15 @@ class FlareSolverrResponse:
     Minimal Response-like object so it behaves like requests.Response.
     """
 
-    def __init__(self, url, status_code, headers, text):
+    def __init__(self, url, status_code, headers, text, execute_js_result=None):
         self.url = url
         self.status_code = status_code
         self.headers = headers or {}
         self.text = text or ""
         self.content = self.text.encode("utf-8")
+        # flaresolverr-next: result string of an optional executeJs snippet, or None
+        # when none was requested / the FlareSolverr build does not support it.
+        self.execute_js_result = execute_js_result
 
         # Cloudflare cookies are irrelevant here, but keep attribute for compatibility
         self.cookies = requests.cookies.RequestsCookieJar()
@@ -322,10 +341,17 @@ def flaresolverr_get(
     url,
     timeout=None,
     session_id=None,
+    document_start_js=None,
+    execute_js=None,
 ):
     """
     Core function for performing a GET request via FlareSolverr only.
     Used internally by FlareSolverrSession.get()
+
+    ``document_start_js`` / ``execute_js`` are flaresolverr-next extras: JS run at
+    document start on every (redirect) document, and JS run once on the solved page
+    whose string result is returned as ``FlareSolverrResponse.execute_js_result``.
+    FlareSolverr builds without support simply ignore them.
 
     Returns None if FlareSolverr is not available.
     """
@@ -345,6 +371,10 @@ def flaresolverr_get(
     payload = {"cmd": "request.get", "url": url, "maxTimeout": timeout * 1000}
     if session_id:
         payload["session"] = session_id
+    if document_start_js:
+        payload["documentStartJs"] = document_start_js
+    if execute_js:
+        payload["executeJs"] = execute_js
 
     try:
         resp = requests.post(
@@ -376,7 +406,11 @@ def flaresolverr_get(
         shared_state.update("user_agent", user_agent)
 
     return FlareSolverrResponse(
-        url=url, status_code=status_code, headers=fs_headers, text=html
+        url=url,
+        status_code=status_code,
+        headers=fs_headers,
+        text=html,
+        execute_js_result=solution.get("executeJsResult"),
     )
 
 

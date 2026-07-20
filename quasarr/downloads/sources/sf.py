@@ -4,17 +4,16 @@
 
 import re
 from datetime import datetime
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
 from quasarr.constants import DOWNLOAD_REQUEST_TIMEOUT_SECONDS
 from quasarr.downloads.sources.helpers.abstract_source import AbstractDownloadSource
+from quasarr.downloads.sources.helpers.redirect import resolve_crypter_redirect
 from quasarr.providers.cloudflare import LazyFlareSolverrSession
 from quasarr.providers.hostname_issues import mark_hostname_issue
 from quasarr.providers.log import debug, info, warn
-from quasarr.providers.utils import detect_crypter_type
 
 
 class Source(AbstractDownloadSource):
@@ -291,71 +290,10 @@ def _is_last_section_integer(url):
 
 
 def _resolve_sf_redirect(url, user_agent, cf_session):
-    """Resolve manually until blocked, then let the shared browser session follow."""
-    current_url = url
-    visited = set()
-    session = requests.Session()
+    """Resolve manually until blocked, then let the shared browser session follow.
 
-    for _hop in range(8):
-        if current_url in visited:
-            debug(f"SF redirect loop detected for {current_url}")
-            return None
-        visited.add(current_url)
-
-        if detect_crypter_type(current_url) is not None:
-            return current_url
-
-        try:
-            r = cf_session.get(
-                current_url,
-                {"User-Agent": user_agent},
-                DOWNLOAD_REQUEST_TIMEOUT_SECONDS,
-                request_get=lambda request_url, headers, timeout: session.get(
-                    request_url,
-                    allow_redirects=False,
-                    timeout=timeout,
-                    headers=headers,
-                ),
-            )
-        except Exception as e:
-            warn(f"Error fetching redirected URL for {url}: {e}")
-            mark_hostname_issue(
-                Source.initials,
-                "download",
-                str(e) if "e" in dir() else "Download error",
-            )
-            return None
-
-        location = (r.headers.get("Location") or "").strip()
-        if location:
-            next_url = urljoin(current_url, location)
-            debug(f"Redirected from <d>{current_url}</d> to <d>{next_url}</d>")
-            if "/404.html" in next_url:
-                warn(f"Link redirected to 404 page: <d>{next_url}</d>")
-                return None
-            current_url = next_url
-            continue
-
-        final_url = (r.url or current_url).strip()
-        if "/404.html" in final_url:
-            warn(f"Link redirected to 404 page: <d>{final_url}</d>")
-            return None
-        if r.status_code >= 400:
-            warn(
-                f"Error fetching redirected URL for {url}: HTTP {r.status_code} at {final_url}"
-            )
-            mark_hostname_issue(
-                Source.initials,
-                "download",
-                f"HTTP {r.status_code} while resolving redirect",
-            )
-            return None
-        if detect_crypter_type(final_url) is not None:
-            return final_url
-        warn(
-            f"Blocked attempt to resolve {url}. Your IP may be banned. Try again later."
-        )
-        return None
-
-    debug(f"SF redirect hop limit exceeded for {url}")
-    return None
+    SF only publishes crypter containers, so off-site final URLs are not accepted.
+    """
+    return resolve_crypter_redirect(
+        url, user_agent, cf_session, Source.initials, accept_offsite=False
+    )
