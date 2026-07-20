@@ -11,6 +11,7 @@ from quasarr.constants import (
 )
 from quasarr.providers.imdb_metadata import (
     IMDbHTML,
+    _localized_titles_from_arr_record,
     get_imdb_id_from_title,
     get_imdb_metadata,
     get_localized_title,
@@ -289,6 +290,96 @@ class IMDbMetadataTests(unittest.TestCase):
         self.assertEqual("Synthetic German Alternate", title)
         radarr.movie_lookup_imdb.assert_called_once_with("tt0000014")
         html_lookup.assert_not_called()
+
+    def test_cold_arr_english_original_title_skips_html_lookup(self):
+        radarr = MagicMock()
+        radarr.movie_lookup_imdb.return_value = {
+            "title": "Synthetischer Anzeigetitel",
+            "year": 2035,
+            "originalTitle": "Synthetic Original Movie",
+            "originalLanguage": {"id": 1, "name": "English"},
+            "alternateTitles": [{"sourceType": "tmdb", "title": "Unlabelled Guess"}],
+        }
+        state = FakeSharedState(radarr=radarr)
+
+        with patch.object(IMDbHTML, "get_localized_title") as html_lookup:
+            title = get_localized_title(state, "tt0000017", "en", SEARCH_CAT_MOVIES)
+
+        # The instance's localized display title must not be used for en - only
+        # the language-proven originalTitle qualifies.
+        self.assertEqual("Synthetic Original Movie", title)
+        html_lookup.assert_not_called()
+
+    def test_cold_sonarr_english_original_seeds_en_from_title(self):
+        radarr = MagicMock()
+        sonarr = MagicMock()
+        sonarr.series_lookup_imdb.return_value = {
+            "title": "Synthetic Series Title",
+            "year": 2036,
+            "originalLanguage": {"id": 1, "name": "English"},
+        }
+        state = FakeSharedState(radarr=radarr, sonarr=sonarr)
+
+        with patch.object(IMDbHTML, "get_localized_title") as html_lookup:
+            title = get_localized_title(state, "tt0000018", "en", SEARCH_CAT_SHOWS)
+
+        # Sonarr's AlternateTitleResource has no originalTitle, so title is used.
+        self.assertEqual("Synthetic Series Title", title)
+        html_lookup.assert_not_called()
+
+    def test_cold_arr_non_english_original_falls_back_to_html_for_en(self):
+        radarr = MagicMock()
+        radarr.movie_lookup_imdb.return_value = {
+            "title": "Synthetic Anime",
+            "year": 2037,
+            "originalTitle": "Synthetic Original Anime",
+            "originalLanguage": {"id": 8, "name": "Japanese"},
+        }
+        state = FakeSharedState(radarr=radarr)
+
+        with patch.object(
+            IMDbHTML,
+            "get_localized_title",
+            return_value="Synthetic English Anime Title",
+        ) as html_lookup:
+            title = get_localized_title(state, "tt0000019", "en", SEARCH_CAT_MOVIES)
+
+        self.assertEqual("Synthetic English Anime Title", title)
+        html_lookup.assert_called_once_with("tt0000019", "en")
+
+    def test_arr_original_language_seeds_matching_code_only(self):
+        record = {
+            "title": "Synthetic Anime",
+            "year": 2037,
+            "originalTitle": "Synthetic Original Anime",
+            "originalLanguage": {"id": 8, "name": "Japanese"},
+        }
+
+        self.assertEqual(
+            {"ja": "Synthetic Original Anime"},
+            _localized_titles_from_arr_record(record),
+        )
+        self.assertEqual({}, _localized_titles_from_arr_record({"title": "No Lang"}))
+        self.assertEqual(
+            {"de": "Synthetischer Originaltitel"},
+            _localized_titles_from_arr_record(
+                {
+                    "title": "Synthetic Display Title",
+                    "originalTitle": "Synthetischer Originaltitel",
+                    "originalLanguage": {"id": 4, "name": "German"},
+                }
+            ),
+        )
+        self.assertEqual(
+            {"fr": "Titre Original Synthetique"},
+            _localized_titles_from_arr_record(
+                {
+                    "title": "Synthetic Display Title",
+                    "originalTitle": "Titre Original Synthetique",
+                    "originalLanguage": {"id": 2, "name": "French"},
+                }
+            ),
+        )
 
     def test_cold_movie_localized_title_uses_only_radarr_for_base_metadata(self):
         radarr = MagicMock()
@@ -573,6 +664,14 @@ class IMDbMetadataTests(unittest.TestCase):
 
         request.assert_called_once_with(
             "https://www.imdb.com/de/title/tt0000015/releaseinfo/", "de"
+        )
+
+    def test_html_lookup_en_uses_unprefixed_default_path(self):
+        with patch.object(IMDbHTML, "_request", return_value=None) as request:
+            self.assertIsNone(IMDbHTML.get_localized_title("tt0000016", "en"))
+
+        request.assert_called_once_with(
+            "https://www.imdb.com/title/tt0000016/releaseinfo/", "en"
         )
 
     def test_html_request_sets_explicit_locale_and_crawler_user_agent(self):

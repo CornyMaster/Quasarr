@@ -362,7 +362,11 @@ class IMDbHTML:
         # The locale-specific HTML metadata is primary. The parser retains an
         # AKA-section fallback for older or browser-rendered responses.
         language = language.lower()
-        url = f"{IMDbHTML._WEB_URL}/{language}/title/{imdb_id}/releaseinfo/"
+        if language == "en":
+            # IMDb serves English at the unprefixed default path and 404s on /en/.
+            url = f"{IMDbHTML._WEB_URL}/title/{imdb_id}/releaseinfo/"
+        else:
+            url = f"{IMDbHTML._WEB_URL}/{language}/title/{imdb_id}/releaseinfo/"
         html_content = IMDbHTML._request(url, language)
 
         if html_content:
@@ -447,6 +451,25 @@ def _localized_titles_from_arr_record(record):
         title = TitleCleaner.sanitize(alternate.get("title"))
         if title:
             localized.setdefault(language.lower(), title)
+
+    # Arr alternate titles carry no language codes, but the original-language
+    # title is language-proven even when the instance localizes its display title.
+    original_language = record.get("originalLanguage")
+    language_name = (
+        original_language.get("name") if isinstance(original_language, dict) else None
+    )
+    code = (
+        IMDbHTML._LANGUAGE_CODES_BY_NAME.get(language_name.lower())
+        if isinstance(language_name, str)
+        else None
+    )
+    if code:
+        original_title = TitleCleaner.sanitize(
+            record.get("originalTitle") or record.get("title")
+        )
+        if original_title:
+            localized.setdefault(code, original_title)
+
     return localized
 
 
