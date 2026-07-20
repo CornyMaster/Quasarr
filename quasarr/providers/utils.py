@@ -331,6 +331,44 @@ def detect_crypter_type(url):
     return None
 
 
+# flaresolverr-next: recorded at document start on every (redirect) document the
+# solver browser renders, appending each URL to window.name (which survives
+# cross-origin navigation). This lets a caller read the full chain the browser
+# walked instead of only its final URL - so when a source's link-protection
+# redirect passes through a crypter container and a hostile ad then pushes the tab
+# onto an affiliate page (Quasarr#419: aliexpress), we can still recover the crypter
+# and ignore everything after it. Builds without documentStartJs support ignore it
+# and the chain is simply unavailable (callers fall back to their header/URL logic).
+NAVIGATION_CHAIN_RECORDER_JS = (
+    "try{var c=[];try{c=JSON.parse(window.name||'[]');}catch(e){c=[];}"
+    "if(!Array.isArray(c))c=[];c.push(location.href);"
+    "window.name=JSON.stringify(c);}catch(e){}"
+)
+NAVIGATION_CHAIN_READ_JS = "return window.name;"
+
+
+def first_crypter_in_chain(execute_js_result):
+    """Return the first crypter URL in a recorded navigation chain, or None.
+
+    ``execute_js_result`` is the JSON string produced by
+    ``NAVIGATION_CHAIN_READ_JS`` (the browser's ordered list of visited URLs). The
+    first entry whose ``detect_crypter_type`` is not None is the real container link;
+    anything after it (e.g. a hostile ad redirect) is ignored. Returns None when no
+    chain is available (non-browser resolution / FlareSolverr build without support)
+    or no crypter was walked, so callers keep their existing behavior.
+    """
+    try:
+        chain = json.loads(execute_js_result) if execute_js_result else []
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(chain, list):
+        return None
+    for hop_url in chain:
+        if isinstance(hop_url, str) and detect_crypter_type(hop_url) is not None:
+            return hop_url
+    return None
+
+
 def image_has_green(image_data):
     """
     Analyze image data to check if it contains green pixels.

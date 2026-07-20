@@ -258,7 +258,8 @@ class FfSourceTests(unittest.TestCase):
             ) as create_session,
             patch("quasarr.providers.cloudflare.flaresolverr_get") as flaresolverr_get,
             patch(
-                "quasarr.downloads.sources.ff.detect_crypter_type", return_value=None
+                "quasarr.downloads.sources.helpers.redirect.detect_crypter_type",
+                return_value=None,
             ),
         ):
             result = FfDownloadSource().get_download_links(
@@ -614,7 +615,7 @@ class FfSfCloudflareTests(unittest.TestCase):
                 redirect_urls.append((url, allow_redirects))
                 return FakeResponse(url, text=challenge, status_code=403)
 
-        def solved_get(shared_state, url, timeout=None, session_id=None):
+        def solved_get(shared_state, url, timeout=None, session_id=None, **kwargs):
             if url == release_url:
                 body = release_html
                 final_url = url
@@ -650,7 +651,7 @@ class FfSfCloudflareTests(unittest.TestCase):
                 "quasarr.providers.cloudflare.flaresolverr_destroy_session"
             ) as destroy_session,
             patch(
-                "quasarr.downloads.sources.ff.detect_crypter_type",
+                "quasarr.downloads.sources.helpers.redirect.detect_crypter_type",
                 side_effect=lambda url: "filecrypt" if url == protected_url else None,
             ),
         ):
@@ -697,7 +698,7 @@ class FfSfCloudflareTests(unittest.TestCase):
                 redirect_urls.append((url, allow_redirects))
                 return FakeResponse(url, text=challenge, status_code=403)
 
-        def solved_get(shared_state, url, timeout=None, session_id=None):
+        def solved_get(shared_state, url, timeout=None, session_id=None, **kwargs):
             if url == release_url:
                 body = release_html
                 final_url = url
@@ -733,7 +734,7 @@ class FfSfCloudflareTests(unittest.TestCase):
                 "quasarr.providers.cloudflare.flaresolverr_destroy_session"
             ) as destroy_session,
             patch(
-                "quasarr.downloads.sources.sf.detect_crypter_type",
+                "quasarr.downloads.sources.helpers.redirect.detect_crypter_type",
                 side_effect=lambda url: "filecrypt" if url == protected_url else None,
             ),
         ):
@@ -792,6 +793,81 @@ class FfSfCloudflareTests(unittest.TestCase):
 
         self.assertEqual([], result)
         destroy_session.assert_called_once_with(ANY, "failed-session")
+
+
+class NavigationChainResolutionTests(unittest.TestCase):
+    """Quasarr#419: when the solver browser follows a link-protection redirect past
+    the real crypter container into a hostile ad, resolution must return the crypter
+    (recovered from the recorded navigation chain), never the ad page."""
+
+    def test_first_crypter_in_chain_picks_crypter_and_ignores_ad(self):
+        from quasarr.providers.utils import first_crypter_in_chain
+
+        crypter = "https://filecrypt.invalid/Container/ABC.html"
+        chain = json.dumps(
+            [
+                "https://host-ff.invalid/external/x",
+                crypter,
+                "https://www.aliexpress.com/p/popular-landing/aliexpress.html",
+            ]
+        )
+        self.assertEqual(crypter, first_crypter_in_chain(chain))
+        # No crypter walked -> None (caller keeps its own logic).
+        self.assertIsNone(
+            first_crypter_in_chain(
+                json.dumps(
+                    ["https://host-ff.invalid/x", "https://www.aliexpress.com/ad"]
+                )
+            )
+        )
+        # No chain available (non-browser resolution / unsupported build).
+        self.assertIsNone(first_crypter_in_chain(None))
+        self.assertIsNone(first_crypter_in_chain("not-json"))
+
+    def test_browser_chain_yields_crypter_not_ad(self):
+        from quasarr.downloads.sources.helpers.redirect import (
+            resolve_crypter_redirect,
+        )
+
+        crypter = "https://filecrypt.invalid/Container/ABC.html"
+        chain = json.dumps(
+            [
+                "https://host-ff.invalid/external/x",
+                crypter,
+                "https://www.aliexpress.com/p/popular-landing/aliexpress.html",
+            ]
+        )
+
+        class CfSession:
+            # Mimics the solver-browser branch: reports the ad as its final URL, but
+            # exposes the recorded chain that walked through the crypter first.
+            def get(
+                self,
+                url,
+                headers,
+                timeout,
+                request_get=None,
+                document_start_js=None,
+                execute_js=None,
+            ):
+                return FlareSolverrResponse(
+                    url="https://www.aliexpress.com/p/popular-landing/aliexpress.html",
+                    status_code=200,
+                    headers={},
+                    text="ad page",
+                    execute_js_result=chain,
+                )
+
+        for accept_offsite in (True, False):
+            resolved = resolve_crypter_redirect(
+                "https://host-ff.invalid/external/x",
+                "UnitTestAgent/1.0",
+                CfSession(),
+                "ff",
+                host="host-ff.invalid",
+                accept_offsite=accept_offsite,
+            )
+            self.assertEqual(crypter, resolved)
 
 
 if __name__ == "__main__":

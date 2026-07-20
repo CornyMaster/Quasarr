@@ -327,7 +327,7 @@ class ProtectedRedirectSourceTests(unittest.TestCase):
             ) as create_session,
             patch("quasarr.providers.cloudflare.flaresolverr_get") as flaresolverr_get,
             patch(
-                "quasarr.downloads.sources.sf.detect_crypter_type",
+                "quasarr.downloads.sources.helpers.redirect.detect_crypter_type",
                 side_effect=lambda url: "filecrypt" if url == protected_url else None,
             ),
         ):
@@ -373,7 +373,7 @@ class ProtectedRedirectSourceTests(unittest.TestCase):
                 return_value=FakeSession(),
             ),
             patch(
-                "quasarr.downloads.sources.sf.detect_crypter_type",
+                "quasarr.downloads.sources.helpers.redirect.detect_crypter_type",
                 return_value=None,
             ),
         ):
@@ -773,7 +773,7 @@ class ProtectedRedirectDownloadTests(unittest.TestCase):
                     return_value=FakeSession(),
                 ),
                 patch(
-                    "quasarr.downloads.sources.sf.detect_crypter_type",
+                    "quasarr.downloads.sources.helpers.redirect.detect_crypter_type",
                     side_effect=lambda url: (
                         "filecrypt" if url == protected_url else None
                     ),
