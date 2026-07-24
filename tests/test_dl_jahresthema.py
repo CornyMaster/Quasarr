@@ -3,6 +3,7 @@
 import unittest
 from datetime import date, datetime
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -409,6 +410,21 @@ class DlJahresthemaSearchTests(unittest.TestCase):
 
         titles = [release["details"]["title"] for release in releases]
 
+        # The annual parent is discovery-only: without a post fragment, the
+        # downloader would scan from the oldest archive post.
+        self.assertNotIn(
+            f"Sample.Magazine.Jahresthema.{current_year}",
+            titles,
+        )
+        self.assertTrue(
+            all(
+                urlsplit(release["details"]["source"]).fragment
+                for release in releases
+                if f"jahresthema-{current_year}.2" in release["details"]["source"]
+            )
+        )
+        # Standalone issue threads keep their legacy unfragmented path.
+        self.assertIn("Sample.Magazine.Issue.001", titles)
         self.assertIn(f"Sample.Magazine.Issue.3.{current_year}", titles)
         self.assertIn(f"Sample.Magazine.Issue.7.{current_year}", titles)
         self.assertNotIn(f"Sample.Magazine.Issue.2.{current_year}", titles)

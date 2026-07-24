@@ -345,6 +345,22 @@ class Source(AbstractSearchSource):
                     password = ""
                     source_url = date_release.get("source", thread_url)
 
+                    if _is_current_year_jahresthema_thread(
+                        title, match_search_string, base_search_category
+                    ):
+                        page_releases.extend(
+                            _expand_jahresthema_thread_releases(
+                                shared_state,
+                                host,
+                                thread_url,
+                                match_search_string,
+                                imdb_id,
+                                self.initials,
+                                search_category,
+                            )
+                        )
+                        continue
+
                     link = generate_download_link(
                         shared_state,
                         title_normalized,
@@ -369,21 +385,6 @@ class Source(AbstractSearchSource):
                             "type": "protected",
                         }
                     )
-
-                    if _is_current_year_jahresthema_thread(
-                        title, match_search_string, base_search_category
-                    ):
-                        page_releases.extend(
-                            _expand_jahresthema_thread_releases(
-                                shared_state,
-                                host,
-                                thread_url,
-                                match_search_string,
-                                imdb_id,
-                                self.initials,
-                                search_category,
-                            )
-                        )
 
                 except Exception as e:
                     debug(f"[Page {page_num}] error parsing item: {e}")
