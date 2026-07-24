@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from unittest import mock
 
 from quasarr.api.sponsors_helper import (
     normalize_helper_supported_urls,
@@ -95,6 +96,77 @@ class SponsorsHelperApiTests(unittest.TestCase):
         ]
 
         self.assertIsNone(select_helper_package(protected_packages, ["container."]))
+
+    def test_select_helper_package_orders_links_by_mirror_whitelist(self):
+        protected_packages = [
+            (
+                "Quasarr_movies_hash",
+                json.dumps(
+                    {
+                        "title": "Example.Release",
+                        "links": [
+                            ["https://a.invalid/1", "ddownload"],
+                            ["https://b.invalid/2", "rapidgator"],
+                            ["https://c.invalid/3", "turbobit"],
+                        ],
+                        "password": "",
+                    }
+                ),
+            )
+        ]
+
+        with (
+            mock.patch(
+                "quasarr.api.sponsors_helper.get_download_category_from_package_id",
+                return_value="movies",
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.get_download_category_mirrors",
+                return_value=["turbobit", "rapidgator"],
+            ),
+        ):
+            _, _, prioritized_links = select_helper_package(protected_packages, [])
+
+        # Whitelist order is the ranking; unlisted mirrors keep their order last.
+        self.assertEqual(
+            ["turbobit", "rapidgator", "ddownload"],
+            [link[1] for link in prioritized_links],
+        )
+
+    def test_select_helper_package_falls_back_to_rapidgator_first(self):
+        protected_packages = [
+            (
+                "Quasarr_movies_hash",
+                json.dumps(
+                    {
+                        "title": "Example.Release",
+                        "links": [
+                            ["https://a.invalid/1", "ddownload"],
+                            ["https://b.invalid/2", "rapidgator"],
+                        ],
+                        "password": "",
+                    }
+                ),
+            )
+        ]
+
+        with (
+            mock.patch(
+                "quasarr.api.sponsors_helper.get_download_category_from_package_id",
+                return_value="movies",
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.get_download_category_mirrors",
+                return_value=[],
+            ),
+        ):
+            _, _, prioritized_links = select_helper_package(protected_packages, [])
+
+        # No whitelist configured: legacy rapidgator-first default is preserved.
+        self.assertEqual(
+            ["rapidgator", "ddownload"],
+            [link[1] for link in prioritized_links],
+        )
 
 
 if __name__ == "__main__":

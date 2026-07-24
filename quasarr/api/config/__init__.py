@@ -596,6 +596,115 @@ def setup_config(app, shared_state):
                 background-color: var(--success-color);
                 border-color: var(--success-color);
             }}
+            .mirror-hint {{
+                margin: 0.75rem 0 0.6rem;
+                font-size: 0.85rem;
+                line-height: 1.45;
+                color: var(--text-muted);
+            }}
+            .mirrors-sortable {{
+                display: flex;
+                flex-direction: column;
+                gap: 0.35rem;
+                margin-top: 0.25rem;
+            }}
+            .mirror-row {{
+                display: flex;
+                align-items: center;
+                gap: 0.6rem;
+                padding: 0 0.55rem;
+                border: 1px solid var(--border-color);
+                border-radius: 0.6rem;
+                background: var(--card-bg);
+                min-height: 2.9rem;
+                transition: background-color 0.15s ease, border-color 0.15s ease;
+            }}
+            .mirror-row:not(.selected) {{
+                color: var(--text-muted);
+            }}
+            .mirror-row:not(.selected):hover {{
+                border-color: var(--primary);
+            }}
+            .mirror-row.selected {{
+                background-color: var(--primary);
+                color: #fff;
+                border-color: var(--primary);
+            }}
+            .mirror-row.tier1.selected {{
+                background-color: var(--success-color);
+                border-color: var(--success-color);
+            }}
+            .mirror-rank {{
+                flex: 0 0 auto;
+                width: 1.7rem;
+                height: 1.7rem;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                border-radius: 50%;
+                font-size: 0.8rem;
+                font-weight: 700;
+                line-height: 1;
+                background: rgba(255, 255, 255, 0.28);
+                color: #fff;
+            }}
+            .mirror-row:not(.selected) .mirror-rank {{
+                visibility: hidden;
+            }}
+            .mirror-row-label {{
+                display: flex;
+                align-items: center;
+                gap: 0.45rem;
+                flex: 1;
+                align-self: stretch;
+                min-width: 0;
+                padding: 0.4rem 0;
+                margin: 0;
+                cursor: pointer;
+                user-select: none;
+                font-size: 0.95rem;
+                font-weight: 600;
+                line-height: 1.3;
+            }}
+            .mirror-label {{
+                min-width: 0;
+                overflow-wrap: anywhere;
+            }}
+            .mirror-star {{
+                flex: 0 0 auto;
+                font-weight: 400;
+                line-height: 1;
+            }}
+            .mirror-move {{
+                display: flex;
+                align-items: center;
+                gap: 0.25rem;
+                flex: 0 0 auto;
+            }}
+            .mirror-row:not(.selected) .mirror-move {{
+                visibility: hidden;
+            }}
+            .mirror-move-btn {{
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                width: 2.2rem;
+                height: 2.2rem;
+                border: none;
+                border-radius: 0.45rem;
+                background: rgba(255, 255, 255, 0.22);
+                cursor: pointer;
+                font-size: 1rem;
+                line-height: 1;
+                padding: 0;
+                margin: 0;
+            }}
+            .mirror-move-btn:hover {{
+                background: rgba(255, 255, 255, 0.4);
+            }}
+            .mirror-move-btn:active {{
+                transform: translateY(1px);
+            }}
             .mirror-checkbox, .search-source-checkbox {{
                 display: none;
             }}
@@ -684,35 +793,82 @@ def setup_config(app, shared_state):
         }}
 
         function editCategory(name, currentMirrors) {{
-            let pills = '';
-            ALL_HOSTERS.forEach(hoster => {{
+            // Enabled mirrors first, in their saved priority order, then the rest.
+            const selected = currentMirrors.filter(m => ALL_HOSTERS.includes(m));
+            const unselected = ALL_HOSTERS.filter(h => !selected.includes(h));
+            const ordered = selected.concat(unselected);
+
+            let rows = '';
+            ordered.forEach(hoster => {{
                 const isChecked = currentMirrors.includes(hoster);
                 const isTier1 = TIER1_HOSTERS.includes(hoster);
                 const tierClass = isTier1 ? 'tier1' : '';
                 const selectedClass = isChecked ? 'selected' : '';
-                const star = isTier1 ? '⭐ ' : '';
-                
-                pills += '<label class="mirror-pill ' + tierClass + ' ' + selectedClass + '" onclick="this.classList.toggle(\\'selected\\')">' +
-                         '<input type="checkbox" class="mirror-checkbox" value="' + hoster + '" ' + (isChecked ? 'checked' : '') + ' onchange="this.parentElement.classList.toggle(\\'selected\\', this.checked)">' +
-                         star + hoster +
-                         '</label>';
+                const star = isTier1 ? '<span class="mirror-star">⭐</span>' : '';
+
+                rows += '<div class="mirror-row ' + tierClass + ' ' + selectedClass + '">' +
+                        '<span class="mirror-rank"></span>' +
+                        '<label class="mirror-row-label">' +
+                        '<input type="checkbox" class="mirror-checkbox" value="' + hoster + '" ' + (isChecked ? 'checked' : '') + ' onchange="reflowMirrors()">' +
+                        star +
+                        '<span class="mirror-label">' + hoster + '</span>' +
+                        '</label>' +
+                        '<span class="mirror-move">' +
+                        '<button type="button" class="mirror-move-btn" onclick="moveMirror(this, -1)" aria-label="Move up" title="Move up">⬆️</button>' +
+                        '<button type="button" class="mirror-move-btn" onclick="moveMirror(this, 1)" aria-label="Move down" title="Move down">⬇️</button>' +
+                        '</span>' +
+                        '</div>';
             }});
 
-            const content = '<h4>Mirror-Whitelist:</h4>' +
-                            '<div class="warning-box">' +
-                            '<strong>⚠️ Warning:</strong><br>This does not affect search results.<br>' +
-                            'If specific mirrors are set, downloads will fail unless the release contains them.' +
-                            '<br><br>' +
-                            '<strong>Only starred mirrors (⭐) are recommended.</strong>' +
+            const content = '<div class="warning-box">' +
+                            '<strong>⚠️ Heads up:</strong> the mirror-whitelist only affects downloads, not search. ' +
+                            'If you enable specific mirrors, a release must include one of them or its download fails.' +
                             '</div>' +
-                            '<div class="mirrors-grid">' +
-                            pills +
+                            '<p class="mirror-hint">' +
+                            'Tap a mirror to enable it. Enabled mirrors move to the top and form a priority list. ' +
+                            'The topmost found mirror is auto-decrypted. Use ⬆️ / ⬇️ to reorder. ⭐ marks recommended mirrors.' +
+                            '</p>' +
+                            '<div class="mirrors-sortable" id="mirrorSortable">' +
+                            rows +
                             '</div>';
-            
-            showModal('Edit Download Category: ' + name, content, 
+
+            showModal('Edit Download Category: ' + name, content,
                 '<button class="btn-secondary" onclick="closeModal()">Cancel</button>' +
                 '<button class="btn-primary" onclick="performEditCategory(\\'' + name + '\\')">Save</button>'
             );
+            reflowMirrors();
+        }}
+
+        function reflowMirrors() {{
+            const parent = document.getElementById('mirrorSortable');
+            if (!parent) return;
+            const rows = Array.from(parent.children);
+            const isOn = row => row.querySelector('.mirror-checkbox').checked;
+            // Stable partition: enabled rows on top (keep their order), disabled below.
+            const enabled = rows.filter(isOn);
+            const disabled = rows.filter(row => !isOn(row));
+            enabled.concat(disabled).forEach(row => parent.appendChild(row));
+            rows.forEach(row => row.classList.toggle('selected', isOn(row)));
+            enabled.forEach((row, i) => {{
+                row.querySelector('.mirror-rank').textContent = (i + 1);
+            }});
+            disabled.forEach(row => {{
+                row.querySelector('.mirror-rank').textContent = '';
+            }});
+        }}
+
+        function moveMirror(btn, dir) {{
+            const row = btn.closest('.mirror-row');
+            if (!row) return;
+            // Step one position, staying inside the enabled (ranked) group.
+            const sibling = dir < 0 ? row.previousElementSibling : row.nextElementSibling;
+            if (!sibling || !sibling.querySelector('.mirror-checkbox').checked) return;
+            if (dir < 0) {{
+                row.parentNode.insertBefore(row, sibling);
+            }} else {{
+                row.parentNode.insertBefore(sibling, row);
+            }}
+            reflowMirrors();
         }}
 
         function editSearchCategory(catId, name, currentSearchSources, baseCategoryId) {{
