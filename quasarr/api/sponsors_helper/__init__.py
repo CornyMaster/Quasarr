@@ -115,9 +115,35 @@ def select_helper_package(protected_packages, supported_url_patterns):
         if not isinstance(raw_links, list) or not raw_links:
             continue
 
-        rapid = [ln for ln in raw_links if is_rapidgator_link(ln)]
-        others = [ln for ln in raw_links if not is_rapidgator_link(ln)]
-        prioritized_links = rapid + others
+        # Order links by the category's mirror-whitelist: the whitelist order is
+        # the priority ranking. Without an explicit whitelist, fall back to the
+        # legacy rapidgator-first default.
+        mirror_priority = []
+        try:
+            category = get_download_category_from_package_id(package[0])
+            mirror_priority = get_download_category_mirrors(category, lowercase=True)
+        except Exception:
+            mirror_priority = []
+
+        if mirror_priority:
+
+            def mirror_rank(link, mirror_priority=mirror_priority):
+                if isinstance(link, (list, tuple)) and len(link) > 1 and link[1]:
+                    haystack = str(link[1]).lower()
+                elif isinstance(link, (list, tuple)) and link:
+                    haystack = str(link[0]).lower()
+                else:
+                    haystack = str(link).lower()
+                for index, mirror in enumerate(mirror_priority):
+                    if mirror and mirror in haystack:
+                        return index
+                return len(mirror_priority)
+
+            prioritized_links = sorted(raw_links, key=mirror_rank)
+        else:
+            rapid = [ln for ln in raw_links if is_rapidgator_link(ln)]
+            others = [ln for ln in raw_links if not is_rapidgator_link(ln)]
+            prioritized_links = rapid + others
 
         prioritized_links, supported_links = prioritize_helper_supported_links(
             prioritized_links,

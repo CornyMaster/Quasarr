@@ -17,6 +17,10 @@ from quasarr.providers.auth import public_endpoint
 from quasarr.providers.html_templates import render_button, render_centered_html
 from quasarr.providers.log import debug, error, info, trace
 from quasarr.providers.statistics import StatsHelper
+from quasarr.storage.categories import (
+    get_download_category_from_package_id,
+    get_download_category_mirrors,
+)
 from quasarr.storage.config import Config
 
 
@@ -84,10 +88,36 @@ def setup_captcha_routes(app):
 
             original_url = data.get("original_url")
 
-            # Prefer rapidgator mirrors when picking the link to open first
-            rapid = [ln for ln in links if "rapidgator" in ln[1].lower()]
-            others = [ln for ln in links if "rapidgator" not in ln[1].lower()]
-            prioritized_links = rapid + others
+            # Order the links to open by the category's mirror-whitelist:
+            # the whitelist order is the priority ranking. Without an explicit
+            # whitelist, fall back to the legacy rapidgator-first default.
+            mirror_priority = []
+            try:
+                category = get_download_category_from_package_id(package_id)
+                mirror_priority = get_download_category_mirrors(
+                    category, lowercase=True
+                )
+            except Exception:
+                mirror_priority = []
+            if mirror_priority:
+
+                def mirror_rank(link):
+                    if isinstance(link, (list, tuple)) and len(link) > 1 and link[1]:
+                        haystack = str(link[1]).lower()
+                    elif isinstance(link, (list, tuple)) and link:
+                        haystack = str(link[0]).lower()
+                    else:
+                        haystack = str(link).lower()
+                    for index, mirror in enumerate(mirror_priority):
+                        if mirror and mirror in haystack:
+                            return index
+                    return len(mirror_priority)
+
+                prioritized_links = sorted(links, key=mirror_rank)
+            else:
+                rapid = [ln for ln in links if "rapidgator" in ln[1].lower()]
+                others = [ln for ln in links if "rapidgator" not in ln[1].lower()]
+                prioritized_links = rapid + others
 
             payload = {
                 "package_id": package_id,
