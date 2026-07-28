@@ -6,7 +6,7 @@ import json
 import time
 from functools import wraps
 
-from bottle import abort, request
+from bottle import HTTPResponse, abort, request
 
 from quasarr.downloads import fail, submit_final_download_urls
 from quasarr.providers import shared_state
@@ -169,21 +169,6 @@ def setup_sponsors_helper_routes(app):
             return None
         return data if isinstance(data, dict) else None
 
-    def get_supported_urls_from_request():
-        payload = request.json if request.method == "POST" else None
-        if isinstance(payload, dict) and "supported_urls" in payload:
-            return normalize_helper_supported_urls(payload.get("supported_urls"))
-
-        query_values = request.query.getall("supported_url")
-        if query_values:
-            return normalize_helper_supported_urls(query_values)
-
-        query_csv = request.query.get("supported_urls")
-        if query_csv:
-            return normalize_helper_supported_urls(query_csv.split(","))
-
-        return []
-
     def extract_failure_reason(data, default_reason=None):
         if not isinstance(data, dict):
             return default_reason
@@ -247,7 +232,6 @@ def setup_sponsors_helper_routes(app):
         mirrors = get_download_category_mirrors(category)
         return {"mirrors": mirrors}
 
-    @app.get("/sponsors_helper/api/to_decrypt/")
     @app.post("/sponsors_helper/api/to_decrypt/")
     @require_api_key
     def to_decrypt_api():
@@ -258,7 +242,15 @@ def setup_sponsors_helper_routes(app):
             if not protected:
                 return abort(404, "No encrypted packages found")
 
-            supported_url_patterns = get_supported_urls_from_request()
+            payload = request.json
+            if not isinstance(payload, dict) or "supported_urls" not in payload:
+                return abort(400, "Missing supported_urls")
+
+            supported_url_patterns = normalize_helper_supported_urls(
+                payload["supported_urls"]
+            )
+            if not supported_url_patterns:
+                return abort(400, "Missing supported_urls")
 
             # Issue #350: only hand SponsorsHelper packages where at least one URL
             # matches the helper's advertised support, and move that URL to the front.
@@ -282,6 +274,8 @@ def setup_sponsors_helper_routes(app):
                     "max_attempts": 3,
                 }
             }
+        except HTTPResponse:
+            raise
         except Exception as e:
             return abort(500, str(e))
 
