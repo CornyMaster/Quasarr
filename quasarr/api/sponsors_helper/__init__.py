@@ -61,6 +61,10 @@ def normalize_helper_supported_urls(url_patterns):
     return normalized_patterns
 
 
+def normalize_helper_supported_mirrors(mirrors):
+    return normalize_helper_supported_urls(mirrors)
+
+
 def extract_helper_candidate_url(link):
     if isinstance(link, (list, tuple)) and link:
         candidate = link[0]
@@ -73,6 +77,12 @@ def extract_helper_candidate_url(link):
     return candidate.strip()
 
 
+def extract_helper_candidate_mirror(link):
+    if isinstance(link, (list, tuple)) and len(link) > 1 and isinstance(link[1], str):
+        return link[1].strip().lower()
+    return ""
+
+
 def is_rapidgator_link(link):
     if isinstance(link, (list, tuple)) and len(link) > 1:
         mirror_name = link[1]
@@ -82,12 +92,15 @@ def is_rapidgator_link(link):
     return "rapidgator" in extract_helper_candidate_url(link).lower()
 
 
-def prioritize_helper_supported_links(links, supported_url_patterns):
+def prioritize_helper_supported_links(
+    links, supported_url_patterns, supported_mirrors=None
+):
     if not isinstance(links, list):
         return [], []
 
     normalized_patterns = normalize_helper_supported_urls(supported_url_patterns)
-    if not normalized_patterns:
+    normalized_mirrors = normalize_helper_supported_mirrors(supported_mirrors)
+    if not normalized_patterns and not normalized_mirrors:
         return list(links), list(links)
 
     supported_links = []
@@ -95,9 +108,10 @@ def prioritize_helper_supported_links(links, supported_url_patterns):
 
     for link in links:
         candidate_url = extract_helper_candidate_url(link).lower()
-        if candidate_url and any(
-            pattern in candidate_url for pattern in normalized_patterns
-        ):
+        if (
+            candidate_url
+            and any(pattern in candidate_url for pattern in normalized_patterns)
+        ) or extract_helper_candidate_mirror(link) in normalized_mirrors:
             supported_links.append(link)
         else:
             unsupported_links.append(link)
@@ -105,7 +119,9 @@ def prioritize_helper_supported_links(links, supported_url_patterns):
     return supported_links + unsupported_links, supported_links
 
 
-def select_helper_package(protected_packages, supported_url_patterns):
+def select_helper_package(
+    protected_packages, supported_url_patterns, supported_mirrors=None
+):
     for package in protected_packages:
         data = json.loads(package[1])
         if "disabled" in data:
@@ -148,8 +164,9 @@ def select_helper_package(protected_packages, supported_url_patterns):
         prioritized_links, supported_links = prioritize_helper_supported_links(
             prioritized_links,
             supported_url_patterns,
+            supported_mirrors,
         )
-        if supported_url_patterns and not supported_links:
+        if (supported_url_patterns or supported_mirrors) and not supported_links:
             continue
 
         return package[0], data, prioritized_links
@@ -251,17 +268,27 @@ def setup_sponsors_helper_routes(app):
             )
             if not supported_url_patterns:
                 return abort(400, "Missing supported_urls")
+            supported_mirrors = normalize_helper_supported_mirrors(
+                payload.get("supported_mirrors")
+            )
 
             # Issue #350: only hand SponsorsHelper packages where at least one URL
             # matches the helper's advertised support, and move that URL to the front.
-            selected_package = select_helper_package(protected, supported_url_patterns)
+            selected_package = select_helper_package(
+                protected, supported_url_patterns, supported_mirrors
+            )
 
             if not selected_package:
                 return abort(404, "No valid packages found")
 
             package_id, data, prioritized_links = selected_package
             title = data["title"]
-            mirror = None if (mirror := data.get("mirror")) == "None" else mirror
+            mirror = data.get("mirror")
+            if mirror in (None, "None") and prioritized_links:
+                first_link = prioritized_links[0]
+                if isinstance(first_link, (list, tuple)) and len(first_link) > 1:
+                    mirror = first_link[1]
+            mirror = None if mirror == "None" else mirror
             password = data["password"]
 
             return {
