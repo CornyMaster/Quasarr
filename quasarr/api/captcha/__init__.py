@@ -276,8 +276,9 @@ def setup_captcha_routes(app):
                     f"&jk_user={quote(junkies_user)}&jk_pass={quote(junkies_pass)}"
                 )
 
+        separator = "&" if "?" in url else "?"
         url_with_quick_transfer_params = (
-            f"{url}?"
+            f"{url}{separator}"
             f"transfer_url={quote(transfer_url)}&"
             f"pkg_id={quote(package_id)}&"
             f"pkg_title={quote(title)}&"

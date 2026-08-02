@@ -147,7 +147,23 @@ class CaptchaUserscriptRoutingTests(unittest.TestCase):
         self.assertEqual("200 OK", status)
         self.assertIn("Open FileCrypt & Get Download Links", body)
         self.assertIn("/captcha/filecrypt.user.js", body)
-        self.assertIn("quick-transfer", body)
+        self.assertIn("abc.html?transfer_url=", body)
+
+    def test_filecrypt_page_appends_transfer_params_to_existing_query(self):
+        package = build_package(
+            "pkg-fc",
+            "https://filecrypt.example.invalid/Container/abc.html?mirror=2",
+            "filecrypt",
+        )
+        app = self._serve([package])
+
+        status, _, body = self._request(
+            app, "/captcha/filecrypt", f"data={encode_data_param(package)}"
+        )
+
+        self.assertEqual("200 OK", status)
+        self.assertIn("abc.html?mirror=2&transfer_url=", body)
+        self.assertNotIn("mirror=2?transfer_url=", body)
 
     def test_keeplinks_page_still_renders_standard_userscript_section(self):
         package = build_package(
