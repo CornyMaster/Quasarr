@@ -44,6 +44,15 @@ def check_package_exists(package_id):
 
 
 def setup_captcha_routes(app):
+    def is_he_link(link):
+        url = link[0] if isinstance(link, (list, tuple)) else link
+        mirror = link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else ""
+        if str(mirror).lower() == "he":
+            return True
+
+        he = shared_state.values["config"]("Hostnames").get("he")
+        return bool(he and he.lower() in str(url).lower())
+
     @app.get("/captcha")
     def check_captcha():
         try:
@@ -144,6 +153,7 @@ def setup_captcha_routes(app):
                 return (sj and sj in url) or (dj and dj in url)
 
             has_junkies_links = any(is_junkies_link(link) for link in prioritized_links)
+            has_he_links = any(is_he_link(link) for link in prioritized_links)
 
             # Hide uses nested arrays like FileCrypt: [["url", "mirror"]]
             has_hide_links = any(
@@ -180,6 +190,9 @@ def setup_captcha_routes(app):
             elif has_junkies_links:
                 debug("Redirecting to Junkies CAPTCHA")
                 redirect(f"/captcha/junkies?data={quote(encoded_payload)}")
+            elif has_he_links:
+                debug("Redirecting to HE CAPTCHA")
+                redirect(f"/captcha/he?data={quote(encoded_payload)}")
             elif has_keeplinks_links:
                 debug("Redirecting to KeepLinks CAPTCHA")
                 redirect(f"/captcha/keeplinks?data={quote(encoded_payload)}")
@@ -226,7 +239,7 @@ def setup_captcha_routes(app):
     def render_userscript_section(
         url, package_id, title, password, provider_type="junkies"
     ):
-        """Render the userscript UI section for FileCrypt, Hide, Junkies, KeepLinks, or ToLink pages
+        """Render the standard userscript UI section for a protected provider.
 
         This is the MAIN solution for these providers (not a bypass/fallback).
 
@@ -235,13 +248,14 @@ def setup_captcha_routes(app):
             package_id: Package identifier
             title: Package title
             password: Package password
-            provider_type: One of "filecrypt", "hide", "junkies", "keeplinks", or "tolink"
+            provider_type: Protected-provider route name
         """
 
         provider_names = {
             "filecrypt": "FileCrypt",
             "hide": "Hide",
             "junkies": "Junkies",
+            "he": "HE",
             "keeplinks": "KeepLinks",
             "tolink": "ToLink",
         }
@@ -479,6 +493,52 @@ def setup_captcha_routes(app):
           </body>
         </html>""")
 
+    @app.get("/captcha/he")
+    def serve_he_captcha():
+        payload = decode_payload()
+
+        if "error" in payload:
+            return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+            <p>{payload["error"]}</p>
+            <p>
+                {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
+            </p>''')
+
+        package_id = payload.get("package_id")
+        title = payload.get("title")
+        password = payload.get("password") or ""
+        urls = payload.get("links")
+        original_url = payload.get("original_url")
+        url = urls[0][0] if isinstance(urls[0], (list, tuple)) else urls[0]
+
+        check_package_exists(package_id)
+
+        package_selector = render_package_selector(package_id, title)
+        failed_warning = render_failed_attempts_warning(package_id, title=title)
+
+        source_button = ""
+        if original_url:
+            source_button = f"<p>{render_button('Source', 'secondary', {'onclick': f"window.open('{js_single_quoted_string_safe(original_url)}', '_blank')"})}</p>"
+
+        return render_centered_html(f"""
+        <!DOCTYPE html>
+        <html>
+          <body>
+            <h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+            {package_selector}
+            {failed_warning}
+                {render_userscript_section(url, package_id, title, password, "he")}
+            {source_button}
+            <p>
+                {render_button("Delete Package", "secondary", {"onclick": f"location.href='/captcha/delete/{package_id}?title={quote(title)}'"})}
+            </p>
+            <p>
+                {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
+            </p>
+
+          </body>
+        </html>""")
+
     @app.get("/captcha/keeplinks")
     def serve_keeplinks_captcha():
         payload = decode_payload()
@@ -644,6 +704,14 @@ def setup_captcha_routes(app):
         response.content_type = "application/javascript"
         return content
 
+    @app.get("/captcha/he.user.js")
+    @public_endpoint
+    def serve_he_user_js():
+        he = shared_state.values["config"]("Hostnames").get("he")
+        content = obfuscated.he_user_js(he)
+        response.content_type = "application/javascript"
+        return content
+
     @app.get("/captcha/keeplinks.user.js")
     @public_endpoint
     def serve_keeplinks_user_js():
@@ -694,6 +762,7 @@ def setup_captcha_routes(app):
                 for l in links
             )
             has_junkies = any(is_junkies_link(l) for l in links)
+            has_he = any(is_he_link(l) for l in links)
             has_keeplinks = any(
                 ("keeplinks." in (l[0] if isinstance(l, (list, tuple)) else l))
                 for l in links
@@ -707,6 +776,8 @@ def setup_captcha_routes(app):
                 return "hide"
             elif has_junkies:
                 return "junkies"
+            elif has_he:
+                return "he"
             elif has_keeplinks:
                 return "keeplinks"
             elif has_tolink:

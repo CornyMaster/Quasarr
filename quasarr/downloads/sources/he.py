@@ -37,17 +37,36 @@ class Source(AbstractDownloadSource):
         result = _strategy_standard(url, headers)
 
         # 2. If Standard failed (result is None), switch to FlareSolverr (Robust)
-        if result is None:
+        if result is None or result.get("inconclusive"):
+            inconclusive_result = result
+            if (
+                result
+                and result.get("inconclusive")
+                and not is_flaresolverr_available(shared_state)
+            ):
+                info("FlareSolverr unavailable after inconclusive HE form response.")
+                return _protected_release_result(url, result["imdb_id"])
             info("Standard connection failed/blocked. Switching to FlareSolverr...")
             result = _strategy_flaresolverr_loop(shared_state, url)
+            if (
+                inconclusive_result
+                and inconclusive_result.get("inconclusive")
+                and (not result or not result.get("links"))
+            ):
+                info("FlareSolverr could not complete inconclusive HE form response.")
+                return _protected_release_result(url, inconclusive_result["imdb_id"])
 
         requested_mirrors = {
             _normalize_mirror_name(mirror) for mirror in (mirrors or []) if mirror
         }
-        if result and result.get("links"):
+        if result and result.get("links") and not result.get("protected"):
             result["links"] = _filter_links_by_mirrors(
                 result["links"], requested_mirrors
             )
+
+        if result and result.get("protected"):
+            info(f"CAPTCHA required to unlock external download links for {title}")
+            return result
 
         if not result or not result["links"]:
             info(f"No external download links found for {title}")
@@ -182,6 +201,33 @@ def _extract_form_payload_list(html_content, url):
     return action_url, payload_list, True
 
 
+def _requires_manual_captcha(html_content):
+    if not html_content:
+        return False
+
+    soup = BeautifulSoup(html_content, "html.parser")
+    form = soup.find("form", id=re.compile(r"content-protector-access-form"))
+    if not form:
+        return False
+
+    captcha_mode = form.find(
+        "input",
+        attrs={"name": "content-protector-captcha", "value": "1"},
+    )
+    captcha_id = form.find("input", attrs={"name": "captcha_id"})
+    return bool(
+        captcha_mode and captcha_id and str(captcha_id.get("value", "")).strip()
+    )
+
+
+def _protected_release_result(url, imdb_id):
+    return {
+        "links": [[_remove_fragment(url), Source.initials]],
+        "imdb_id": imdb_id,
+        "protected": True,
+    }
+
+
 def _parse_links_strict(html):
     """
     Parses links specifically from the content-protector-access-form div
@@ -254,6 +300,10 @@ def _strategy_standard(url, headers):
             debug(f"Standard: Found {len(links)} links immediately.")
             return {"links": links, "imdb_id": imdb_id}
 
+        if _requires_manual_captcha(r.text):
+            debug("Standard: Manual CAPTCHA required.")
+            return _protected_release_result(clean_url, imdb_id)
+
         # 2. Extract Form
         action_url, payload_list, found_form = _extract_form_payload_list(
             r.text, clean_url
@@ -290,9 +340,12 @@ def _strategy_standard(url, headers):
         if links:
             debug(f"Standard: Success! Found {len(links)} links.")
             return {"links": links, "imdb_id": imdb_id}
-        else:
-            debug("Standard: POST succeeded but returned no links.")
-            return None
+        if _requires_manual_captcha(r_post.text):
+            debug("Standard: Manual CAPTCHA required after POST.")
+            return _protected_release_result(clean_url, imdb_id)
+
+        debug("Standard: POST succeeded but returned no links. Trying FlareSolverr.")
+        return {"links": [], "imdb_id": imdb_id, "inconclusive": True}
 
     except Exception as e:
         debug(f"Standard Strategy failed: {e}")
@@ -334,6 +387,7 @@ def _strategy_flaresolverr_loop(shared_state, url):
 
         # 2. Submission Loop
         max_attempts = 3
+        submitted_form = False
 
         for attempt in range(1, max_attempts + 1):
             # A. Check for success (links already visible?)
@@ -344,6 +398,10 @@ def _strategy_flaresolverr_loop(shared_state, url):
                 )
                 return {"links": links, "imdb_id": imdb_id}
 
+            if _requires_manual_captcha(current_html):
+                debug("FlareSolverr: Manual CAPTCHA required.")
+                return _protected_release_result(clean_url, imdb_id)
+
             if attempt == max_attempts:
                 break
 
@@ -353,6 +411,11 @@ def _strategy_flaresolverr_loop(shared_state, url):
             )
 
             if not found_form:
+                if submitted_form:
+                    warn(
+                        "FlareSolverr: No links found after form submission; CAPTCHA assumed."
+                    )
+                    return _protected_release_result(clean_url, imdb_id)
                 warn(f"FlareSolverr: Form not found on attempt {attempt}. Aborting.")
                 return {"links": [], "imdb_id": imdb_id}
 
@@ -368,6 +431,7 @@ def _strategy_flaresolverr_loop(shared_state, url):
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=DOWNLOAD_REQUEST_TIMEOUT_SECONDS,
             )
+            submitted_form = True
 
             # D. Update State
             current_html = r_post.text
@@ -378,6 +442,12 @@ def _strategy_flaresolverr_loop(shared_state, url):
                     "FlareSolverr: Form detected in response (Challenge solved or invalid token). Retrying..."
                 )
                 continue
+
+        if submitted_form:
+            warn(
+                "FlareSolverr: No links found after form submission attempts; CAPTCHA assumed."
+            )
+            return _protected_release_result(clean_url, imdb_id)
 
         warn("FlareSolverr: Max attempts reached without success.")
         return {"links": [], "imdb_id": imdb_id}

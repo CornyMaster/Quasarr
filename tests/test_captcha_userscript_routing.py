@@ -28,14 +28,14 @@ class FakeProtectedDb:
         return None
 
 
-def build_package(pkg_id, url, mirror):
+def build_package(pkg_id, url, mirror, password=""):
     return (
         pkg_id,
         json.dumps(
             {
                 "title": "Synthetic.Release.2024.German.1080p.WEB.H264-GRP",
                 "links": [[url, mirror]],
-                "password": "",
+                "password": password,
             }
         ),
     )
@@ -83,7 +83,9 @@ class CaptchaUserscriptRoutingTests(unittest.TestCase):
         fake_values = {
             "device": object(),
             # Sections are plain dicts; only .get() is used by the routes under test
-            "config": lambda section: {},
+            "config": lambda section: (
+                {"he": "source.invalid"} if section == "Hostnames" else {}
+            ),
         }
         stack = patch.multiple(
             shared_state,
@@ -119,6 +121,17 @@ class CaptchaUserscriptRoutingTests(unittest.TestCase):
         self.assertTrue(status.startswith("30"))
         self.assertIn("/captcha/keeplinks?data=", headers["Location"])
 
+    def test_he_package_redirects_to_he_userscript_page(self):
+        package = build_package(
+            "pkg-he", "https://source.invalid/releases/synthetic", "he"
+        )
+        app = self._serve([package])
+
+        status, headers, _ = self._request(app, "/captcha")
+
+        self.assertTrue(status.startswith("30"))
+        self.assertIn("/captcha/he?data=", headers["Location"])
+
     def test_filecrypt_page_renders_standard_userscript_section(self):
         package = build_package(
             "pkg-fc",
@@ -150,6 +163,47 @@ class CaptchaUserscriptRoutingTests(unittest.TestCase):
         self.assertIn("Open KeepLinks & Get Download Links", body)
         self.assertIn("/captcha/keeplinks.user.js", body)
         self.assertIn("quick-transfer", body)
+
+    def test_he_page_renders_standard_userscript_section(self):
+        package = build_package(
+            "pkg-he", "https://source.invalid/releases/synthetic", "he"
+        )
+        app = self._serve([package])
+
+        status, _, body = self._request(
+            app, "/captcha/he", f"data={encode_data_param(package)}"
+        )
+
+        self.assertEqual("200 OK", status)
+        self.assertIn("Open HE & Get Download Links", body)
+        self.assertIn("/captcha/he.user.js", body)
+        self.assertIn("quick-transfer", body)
+
+    def test_he_page_accepts_missing_password(self):
+        package = build_package(
+            "pkg-he", "https://source.invalid/releases/synthetic", "he", None
+        )
+        app = self._serve([package])
+
+        status, _, body = self._request(
+            app, "/captcha/he", f"data={encode_data_param(package)}"
+        )
+
+        self.assertEqual("200 OK", status)
+        self.assertIn("Open HE & Get Download Links", body)
+
+    def test_he_userscript_uses_configured_hostname(self):
+        package = build_package(
+            "pkg-he", "https://source.invalid/releases/synthetic", "he"
+        )
+        app = self._serve([package])
+
+        status, headers, body = self._request(app, "/captcha/he.user.js")
+
+        self.assertEqual("200 OK", status)
+        self.assertEqual("application/javascript", headers["Content-Type"])
+        self.assertIn("*://source.invalid/*", body)
+        self.assertNotIn("{he}", body)
 
     def test_removed_server_side_filecrypt_routes_are_gone(self):
         package = build_package(

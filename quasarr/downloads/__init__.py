@@ -379,7 +379,10 @@ def process_links(
             reason=f'All verifiable links are offline for "{title}" on {label} - "{source_url}"',
         )
 
-    classified = classify_links(links)
+    if source_result.get("protected") is True:
+        classified = {"direct": [], "auto": [], "protected": links}
+    else:
+        classified = classify_links(links)
     classified = _drop_filecrypt_if_disabled(shared_state, classified, title)
 
     # PRIORITY 1: Direct hoster links

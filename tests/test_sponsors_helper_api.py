@@ -4,13 +4,55 @@ import json
 import unittest
 from unittest import mock
 
+from bottle import Bottle, HTTPError
+
 from quasarr.api.sponsors_helper import (
     normalize_helper_supported_urls,
     select_helper_package,
+    setup_sponsors_helper_routes,
 )
 
 
 class SponsorsHelperApiTests(unittest.TestCase):
+    def test_to_decrypt_route_accepts_only_post(self):
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+
+        methods = {
+            route.method
+            for route in app.routes
+            if route.rule == "/sponsors_helper/api/to_decrypt/"
+        }
+
+        self.assertEqual({"POST"}, methods)
+
+    def test_to_decrypt_route_preserves_invalid_payload_status(self):
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(
+            route
+            for route in app.routes
+            if route.rule == "/sponsors_helper/api/to_decrypt/"
+        )
+        protected_db = mock.Mock()
+        protected_db.retrieve_all_titles.return_value = [("pkg-1", "{}")]
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.shared_state.update"),
+            mock.patch(
+                "quasarr.api.sponsors_helper.shared_state.get_db",
+                return_value=protected_db,
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.request",
+                mock.Mock(json={}),
+            ),
+            self.assertRaises(HTTPError) as context,
+        ):
+            route.callback()
+
+        self.assertEqual(400, context.exception.status_code)
+
     def test_normalize_helper_supported_urls_deduplicates_and_lowercases(self):
         self.assertEqual(
             ["container.", "alpha.", "beta."],
@@ -80,6 +122,27 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual("pkg-2", package_id)
         self.assertEqual("Supported.Second", data["title"])
         self.assertEqual("https://alpha.invalid/f/abc", prioritized_links[0][0])
+
+    def test_select_helper_package_accepts_advertised_mirror(self):
+        protected_packages = [
+            (
+                "pkg-1",
+                json.dumps(
+                    {
+                        "title": "Example.Release",
+                        "links": [["https://source.invalid/release", "he"]],
+                        "password": "",
+                    }
+                ),
+            )
+        ]
+
+        package_id, _, links = select_helper_package(
+            protected_packages, ["container."], ["he"]
+        )
+
+        self.assertEqual("pkg-1", package_id)
+        self.assertEqual("he", links[0][1])
 
     def test_select_helper_package_returns_none_when_nothing_matches(self):
         protected_packages = [
