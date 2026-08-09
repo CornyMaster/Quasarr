@@ -144,7 +144,7 @@ class IMDbMetadataTests(unittest.TestCase):
             title = get_localized_title(state, "tt0000004", "de")
 
         self.assertEqual("Synthetic German Title", title)
-        html_lookup.assert_called_once_with("tt0000004", "de")
+        html_lookup.assert_called_once_with("tt0000004", "de", deadline=None)
         update_cache.assert_called_once_with(
             "tt0000004", "localized", "Synthetic German Title", "de"
         )
@@ -247,7 +247,7 @@ class IMDbMetadataTests(unittest.TestCase):
             title = get_localized_title(state, "tt0000007", "de", SEARCH_CAT_MOVIES)
 
         self.assertEqual("Fresh Synthetic Title", title)
-        html_lookup.assert_called_once_with("tt0000007", "de")
+        html_lookup.assert_called_once_with("tt0000007", "de", deadline=None)
         stored = loads(self.databases["imdb_metadata"].values["tt0000007"])
         self.assertEqual("Fresh Synthetic Title", stored["localized"]["de"])
 
@@ -345,7 +345,7 @@ class IMDbMetadataTests(unittest.TestCase):
             title = get_localized_title(state, "tt0000019", "en", SEARCH_CAT_MOVIES)
 
         self.assertEqual("Synthetic English Anime Title", title)
-        html_lookup.assert_called_once_with("tt0000019", "en")
+        html_lookup.assert_called_once_with("tt0000019", "en", deadline=None)
 
     def test_arr_original_language_seeds_matching_code_only(self):
         record = {
@@ -663,7 +663,7 @@ class IMDbMetadataTests(unittest.TestCase):
             self.assertIsNone(IMDbHTML.get_localized_title("tt0000015", "de"))
 
         request.assert_called_once_with(
-            "https://www.imdb.com/de/title/tt0000015/releaseinfo/", "de"
+            "https://www.imdb.com/de/title/tt0000015/releaseinfo/", "de", deadline=None
         )
 
     def test_html_lookup_en_uses_unprefixed_default_path(self):
@@ -671,7 +671,7 @@ class IMDbMetadataTests(unittest.TestCase):
             self.assertIsNone(IMDbHTML.get_localized_title("tt0000016", "en"))
 
         request.assert_called_once_with(
-            "https://www.imdb.com/title/tt0000016/releaseinfo/", "en"
+            "https://www.imdb.com/title/tt0000016/releaseinfo/", "en", deadline=None
         )
 
     def test_html_request_sets_explicit_locale_and_crawler_user_agent(self):

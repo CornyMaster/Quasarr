@@ -2,6 +2,7 @@
 # Quasarr
 # Project by https://github.com/rix1337
 
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -36,7 +37,10 @@ class SonarrAPIClient:
         self._api_key = api_key
         self._timeout = timeout
 
-    def _get(self, path, params=None):
+    def _get(self, path, params=None, timeout=None):
+        # A caller timeout only ever tightens the client's own: it says how much
+        # of its budget is left, not that this request may take longer.
+        timeout = min(self._timeout, timeout) if timeout else self._timeout
         url = f"{self._base_url}/api/v3{path}"
         headers = {
             "X-Api-Key": self._api_key,
@@ -44,7 +48,10 @@ class SonarrAPIClient:
         }
         try:
             response = requests.get(
-                url, headers=headers, params=params, timeout=self._timeout
+                url,
+                headers=headers,
+                params=params,
+                timeout=timeout,
             )
             response.raise_for_status()
             return response.json()
@@ -76,20 +83,22 @@ class SonarrAPIClient:
             return []
         return self._get("/series/lookup", params={"term": term}) or []
 
-    def wanted(self, kind, page=1, page_size=50):
+    def wanted(self, kind, page=1, page_size=50, timeout=None):
         """Return a wanted episodes page (``kind`` is ``missing`` or ``cutoff``);
-        records include the series."""
-        return (
-            self._get(
-                f"/wanted/{kind}",
-                params={
-                    "page": page,
-                    "pageSize": page_size,
-                    "includeSeries": "true",
-                    "monitored": "true",
-                },
-            )
-            or {}
+        records include the series.
+
+        ``None`` means the request failed. A caller walking pages must not read
+        that as "no more pages".
+        """
+        return self._get(
+            f"/wanted/{kind}",
+            params={
+                "page": page,
+                "pageSize": page_size,
+                "includeSeries": "true",
+                "monitored": "true",
+            },
+            timeout=timeout,
         )
 
 
@@ -157,7 +166,7 @@ def _has_aired(record, now):
         return False
 
 
-def get_wanted_episodes(shared_state, limit=50):
+def get_wanted_episodes(shared_state, limit=50, deadline=None, status=None):
     """Return aired monitored episodes Sonarr wants as ``[{imdb_id, season,
     episode}]``.
 
@@ -168,6 +177,11 @@ def get_wanted_episodes(shared_state, limit=50):
     ones. Empty when Sonarr is not configured or the request fails. Used to seed
     a show feed for sources that need a concrete season+episode per request.
     """
+    if status is not None:
+        # Callers that persist progress across runs need to know whether this is
+        # the whole wanted list or as far as paging got.
+        status["complete"] = False
+
     client = get_client(shared_state)
     if client is None:
         return []
@@ -179,7 +193,20 @@ def get_wanted_episodes(shared_state, limit=50):
         for page in range(1, _WANTED_MAX_PAGES + 1):
             if len(episodes) >= limit:
                 return episodes
-            records = client.wanted(kind, page=page, page_size=limit).get("records", [])
+            # Every page is its own Sonarr request, so a slow instance must not
+            # spend a caller's whole budget before it gets any seeds - and the
+            # last page before the deadline must not overrun it either.
+            page_timeout = None
+            if deadline is not None:
+                page_timeout = deadline - time.time()
+                if page_timeout <= 0:
+                    return episodes
+            page_data = client.wanted(
+                kind, page=page, page_size=limit, timeout=page_timeout
+            )
+            if page_data is None:
+                return episodes  # request failed: what we have is partial
+            records = page_data.get("records", [])
             if not records:
                 break  # no more pages for this kind
             for record in records:
@@ -199,6 +226,10 @@ def get_wanted_episodes(shared_state, limit=50):
                     {"imdb_id": imdb_id, "season": season, "episode": episode}
                 )
                 if len(episodes) >= limit:
+                    if status is not None:
+                        status["complete"] = True
                     return episodes
 
+    if status is not None:
+        status["complete"] = True
     return episodes

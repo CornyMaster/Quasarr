@@ -119,6 +119,12 @@ SESSION_REQUEST_TIMEOUT_SECONDS = int(
     TIMEOUT_SLOW_MODE_DEFINITIONS["session"]["base_seconds"]
 )
 
+# Ceiling for one *arr-facing search or feed response. Radarr and Sonarr disable
+# an indexer that outlives their own request timeout (100s by default), so the
+# fan-out stops waiting for a slow source well before that. Deliberately not part
+# of slow mode: the *arr timeout does not grow with it.
+SEARCH_FANOUT_DEADLINE_SECONDS = 60
+
 # Notification providers exposed in config/UI.
 NOTIFICATION_PROVIDERS = ("discord", "telegram")
 
