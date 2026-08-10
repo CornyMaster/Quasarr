@@ -10,9 +10,10 @@ from quasarr.search import get_search_results
 class FakeSearchExecutor:
     latest = None
 
-    def __init__(self):
+    def __init__(self, deadline=None):
         self.searches = []
         self.added = []
+        self.deadline = deadline
         FakeSearchExecutor.latest = self
 
     def add(self, source, args, kwargs, **options):

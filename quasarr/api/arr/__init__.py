@@ -2,6 +2,7 @@
 # Quasarr
 # Project by https://github.com/rix1337
 
+import time
 import traceback
 import xml.sax.saxutils as sax_utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +12,7 @@ from xml.etree import ElementTree
 
 from bottle import request
 
+from quasarr.constants import SEARCH_FANOUT_DEADLINE_SECONDS
 from quasarr.downloads import download
 from quasarr.downloads.packages import delete_package, get_packages
 from quasarr.providers import shared_state
@@ -365,6 +367,12 @@ def setup_arr_routes(app):
                 elif mode in ["movie", "tvsearch", "book", "music", "search"]:
                     releases = []
 
+                    # One deadline for the whole request: cache-sharing categories
+                    # run one after another, so a per-run deadline would let a
+                    # two-category request take twice as long as the *arr client
+                    # is willing to wait.
+                    request_deadline = time.time() + SEARCH_FANOUT_DEADLINE_SECONDS
+
                     try:
                         offset = int(getattr(request.query, "offset", 0) or 0)
                     except (AttributeError, ValueError) as e:
@@ -475,6 +483,7 @@ def setup_arr_routes(app):
                                         episode=episode,
                                         offset=request_offset,
                                         limit=request_limit,
+                                        deadline=request_deadline,
                                     )
                                 )
                             )
@@ -497,6 +506,7 @@ def setup_arr_routes(app):
                                     search_phrase=search_phrase,
                                     offset=request_offset,
                                     limit=request_limit,
+                                    deadline=request_deadline,
                                 )
                             )
                         )
@@ -516,6 +526,7 @@ def setup_arr_routes(app):
                                         search_phrase=search_phrase,
                                         offset=request_offset,
                                         limit=request_limit,
+                                        deadline=request_deadline,
                                     )
                                 )
                             )

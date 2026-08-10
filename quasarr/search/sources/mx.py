@@ -20,6 +20,7 @@
 import re
 import time
 from datetime import datetime, timezone
+from threading import Lock
 
 import requests
 
@@ -27,6 +28,7 @@ from quasarr.constants import (
     FEED_REQUEST_TIMEOUT_SECONDS,
     SEARCH_CAT_MOVIES,
     SEARCH_CAT_SHOWS,
+    SEARCH_FANOUT_DEADLINE_SECONDS,
     SEARCH_REQUEST_TIMEOUT_SECONDS,
 )
 from quasarr.providers import radarr_api, shared_state, sonarr_api
@@ -46,6 +48,10 @@ from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 FEED_LIBRARY_LIMIT = 50
 
 
+class FeedBudgetSpent(Exception):
+    """The feed's wall-clock budget ran out while a seed was still being read."""
+
+
 class Source(AbstractSearchSource):
     initials = "mx"
     language = "fr"
@@ -59,6 +65,11 @@ class Source(AbstractSearchSource):
     requires_radarr = True
     requires_sonarr = True
 
+    def __init__(self):
+        # Where the next feed run resumes in the wanted list, per base category.
+        self._feed_offsets = {}
+        self._feed_lock = Lock()
+
     # ------------------------------------------------------------------ #
     #  HTTP                                                               #
     # ------------------------------------------------------------------ #
@@ -71,6 +82,13 @@ class Source(AbstractSearchSource):
         return f"https://api.{host}/api", host
 
     def _get(self, api_base, host, path, params, shared_state, timeout):
+        if callable(timeout):
+            # Feed runs hand in a callable so every round trip of a seed gets the
+            # budget that is actually left, not the one left when the seed began.
+            timeout = timeout()
+            if timeout is None:
+                raise FeedBudgetSpent()
+
         headers = {
             "User-Agent": shared_state.values["user_agent"],
             "Referer": f"https://{host}/",
@@ -249,9 +267,18 @@ class Source(AbstractSearchSource):
         search_category,
         season=None,
         episode=None,
+        title_deadline=None,
     ):
-        title = get_localized_title(shared_state, imdb_id, "fr", search_category)
+        # Title resolution runs before any MX request and can reach IMDb and
+        # FlareSolverr, so a feed run hands it the same budget the rest obeys.
+        title = get_localized_title(
+            shared_state, imdb_id, "fr", search_category, deadline=title_deadline
+        )
         if not title:
+            if title_deadline is not None and time.time() >= title_deadline:
+                # Out of time, not out of titles: this seed was never answered,
+                # so it keeps its place instead of being rotated past.
+                raise FeedBudgetSpent()
             return []
 
         match = self._match_imdb(
@@ -304,6 +331,10 @@ class Source(AbstractSearchSource):
         # the *arr libraries: monitored movies from Radarr, episodes from Sonarr.
         # The matching client must be configured; warn (don't fail) when it is
         # not, since the user may run a movie-only or TV-only setup.
+        # Seed acquisition pages the *arr API, so it shares the feed's budget
+        # instead of being free to spend all of it before the first lookup.
+        deadline = start_time + _feed_budget_seconds()
+        seed_status = {}
         base_cat = get_base_search_category_id(search_category)
         if base_cat == SEARCH_CAT_MOVIES:
             if radarr_api.get_client(shared_state) is None:
@@ -312,7 +343,10 @@ class Source(AbstractSearchSource):
             seeds = [
                 (imdb_id, None, None)
                 for imdb_id in radarr_api.get_wanted_imdb_ids(
-                    shared_state, limit=FEED_LIBRARY_LIMIT
+                    shared_state,
+                    limit=FEED_LIBRARY_LIMIT,
+                    deadline=deadline,
+                    status=seed_status,
                 )
             ]
         elif base_cat == SEARCH_CAT_SHOWS:
@@ -322,15 +356,48 @@ class Source(AbstractSearchSource):
             seeds = [
                 (ep["imdb_id"], ep["season"], ep["episode"])
                 for ep in sonarr_api.get_wanted_episodes(
-                    shared_state, limit=FEED_LIBRARY_LIMIT
+                    shared_state,
+                    limit=FEED_LIBRARY_LIMIT,
+                    deadline=deadline,
+                    status=seed_status,
                 )
             ]
         else:
             return []
 
+        seeds = seeds[:FEED_LIBRARY_LIMIT]
+        # Paging stops early on both a spent budget and a failed *arr page, so a
+        # short list here can be a partial view of the wanted list rather than
+        # all of it. A cursor normalized against that shorter list points
+        # somewhere near the head, which is not progress worth storing.
+        seeds_are_complete = seed_status.get("complete", False)
+        # Every seed costs several API round trips, so a full run can outlast the
+        # *arr client's own request timeout and get the indexer disabled. Resume
+        # where the previous run stopped so successive feed pulls still cover the
+        # whole wanted list instead of replaying the same head until the budget
+        # runs out.
+        # The source registry hands out one shared instance, so feed runs for the
+        # same category can overlap; the lock keeps each offset access atomic and
+        # the stored value normalized. Two concurrent runs still read the same
+        # offset and cover the same seeds: reserving a window up front cannot
+        # prevent that, because a claim of the whole list wraps straight back to
+        # the offset it started from. The feed cache is what keeps repeat pulls
+        # off the source.
+        with self._feed_lock:
+            offset = self._feed_offsets.get(base_cat, 0) % len(seeds) if seeds else 0
+        seeds = seeds[offset:] + seeds[:offset]
+
         releases = []
         failures = 0
-        for imdb_id, season, episode in seeds[:FEED_LIBRARY_LIMIT]:
+        processed = 0
+        for imdb_id, season, episode in seeds:
+            if _remaining_feed_timeout(start_time) is None:
+                debug(
+                    f"[mx] feed budget of {_feed_budget_seconds()}s spent, "
+                    f"skipping {len(seeds) - processed} remaining seeds"
+                )
+                break
+            processed += 1
             try:
                 releases.extend(
                     self._releases_for_imdb(
@@ -338,15 +405,32 @@ class Source(AbstractSearchSource):
                         host,
                         imdb_id,
                         shared_state,
-                        FEED_REQUEST_TIMEOUT_SECONDS,
+                        lambda: _remaining_feed_timeout(start_time),
                         search_category,
                         season=season,
                         episode=episode,
+                        title_deadline=deadline,
                     )
                 )
+            except FeedBudgetSpent:
+                # This seed produced nothing, so leave it for the next run.
+                processed -= 1
+                debug(
+                    f"[mx] feed budget of {_feed_budget_seconds()}s spent "
+                    f"while reading {imdb_id}, {len(seeds) - processed} seeds left"
+                )
+                break
             except Exception as e:
                 failures += 1
                 debug(f"[mx] feed item {imdb_id} error: {e}")
+
+        if seeds and seeds_are_complete:
+            # An empty seed list means the wanted lookup came back with nothing
+            # (a transient *arr failure reads as an empty page), which says
+            # nothing about where the next run should resume. Writing an offset
+            # for it would send the following healthy pull back to the head.
+            with self._feed_lock:
+                self._feed_offsets[base_cat] = (offset + processed) % len(seeds)
 
         if releases:
             clear_hostname_issue(self.initials)
@@ -467,3 +551,24 @@ def _to_rfc2822(date_str):
         return dt.strftime("%a, %d %b %Y %H:%M:%S +0000")
     except Exception:
         return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+
+def _feed_budget_seconds():
+    """The feed budget, capped at the window the response is answered in.
+
+    Slow mode triples the feed timeout while the fan-out deadline stays put, and
+    a run that outlives the response is discarded work that still advanced the
+    resume offset - so those seeds would not be retried until the next rotation.
+    """
+    return min(FEED_REQUEST_TIMEOUT_SECONDS, SEARCH_FANOUT_DEADLINE_SECONDS)
+
+
+def _remaining_feed_timeout(start_time):
+    """Seconds left of the feed's wall-clock budget, or None once it is spent."""
+    budget = _feed_budget_seconds()
+    if start_time is None:
+        return budget
+    remaining = budget - (time.time() - start_time)
+    if remaining <= 0:
+        return None
+    return max(0.1, remaining)

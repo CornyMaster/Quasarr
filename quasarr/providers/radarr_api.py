@@ -2,6 +2,8 @@
 # Quasarr
 # Project by https://github.com/rix1337
 
+import time
+
 import requests
 
 from quasarr.providers.log import error, trace, warn
@@ -34,7 +36,10 @@ class RadarrAPIClient:
         self._api_key = api_key
         self._timeout = timeout
 
-    def _get(self, path, params=None):
+    def _get(self, path, params=None, timeout=None):
+        # A caller timeout only ever tightens the client's own: it says how much
+        # of its budget is left, not that this request may take longer.
+        timeout = min(self._timeout, timeout) if timeout else self._timeout
         url = f"{self._base_url}/api/v3{path}"
         headers = {
             "X-Api-Key": self._api_key,
@@ -42,7 +47,10 @@ class RadarrAPIClient:
         }
         try:
             response = requests.get(
-                url, headers=headers, params=params, timeout=self._timeout
+                url,
+                headers=headers,
+                params=params,
+                timeout=timeout,
             )
             response.raise_for_status()
             return response.json()
@@ -66,14 +74,16 @@ class RadarrAPIClient:
             return []
         return self._get("/movie/lookup", params={"term": term}) or []
 
-    def wanted(self, kind, page=1, page_size=50):
-        """Return a wanted movies page (``kind`` is ``missing`` or ``cutoff``)."""
-        return (
-            self._get(
-                f"/wanted/{kind}",
-                params={"page": page, "pageSize": page_size, "monitored": "true"},
-            )
-            or {}
+    def wanted(self, kind, page=1, page_size=50, timeout=None):
+        """Return a wanted movies page (``kind`` is ``missing`` or ``cutoff``).
+
+        ``None`` means the request failed. A caller walking pages must not read
+        that as "no more pages".
+        """
+        return self._get(
+            f"/wanted/{kind}",
+            params={"page": page, "pageSize": page_size, "monitored": "true"},
+            timeout=timeout,
         )
 
 
@@ -108,7 +118,7 @@ _RELEASED_STATUSES = {"inCinemas", "released"}
 _WANTED_MAX_PAGES = 5
 
 
-def get_wanted_imdb_ids(shared_state, limit=50):
+def get_wanted_imdb_ids(shared_state, limit=50, deadline=None, status=None):
     """Return IMDb IDs of monitored movies Radarr wants as a list.
 
     Covers both missing movies (no file) and cutoff-unmet ones (present but
@@ -119,6 +129,11 @@ def get_wanted_imdb_ids(shared_state, limit=50):
     still yields released ones instead of an empty seed. Empty when Radarr is
     not configured or the request fails.
     """
+    if status is not None:
+        # Callers that persist progress across runs need to know whether this is
+        # the whole wanted list or as far as paging got.
+        status["complete"] = False
+
     client = get_client(shared_state)
     if client is None:
         return []
@@ -129,7 +144,20 @@ def get_wanted_imdb_ids(shared_state, limit=50):
         for page in range(1, _WANTED_MAX_PAGES + 1):
             if len(imdb_ids) >= limit:
                 return imdb_ids
-            records = client.wanted(kind, page=page, page_size=limit).get("records", [])
+            # Every page is its own Radarr request, so a slow instance must not
+            # spend a caller's whole budget before it gets any seeds - and the
+            # last page before the deadline must not overrun it either.
+            page_timeout = None
+            if deadline is not None:
+                page_timeout = deadline - time.time()
+                if page_timeout <= 0:
+                    return imdb_ids
+            page_data = client.wanted(
+                kind, page=page, page_size=limit, timeout=page_timeout
+            )
+            if page_data is None:
+                return imdb_ids  # request failed: what we have is partial
+            records = page_data.get("records", [])
             if not records:
                 break  # no more pages for this kind
             for movie in records:
@@ -141,6 +169,10 @@ def get_wanted_imdb_ids(shared_state, limit=50):
                 seen.add(imdb_id)
                 imdb_ids.append(imdb_id)
                 if len(imdb_ids) >= limit:
+                    if status is not None:
+                        status["complete"] = True
                     return imdb_ids
 
+    if status is not None:
+        status["complete"] = True
     return imdb_ids

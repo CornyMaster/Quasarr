@@ -4,6 +4,7 @@
 
 import html
 import re
+import time
 from datetime import datetime, timedelta
 from json import dumps, loads
 
@@ -100,7 +101,7 @@ class IMDbHTML:
     }
 
     @staticmethod
-    def _request(url, language):
+    def _request(url, language, deadline=None):
         headers = {
             "Accept-Language": IMDbHTML._LANGUAGE_HEADERS.get(
                 language, f"{language},en;q=0.8"
@@ -118,6 +119,12 @@ class IMDbHTML:
 
         # Browser fallback preserves the old AKA parsing path when direct HTML
         # is unavailable. FlareSolverr cannot reliably set localization headers.
+        if deadline is not None and time.time() >= deadline:
+            # It allows 60s on its own and the caller stopped waiting, so this
+            # is the one stage worth giving up rather than starting.
+            debug("Skipped IMDb FlareSolverr fallback: caller out of time")
+            return None
+
         flaresolverr_url = _get_config("FlareSolverr").get("url")
         flaresolverr_skipped = _get_db("skip_flaresolverr").retrieve("skipped")
 
@@ -358,7 +365,7 @@ class IMDbHTML:
         return localized_page_title
 
     @staticmethod
-    def get_localized_title(imdb_id, language):
+    def get_localized_title(imdb_id, language, deadline=None):
         # The locale-specific HTML metadata is primary. The parser retains an
         # AKA-section fallback for older or browser-rendered responses.
         language = language.lower()
@@ -367,7 +374,7 @@ class IMDbHTML:
             url = f"{IMDbHTML._WEB_URL}/title/{imdb_id}/releaseinfo/"
         else:
             url = f"{IMDbHTML._WEB_URL}/{language}/title/{imdb_id}/releaseinfo/"
-        html_content = IMDbHTML._request(url, language)
+        html_content = IMDbHTML._request(url, language, deadline=deadline)
 
         if html_content:
             try:
@@ -568,7 +575,23 @@ def get_poster_link(shared_state, imdb_id, search_category=None):
     return None
 
 
-def get_localized_title(shared_state, imdb_id, language="de", search_category=None):
+def get_localized_title(
+    shared_state, imdb_id, language="de", search_category=None, deadline=None
+):
+    """Resolve a localized title, optionally within a caller's wall-clock budget.
+
+    ``deadline`` is an absolute time. Cache hits always answer; the Arr refresh
+    and the IMDb HTML/FlareSolverr fallbacks are skipped once it has passed,
+    because those cost real requests (the browser fallback alone allows 70s) and
+    would otherwise run long after the caller stopped waiting for them.
+    """
+
+    def out_of_time():
+        # Re-read on every gate: the Arr refresh between them costs a request of
+        # its own, so a budget that was intact on entry can be gone by the time
+        # the far more expensive IMDb fallbacks would start.
+        return deadline is not None and time.time() >= deadline
+
     imdb_metadata = _get_cached_metadata(imdb_id)
     cache_is_fresh = bool(
         imdb_metadata and imdb_metadata.get("ttl", 0) > datetime.now().timestamp()
@@ -577,7 +600,7 @@ def get_localized_title(shared_state, imdb_id, language="de", search_category=No
         localized = imdb_metadata.get("localized", {}).get(language)
         if localized:
             return _normalize_localized_title(localized, language)
-    else:
+    elif not out_of_time():
         imdb_metadata, arr_localized = _refresh_imdb_metadata(
             shared_state, imdb_id, search_category, imdb_metadata
         )
@@ -585,7 +608,11 @@ def get_localized_title(shared_state, imdb_id, language="de", search_category=No
         if localized:
             return _normalize_localized_title(localized, language)
 
-    title = IMDbHTML.get_localized_title(imdb_id, language)
+    if out_of_time():
+        debug(f"Skipped localized-title lookup for {imdb_id}: caller out of time")
+        return None
+
+    title = IMDbHTML.get_localized_title(imdb_id, language, deadline=deadline)
     if title:
         sanitized_title = TitleCleaner.sanitize(title)
         _update_cache(imdb_id, "localized", sanitized_title, language)

@@ -4,6 +4,7 @@
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from threading import Lock
@@ -13,6 +14,7 @@ from quasarr.constants import (
     SEARCH_CAT_MOVIES,
     SEARCH_CAT_MUSIC,
     SEARCH_CAT_SHOWS,
+    SEARCH_FANOUT_DEADLINE_SECONDS,
 )
 from quasarr.providers.imdb_metadata import get_imdb_metadata
 from quasarr.providers.log import (
@@ -38,6 +40,7 @@ def get_search_results(
     episode=None,
     offset=0,
     limit=1000,
+    deadline=None,
 ):
     from quasarr.providers.utils import (
         determine_search_category,
@@ -84,7 +87,15 @@ def get_search_results(
             error("TV search unavailable: Sonarr is not configured")
             return []
 
-    if imdb_id:
+    # Anchored before metadata warming: sources derive their own budget from this,
+    # so starting the clock after the warming would let a source outlive the
+    # deadline by however long the warming took.
+    start_time = time.time()
+
+    if imdb_id and (deadline is None or time.time() < deadline):
+        # A failed refresh is not cached, so every category of a multi-category
+        # request would otherwise pay the Arr client timeout again, past the
+        # ceiling the deadline exists to hold.
         get_imdb_metadata(shared_state, imdb_id, base_search_category)
 
     capability_category = get_search_capability_category(search_category)
@@ -111,8 +122,7 @@ def get_search_results(
             f"Using whitelist for category <g>{search_category}</g>: {', '.join([s.upper() for s in whitelisted_sources])}"
         )
 
-    start_time = time.time()
-    search_executor = SearchExecutor()
+    search_executor = SearchExecutor(deadline=deadline)
 
     # Config retrieval
     config = shared_state.values["config"]("Hostnames")
@@ -326,8 +336,16 @@ def get_search_results(
 
 
 class SearchExecutor:
-    def __init__(self):
+    def __init__(self, deadline=None):
         self.searches = []
+        # Absolute time this fan-out must be answered by. Callers that run several
+        # executors for one *arr request pass their own so the runs share a single
+        # deadline instead of each starting a fresh one.
+        self.deadline = (
+            deadline
+            if deadline is not None
+            else time.time() + SEARCH_FANOUT_DEADLINE_SECONDS
+        )
 
     def add(
         self,
@@ -364,9 +382,17 @@ class SearchExecutor:
         min_ttl = float("inf")
         bar_str = ""  # Initialize to prevent UnboundLocalError on full cache
 
-        with ThreadPoolExecutor() as executor:
+        deadline = self.deadline
+        # One worker per source: the default pool is sized from the CPU count, so
+        # on a small host the last sources would queue behind the first ones and
+        # burn the deadline without ever having started.
+        # Not a context manager on purpose: its __exit__ joins every worker, which
+        # would re-introduce the very wait the deadline exists to prevent.
+        executor = ThreadPoolExecutor(max_workers=max(1, len(self.searches)))
+        try:
             current_index = 0
             pending_futures = []
+            skipped_badges = []
 
             for key, func, use_cache, ttl, source_name in self.searches:
                 cached_result = None
@@ -388,16 +414,30 @@ class SearchExecutor:
                         min_ttl = ttl_left
                 else:
                     all_cached = False
+                    if time.time() >= deadline:
+                        # Nothing left to spend. Starting the work anyway would
+                        # only detach a worker whose result this response can no
+                        # longer use, and hit the source a second time for it.
+                        skipped_badges.append(
+                            f"<bg yellow><black>{source_name.upper()}</black></bg yellow>"
+                        )
+                        get_source_logger(source_name).warn(
+                            "Not started, this request is already out of time"
+                        )
+                        continue
+
                     future = executor.submit(func)
                     cache_meta = (key, ttl) if use_cache else None
                     future_to_meta[future] = (current_index, cache_meta, source_name)
                     pending_futures.append(future)
                     current_index += 1
 
+            results_badges = [""] * len(pending_futures)
             if pending_futures:
-                results_badges = [""] * len(pending_futures)
+                collected = set()
 
-                for future in as_completed(pending_futures):
+                def collect(future):
+                    collected.add(future)
                     index, cache_meta, source_name = future_to_meta[future]
                     try:
                         res = future.result()
@@ -420,7 +460,35 @@ class SearchExecutor:
                         )
                         get_source_logger(source_name).warn(f"Search error: {e}")
 
-                bar_str = f" [{' '.join(results_badges)}]"
+                try:
+                    for future in as_completed(
+                        pending_futures, timeout=max(0.1, deadline - time.time())
+                    ):
+                        collect(future)
+                except FutureTimeoutError:
+                    # Radarr and Sonarr drop an indexer that outlives their own
+                    # request timeout, so answer with whatever is ready instead of
+                    # waiting for the straggler.
+                    for future in pending_futures:
+                        if future in collected:
+                            continue
+                        if future.done():
+                            collect(future)
+                            continue
+
+                        index, _, source_name = future_to_meta[future]
+                        results_badges[index] = (
+                            f"<bg yellow><black>{source_name.upper()}</black></bg yellow>"
+                        )
+                        get_source_logger(source_name).warn(
+                            f"Dropped from this response after "
+                            f"{SEARCH_FANOUT_DEADLINE_SECONDS}s"
+                        )
+
+            if results_badges or skipped_badges:
+                bar_str = f" [{' '.join(results_badges + skipped_badges)}]"
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         return results, bar_str, all_cached, min_ttl
 

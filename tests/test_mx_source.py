@@ -1,16 +1,20 @@
+import time
 import unittest
 from contextlib import ExitStack
+from threading import Thread
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from quasarr.constants import SEARCH_CAT_MOVIES, SEARCH_CAT_SHOWS
 from quasarr.downloads.sources.mx import Source as DownloadSource
 from quasarr.search.sources.mx import (
-    Source as SearchSource,
+    FeedBudgetSpent,
+    _normalize_quality,
+    _remaining_feed_timeout,
+    _sanitize,
 )
 from quasarr.search.sources.mx import (
-    _normalize_quality,
-    _sanitize,
+    Source as SearchSource,
 )
 
 
@@ -128,6 +132,22 @@ def build_fake_get(responses):
 
     fake_get.calls = calls
     return fake_get
+
+
+def wanted_returning(items):
+    """Stand in for a wanted helper whose paging completed.
+
+    The real helpers report completeness through ``status``; a mock that only
+    returns a list looks like a partial acquisition, which suppresses the resume
+    offset write.
+    """
+
+    def _wanted(_shared_state, limit=50, deadline=None, status=None):
+        if status is not None:
+            status["complete"] = True
+        return list(items)
+
+    return _wanted
 
 
 def patch_issue_tracking(stack):
@@ -289,7 +309,7 @@ class MxFeedTests(unittest.TestCase):
                     return_value=["tt0000001"],
                 )
             )
-            releases = SearchSource().feed(ss, 0.0, SEARCH_CAT_MOVIES)
+            releases = SearchSource().feed(ss, time.time(), SEARCH_CAT_MOVIES)
         self.assertEqual(len(releases), 1)
         self.assertEqual(releases[0]["details"]["imdb_id"], "tt0000001")
 
@@ -319,7 +339,7 @@ class MxFeedTests(unittest.TestCase):
                     return_value=[{"imdb_id": "tt0000002", "season": 1, "episode": 1}],
                 )
             )
-            releases = SearchSource().feed(ss, 0.0, SEARCH_CAT_SHOWS)
+            releases = SearchSource().feed(ss, time.time(), SEARCH_CAT_SHOWS)
         self.assertEqual(len(releases), 1)
         self.assertIn("S01E01", releases[0]["details"]["title"])
         # Sonarr's season+episode reached the source download endpoint.
@@ -337,7 +357,7 @@ class MxFeedTests(unittest.TestCase):
             episodes = stack.enter_context(
                 patch("quasarr.search.sources.mx.sonarr_api.get_wanted_episodes")
             )
-            releases = SearchSource().feed(ss, 0.0, SEARCH_CAT_SHOWS)
+            releases = SearchSource().feed(ss, time.time(), SEARCH_CAT_SHOWS)
         self.assertEqual(releases, [])
         get.assert_not_called()
         episodes.assert_not_called()
@@ -352,7 +372,7 @@ class MxFeedTests(unittest.TestCase):
             ids = stack.enter_context(
                 patch("quasarr.search.sources.mx.radarr_api.get_wanted_imdb_ids")
             )
-            releases = SearchSource().feed(ss, 0.0, SEARCH_CAT_MOVIES)
+            releases = SearchSource().feed(ss, time.time(), SEARCH_CAT_MOVIES)
         self.assertEqual(releases, [])
         get.assert_not_called()
         ids.assert_not_called()
@@ -384,7 +404,7 @@ class MxFeedTests(unittest.TestCase):
                     return_value=["tt0000001"],
                 )
             )
-            releases = SearchSource().feed(ss, 0.0, SEARCH_CAT_MOVIES)
+            releases = SearchSource().feed(ss, time.time(), SEARCH_CAT_MOVIES)
         self.assertEqual(releases, [])
         mark.assert_called_once()
         clear.assert_not_called()
@@ -416,10 +436,228 @@ class MxFeedTests(unittest.TestCase):
                     return_value=["tt0000001"],
                 )
             )
-            releases = SearchSource().feed(ss, 0.0, SEARCH_CAT_MOVIES)
+            releases = SearchSource().feed(ss, time.time(), SEARCH_CAT_MOVIES)
         self.assertEqual(releases, [])
         mark.assert_not_called()
         clear.assert_not_called()
+
+    def test_feed_stops_at_budget_and_resumes_where_it_left_off(self):
+        # Each seed costs several round trips, so a full wanted list can outlast
+        # the *arr client's request timeout. The run must stop at the feed budget
+        # and the next run must continue with the seeds it did not reach.
+        ss = make_shared_state(radarr=True)
+        source = SearchSource()
+        wanted = ["tt0000001", "tt0000002", "tt0000003", "tt0000004"]
+        queried = []
+
+        def fake_lookup(_self, _api_base, _host, imdb_id, *args, **kwargs):
+            queried.append(imdb_id)
+            return []
+
+        def run():
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(SearchSource, "_releases_for_imdb", fake_lookup)
+                )
+                patch_issue_tracking(stack)
+                stack.enter_context(
+                    patch(
+                        "quasarr.search.sources.mx.radarr_api.get_wanted_imdb_ids",
+                        wanted_returning(wanted),
+                    )
+                )
+                stack.enter_context(
+                    patch("quasarr.search.sources.mx.FEED_REQUEST_TIMEOUT_SECONDS", 30)
+                )
+                # Two seeds fit in the budget, the third finds it spent.
+                stack.enter_context(
+                    patch(
+                        "quasarr.search.sources.mx.time.time",
+                        side_effect=[0.0, 1.0, 31.0, 31.0],
+                    )
+                )
+                source.feed(ss, 0.0, SEARCH_CAT_MOVIES)
+
+        run()
+        self.assertEqual(["tt0000001", "tt0000002"], queried)
+
+        queried.clear()
+        run()
+        self.assertEqual(["tt0000003", "tt0000004"], queried)
+
+    def test_budget_spent_mid_seed_leaves_that_seed_for_the_next_run(self):
+        # A seed whose own round trips ran into the budget produced nothing, so
+        # it must be retried rather than skipped - and a spent budget is not a
+        # source outage.
+        ss = make_shared_state(radarr=True)
+        source = SearchSource()
+        queried = []
+
+        def fake_lookup(_self, _api_base, _host, imdb_id, *args, **kwargs):
+            queried.append(imdb_id)
+            raise FeedBudgetSpent()
+
+        def run(mark):
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(SearchSource, "_releases_for_imdb", fake_lookup)
+                )
+                stack.enter_context(
+                    patch("quasarr.search.sources.mx.clear_hostname_issue")
+                )
+                stack.enter_context(
+                    patch("quasarr.search.sources.mx.mark_hostname_issue", mark)
+                )
+                stack.enter_context(
+                    patch(
+                        "quasarr.search.sources.mx.radarr_api.get_wanted_imdb_ids",
+                        return_value=["tt0000001", "tt0000002"],
+                    )
+                )
+                source.feed(ss, time.time(), SEARCH_CAT_MOVIES)
+
+        mark = MagicMock()
+        run(mark)
+        run(mark)
+        self.assertEqual(["tt0000001", "tt0000001"], queried)
+        mark.assert_not_called()
+
+    def test_concurrent_feed_runs_leave_a_consistent_resume_offset(self):
+        # The registry hands out one shared Source, so feed runs for the same
+        # category can overlap on the offset. Whatever interleaving happens, the
+        # stored offset has to be a value a run actually reached.
+        ss = make_shared_state(radarr=True)
+        source = SearchSource()
+        wanted = ["tt1", "tt2", "tt3", "tt4"]
+
+        def fake_lookup(*_args, **_kwargs):
+            return []
+
+        def run():
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(SearchSource, "_releases_for_imdb", fake_lookup)
+                )
+                patch_issue_tracking(stack)
+                stack.enter_context(
+                    patch(
+                        "quasarr.search.sources.mx.radarr_api.get_wanted_imdb_ids",
+                        wanted_returning(wanted),
+                    )
+                )
+                source.feed(ss, time.time(), SEARCH_CAT_MOVIES)
+
+        threads = [Thread(target=run) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+
+        self.assertIn(source._feed_offsets[SEARCH_CAT_MOVIES], range(len(wanted) + 1))
+
+    def test_a_title_lookup_that_ran_out_of_time_keeps_its_seed(self):
+        # No title because the budget went during the lookup, not because none
+        # exists. The seed was never answered, so it keeps its place instead of
+        # being rotated past: the clock is inside the budget at the loop check
+        # and past it by the time the title comes back empty.
+        ss = make_shared_state(radarr=True)
+        source = SearchSource()
+
+        with ExitStack() as stack:
+            patch_issue_tracking(stack)
+            stack.enter_context(
+                patch(
+                    "quasarr.search.sources.mx.get_localized_title",
+                    return_value=None,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "quasarr.search.sources.mx.radarr_api.get_wanted_imdb_ids",
+                    wanted_returning(["tt0000001", "tt0000002"]),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "quasarr.search.sources.mx.time.time",
+                    side_effect=[0, 100, 100],
+                )
+            )
+            source.feed(ss, 0.0, SEARCH_CAT_MOVIES)
+
+        self.assertEqual(0, source._feed_offsets[SEARCH_CAT_MOVIES])
+
+    def test_partial_seed_acquisition_keeps_the_resume_offset(self):
+        # Wanted paging stops at the same deadline, so a short list can be a
+        # partial view. Normalizing the stored cursor against it (40 % 10 = 0)
+        # and writing that back would drag the rotation to the head.
+        ss = make_shared_state(radarr=True)
+        source = SearchSource()
+        source._feed_offsets[SEARCH_CAT_MOVIES] = 40
+
+        with ExitStack() as stack:
+            patch_issue_tracking(stack)
+            stack.enter_context(
+                patch(
+                    "quasarr.search.sources.mx.radarr_api.get_wanted_imdb_ids",
+                    return_value=[f"tt{i}" for i in range(10)],
+                )
+            )
+            # The helper reported no completion, the mark of an acquisition that
+            # was cut short by a spent budget or a failed page.
+            source.feed(ss, time.time(), SEARCH_CAT_MOVIES)
+
+        self.assertEqual(40, source._feed_offsets[SEARCH_CAT_MOVIES])
+
+    def test_a_failed_seed_lookup_keeps_the_resume_offset(self):
+        # A transient Radarr failure reads as an empty page, so the wanted helper
+        # returns no seeds. That says nothing about where to resume, and writing
+        # an offset for it would send the next healthy pull back to the head.
+        ss = make_shared_state(radarr=True)
+        source = SearchSource()
+        source._feed_offsets[SEARCH_CAT_MOVIES] = 3
+
+        with ExitStack() as stack:
+            patch_issue_tracking(stack)
+            stack.enter_context(
+                patch(
+                    "quasarr.search.sources.mx.radarr_api.get_wanted_imdb_ids",
+                    return_value=[],
+                )
+            )
+            source.feed(ss, time.time(), SEARCH_CAT_MOVIES)
+
+        self.assertEqual(3, source._feed_offsets[SEARCH_CAT_MOVIES])
+
+    def test_feed_budget_never_outlives_the_fan_out_deadline(self):
+        # Slow mode triples the feed timeout, but the window the response is
+        # answered in does not grow with it. A run past that window is discarded
+        # while still having advanced the resume offset, so its seeds would not
+        # come round again until the next full rotation.
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("quasarr.search.sources.mx.FEED_REQUEST_TIMEOUT_SECONDS", 90)
+            )
+            stack.enter_context(
+                patch("quasarr.search.sources.mx.SEARCH_FANOUT_DEADLINE_SECONDS", 60)
+            )
+            stack.enter_context(
+                patch("quasarr.search.sources.mx.time.time", return_value=61.0)
+            )
+            self.assertIsNone(_remaining_feed_timeout(0.0))
+
+    def test_get_raises_once_the_budget_callable_reports_it_is_spent(self):
+        # The per-seed budget is re-read before every round trip, so a seed with
+        # many links cannot outrun it by reusing the value it started with.
+        with self.assertRaises(FeedBudgetSpent):
+            SearchSource()._get(
+                "https://api.source.invalid/api",
+                "source.invalid",
+                "/search",
+                {},
+                make_shared_state(),
+                lambda: None,
+            )
 
 
 class MxSpecialsTests(unittest.TestCase):
