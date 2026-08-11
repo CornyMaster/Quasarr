@@ -7,6 +7,7 @@ The Newznab-facing search layer: `get_search_results()` fans a single *arr reque
 ## Ownership
 
 - `__init__.py` - orchestrator: the three search branches, `SearchExecutor` (thread-pool fan-out + per-source status badges), `SearchCache` (TTL cache)
+- `runtime.py` - process-local search instrumentation: `SearchRuntime`, the `search_runtime` singleton, `read_process_memory()`
 - `sources/` - see Child DOX Index
 
 ## Local Contracts
@@ -20,6 +21,8 @@ The Newznab-facing search layer: `get_search_results()` fans a single *arr reque
 - Cache TTL is 300s for search, 60s for feed; the key nulls `start_time` and uses the cache-owner category. Cached entries skip execution entirely, so source methods must be safe to skip.
 - Per-source results are merged, date-sorted descending, title-filtered by `release_matches_search_category`, then offset/limit-sliced; feed responses are never paginated.
 - Search sources normally have a same-key download twin (FX is the search-only exception); the `source_key` embedded in the search payload routes the later `download()` call to the same-key twin first when one exists.
+- `runtime.py` counters are process-local and fixed-cardinality: `snapshot()` returns exactly the documented counter keys plus `rss_kib`/`pss_kib`/`threads`. Never add a source initial, query, URL, hostname, or category ID to a counter name or value - the snapshot is meant for logs, so every key and value must stay bounded. `record_source_outcome()` accepts only `completed`, `dropped`, `skipped`, `errored`, and `budget_exhausted` and raises `ValueError` otherwise.
+- `SearchRuntime` takes an injected `clock` and `memory_reader` so tests stay deterministic; gauges (`active_requests`, `active_source_tasks`) are decremented in `finally`, so a raising body still returns them to zero. `last_activity_at` is stamped from that clock on every gauge transition. `read_process_memory()` reads `/proc/self/status` and `/proc/self/smaps_rollup` and returns `None` readings on non-Linux hosts or when a file is missing - it never raises into a search request.
 
 ## Work Guidance
 
