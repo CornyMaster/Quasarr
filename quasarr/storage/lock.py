@@ -2,6 +2,7 @@ import os
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from functools import wraps
 
 from filelock import FileLock
@@ -10,6 +11,17 @@ from quasarr.providers.log import trace
 
 _locks = {}
 _locks_guard = threading.Lock()
+_locked_call_guard = threading.local()
+
+
+@contextmanager
+def reject_locked_calls_from_callback():
+    previous = getattr(_locked_call_guard, "mutation_callback", False)
+    _locked_call_guard.mutation_callback = True
+    try:
+        yield
+    finally:
+        _locked_call_guard.mutation_callback = previous
 
 
 class ProcessLocalFileLock:
@@ -86,6 +98,10 @@ def with_lock(lock: ProcessLocalFileLock, timeout=-1):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            if getattr(_locked_call_guard, "mutation_callback", False):
+                raise RuntimeError(
+                    "Locked storage calls are not allowed from a database mutation callback"
+                )
             start = time.monotonic()
             with lock.acquire(timeout=timeout):
                 delta = time.monotonic() - start

@@ -35,6 +35,8 @@ from quasarr.storage.categories import (
     get_download_category_mirrors,
 )
 
+_PROTECTED_MIRROR_KEYS = frozenset({"junkies"})
+
 # =============================================================================
 # DETERMINISTIC PACKAGE ID GENERATION
 # =============================================================================
@@ -97,6 +99,26 @@ def detect_crypter(url):
     return None, None
 
 
+def protected_crypter_keys():
+    return frozenset(PROTECTED_PATTERNS) | _PROTECTED_MIRROR_KEYS
+
+
+def resolve_protected_crypter_key(link):
+    if not isinstance(link, (list, tuple)) or not link:
+        return None
+
+    url = link[0]
+    if not isinstance(url, str):
+        return None
+
+    mirror = link[1] if len(link) > 1 else ""
+    if isinstance(mirror, str) and mirror.lower() in _PROTECTED_MIRROR_KEYS:
+        return mirror.lower()
+
+    crypter, crypter_type = detect_crypter(url)
+    return crypter if crypter_type == "protected" else None
+
+
 def _drop_filecrypt_if_disabled(shared_state, classified, title):
     """Drop filecrypt links from the protected bucket when the kill switch is off."""
     if shared_state.values.get("filecrypt_enabled", True):
@@ -128,9 +150,7 @@ def classify_links(links):
 
     for link in links:
         url = link[0]
-        mirror = link[1] if len(link) > 1 else ""
-
-        if isinstance(mirror, str) and mirror.lower() == "junkies":
+        if resolve_protected_crypter_key(link):
             classified["protected"].append(link)
             continue
 

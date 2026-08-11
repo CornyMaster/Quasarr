@@ -16,13 +16,16 @@ Locking contract:
   both config and database locks are involved. Never call into
   `quasarr.storage.config` from inside a DataBase method, because that
   would invert the order and risks AB-BA deadlock across processes.
+- `mutate_value` holds one SQLite write transaction across read, callback,
+    and write. The callback runs once and cannot enter another locked
+    Config/DataBase operation; it must return a string or None without side effects.
 """
 
 import sqlite3
 import time
 
 from quasarr.providers.log import error, warn
-from quasarr.storage.lock import get_lock, with_lock
+from quasarr.storage.lock import get_lock, reject_locked_calls_from_callback, with_lock
 
 lock = get_lock("database")
 
@@ -270,6 +273,33 @@ class DataBase(object):
                 raise
 
         return self._with_retry(operation)
+
+    @with_lock(lock)
+    def mutate_value(self, key, mutator):
+        """Atomically replace or delete one value using a side-effect-free callback."""
+        if not callable(mutator):
+            raise TypeError("mutator must be callable")
+
+        self._with_retry(lambda: self._conn.execute("BEGIN IMMEDIATE"))
+        try:
+            query = f"SELECT value FROM {self._table} WHERE key=?"
+            result = self._conn.execute(query, (key,)).fetchone()
+            current_value = result[0] if result else None
+            with reject_locked_calls_from_callback():
+                new_value = mutator(current_value)
+            if new_value is not None and not isinstance(new_value, str):
+                raise TypeError("mutator must return str or None")
+
+            delete_query = f"DELETE FROM {self._table} WHERE key=?"
+            self._conn.execute(delete_query, (key,))
+            if new_value is not None:
+                insert_query = f"INSERT INTO {self._table} VALUES (?, ?)"
+                self._conn.execute(insert_query, (key, new_value))
+            self._conn.commit()
+            return new_value
+        except Exception:
+            self._rollback()
+            raise
 
     @with_lock(lock)
     def delete(self, key):

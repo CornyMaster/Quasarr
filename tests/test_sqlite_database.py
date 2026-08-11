@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 
+import json
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 from quasarr.providers import shared_state
+from quasarr.storage.config import Config
 from quasarr.storage.sqlite_database import SQLITE_BUSY_TIMEOUT_MS, DataBase
 
 
@@ -36,6 +40,100 @@ class SQLiteDatabaseTests(unittest.TestCase):
         self.assertIsNone(reopened.retrieve("first"))
         db._conn.close()
         reopened._conn.close()
+
+    def test_mutate_value_preserves_both_concurrent_observations(self):
+        first = DataBase("crypter_cooldowns")
+        second = DataBase("crypter_cooldowns")
+        first.update_store("filecrypt", json.dumps({"observations": []}))
+        first_callback_started = threading.Event()
+        second_mutation_started = threading.Event()
+        errors = []
+
+        def append_observation(current_value, package_id):
+            record = json.loads(current_value)
+            record["observations"].append(package_id)
+            return json.dumps(record)
+
+        def mutate_first():
+            try:
+                def mutator(current_value):
+                    first_callback_started.set()
+                    if not second_mutation_started.wait(2):
+                        raise RuntimeError("second mutation did not start")
+                    time.sleep(0.05)
+                    return append_observation(current_value, "package-a")
+
+                first.mutate_value("filecrypt", mutator)
+            except Exception as error:
+                errors.append(error)
+
+        def mutate_second():
+            try:
+                if not first_callback_started.wait(2):
+                    raise RuntimeError("first callback did not start")
+                second_mutation_started.set()
+                second.mutate_value(
+                    "filecrypt",
+                    lambda value: append_observation(value, "package-b"),
+                )
+            except Exception as error:
+                errors.append(error)
+
+        first_thread = threading.Thread(target=mutate_first)
+        second_thread = threading.Thread(target=mutate_second)
+        first_thread.start()
+        second_thread.start()
+        first_thread.join(5)
+        second_thread.join(5)
+
+        try:
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual([], errors)
+            stored = json.loads(first.retrieve("filecrypt"))
+            self.assertEqual(
+                {"package-a", "package-b"}, set(stored["observations"])
+            )
+        finally:
+            first._conn.close()
+            second._conn.close()
+
+    def test_mutate_value_rolls_back_when_mutator_raises(self):
+        db = DataBase("crypter_cooldowns")
+        db.update_store("filecrypt", "original")
+        calls = {"count": 0}
+
+        def fail_mutation(_current_value):
+            calls["count"] += 1
+            raise RuntimeError("mutation failed")
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "mutation failed"):
+                db.mutate_value("filecrypt", fail_mutation)
+
+            self.assertEqual(1, calls["count"])
+            self.assertEqual("original", db.retrieve("filecrypt"))
+        finally:
+            db._conn.close()
+
+    def test_mutate_value_rejects_nested_database_and_config_calls(self):
+        db = DataBase("crypter_cooldowns")
+        db.update_store("filecrypt", "original")
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "mutation callback"):
+                db.mutate_value(
+                    "filecrypt", lambda _current_value: db.retrieve("filecrypt")
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "mutation callback"):
+                db.mutate_value(
+                    "filecrypt", lambda _current_value: Config("API").get("key")
+                )
+
+            self.assertEqual("original", db.retrieve("filecrypt"))
+        finally:
+            db._conn.close()
 
     def test_rejects_invalid_table_name(self):
         with self.assertRaises(ValueError):

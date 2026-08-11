@@ -16,6 +16,7 @@ Hermetic unit tests for Quasarr, built exclusively on the standard-library `unit
 - Synthetic-data rule (security-critical): source hostnames in tests are fake domains on the reserved `.invalid` TLD; use synthetic release titles (never paste real ones). Real public hoster/crypter domains are permitted only where the production matching logic keys on those literal domains - they are hoster/crypter services, not protected sources.
 - `shared_state` is always faked (MagicMock with a `.values` dict, SimpleNamespace, or a small local class whose `values["config"]` is a callable returning dicts) - except the storage-layer tests above, which mutate the real module in `setUp`.
 - There is no fixtures directory and no shared test-helpers module: each file defines its own `FakeResponse`/`FakeSession`/fake shared_state inline.
+- `test_crypter_cooldowns.py` pins the canonical protected-crypter resolver, fixed three-distinct-observations/15-minute evidence rule, minimum cooldown, no-URL schema, state validation, successful-access clearing, and one-time protected-package probes. `test_sqlite_database.py` separately proves atomic concurrent mutation, rollback, and nested Config/DataBase rejection using the real SQLite wrapper.
 - Run the full suite after touching shared providers, download flow, search behavior, or notification logic. Per root change discipline, tests change only when the intended behavior in the covered area changed or the existing test is incorrect.
 
 ## Work Guidance
