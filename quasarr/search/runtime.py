@@ -5,6 +5,7 @@
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
 SOURCE_OUTCOMES = (
@@ -60,9 +61,9 @@ def _read_proc_fields(path, wanted):
         return {}
 
 
-def read_process_memory():
+def read_process_memory() -> dict[str, int | None]:
     """Process-wide RSS/PSS/thread readings, or None values off Linux."""
-    readings = dict.fromkeys(_MEMORY_KEYS, None)
+    readings: dict[str, int | None] = dict.fromkeys(_MEMORY_KEYS, None)
     if not sys.platform.startswith("linux"):
         return readings
     readings.update(_read_proc_fields("/proc/self/status", _STATUS_FIELDS))
@@ -72,6 +73,12 @@ def read_process_memory():
     return readings
 
 
+class _OverdueToken:
+    """Opaque handle for one overdue source task, compared by identity."""
+
+    __slots__ = ()
+
+
 class SearchRuntime:
     """Process-local, fixed-cardinality counters for the search fan-out.
 
@@ -79,103 +86,114 @@ class SearchRuntime:
     is meant for logs, so every value has to stay bounded.
     """
 
-    def __init__(self, clock=time.monotonic, memory_reader=read_process_memory):
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        memory_reader: Callable[[], Mapping[str, int | None]] = read_process_memory,
+    ) -> None:
+        # The clock is injected so later time-based work stays deterministic in
+        # tests; none of the counters below are time-based.
         self._clock = clock
         self._memory_reader = memory_reader
         self._lock = threading.RLock()
         self._counters = dict.fromkeys(_COUNTER_KEYS, 0)
         self._active_requests = 0
         self._active_source_tasks = 0
-        self._overdue_source_tasks = 0
+        self._overdue_tokens: set[_OverdueToken] = set()
         self._peak_active_source_tasks = 0
-        self._last_activity_at = clock()
-
-    @property
-    def last_activity_at(self):
-        with self._lock:
-            return self._last_activity_at
-
-    def reset(self):
-        with self._lock:
-            self._counters = dict.fromkeys(_COUNTER_KEYS, 0)
-            self._active_requests = 0
-            self._active_source_tasks = 0
-            self._overdue_source_tasks = 0
-            self._peak_active_source_tasks = 0
-            self._last_activity_at = self._clock()
 
     @contextmanager
-    def request(self, category_count, family_count):
+    def request(
+        self, category_count: int, family_count: int
+    ) -> Iterator["SearchRuntime"]:
         with self._lock:
             self._counters["requests_started"] += 1
             self._counters["categories_planned"] += int(category_count)
             self._counters["families_planned"] += int(family_count)
             self._active_requests += 1
-            self._last_activity_at = self._clock()
         try:
             yield self
         finally:
             with self._lock:
                 self._counters["requests_completed"] += 1
                 self._active_requests -= 1
-                self._last_activity_at = self._clock()
 
     @contextmanager
-    def source_task(self):
+    def source_task(self) -> Iterator["SearchRuntime"]:
         with self._lock:
             self._counters["source_started"] += 1
             self._active_source_tasks += 1
             self._peak_active_source_tasks = max(
                 self._peak_active_source_tasks, self._active_source_tasks
             )
-            self._last_activity_at = self._clock()
         try:
             yield self
         finally:
             with self._lock:
                 self._active_source_tasks -= 1
-                self._last_activity_at = self._clock()
 
-    def record_source_outcome(self, outcome):
+    def record_source_outcome(self, outcome: str) -> None:
         if outcome not in SOURCE_OUTCOMES:
             raise ValueError(f"Unknown search source outcome: {outcome}")
         self._increment(f"source_{outcome}")
 
-    def record_cache_hit(self):
+    def record_cache_hit(self) -> None:
         self._increment("cache_hits")
 
-    def record_cache_miss(self):
+    def record_cache_miss(self) -> None:
         self._increment("cache_misses")
 
-    def record_cache_eviction(self):
+    def record_cache_eviction(self) -> None:
         self._increment("cache_evictions")
 
-    def record_coalesced_waiter(self):
+    def record_coalesced_waiter(self) -> None:
         self._increment("coalesced_waiters")
 
-    def mark_source_overdue(self):
+    def mark_source_overdue(self) -> _OverdueToken:
+        """Claim one overdue slot and return the token that releases it."""
+        token = _OverdueToken()
         with self._lock:
-            self._overdue_source_tasks += 1
-            self._last_activity_at = self._clock()
+            self._overdue_tokens.add(token)
+        return token
 
-    def resolve_source_overdue(self):
+    def resolve_source_overdue(self, token: object) -> bool:
+        """Release only the slot claimed by `token`; replays return False."""
         with self._lock:
-            self._overdue_source_tasks = max(0, self._overdue_source_tasks - 1)
-            self._last_activity_at = self._clock()
+            if not isinstance(token, _OverdueToken):
+                return False
+            if token not in self._overdue_tokens:
+                return False
+            self._overdue_tokens.remove(token)
+            return True
 
-    def snapshot(self):
-        readings = self._memory_reader() or {}
+    def snapshot(self) -> dict[str, int | None]:
+        readings = self._memory_readings()
         with self._lock:
-            snapshot = dict(self._counters)
+            snapshot: dict[str, int | None] = dict(self._counters)
             snapshot["active_requests"] = self._active_requests
             snapshot["active_source_tasks"] = self._active_source_tasks
-            snapshot["overdue_source_tasks"] = self._overdue_source_tasks
+            snapshot["overdue_source_tasks"] = len(self._overdue_tokens)
             snapshot["peak_active_source_tasks"] = self._peak_active_source_tasks
-        for key in _MEMORY_KEYS:
-            snapshot[key] = readings.get(key)
+        snapshot.update(readings)
         return snapshot
 
-    def _increment(self, key):
+    def _memory_readings(self) -> dict[str, int | None]:
+        """Readings the snapshot can trust; anything else degrades to None."""
+        readings: dict[str, int | None] = dict.fromkeys(_MEMORY_KEYS, None)
+        try:
+            raw = self._memory_reader()
+        except Exception:
+            return readings
+        if not isinstance(raw, Mapping):
+            return readings
+        for key in _MEMORY_KEYS:
+            value = raw.get(key)
+            # bool is an int subclass, but a flag is never a KiB or thread count.
+            if isinstance(value, int) and not isinstance(value, bool):
+                readings[key] = value
+        return readings
+
+    def _increment(self, key: str) -> None:
         with self._lock:
             self._counters[key] += 1
 

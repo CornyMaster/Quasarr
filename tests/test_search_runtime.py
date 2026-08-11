@@ -1,3 +1,4 @@
+import io
 import unittest
 from threading import Barrier, Thread
 from unittest.mock import patch
@@ -35,8 +36,26 @@ SNAPSHOT_KEYS = {
 }
 
 
+PROC_FILES = {
+    "/proc/self/status": "Name:\tpython3\nVmRSS:\t  123456 kB\nThreads:\t17\n",
+    "/proc/self/smaps_rollup": "Rss:\t  123456 kB\nPss:\t   65432 kB\n",
+}
+
+
 def make_runtime(memory=None):
     return SearchRuntime(clock=lambda: 100.0, memory_reader=lambda: memory or {})
+
+
+def fake_proc_opener(files):
+    """Stand-in for open() so the /proc reader never touches a real file."""
+
+    def fake_open(path, *_args, **_kwargs):
+        try:
+            return io.StringIO(files[path])
+        except KeyError:
+            raise OSError(f"no such file: {path}") from None
+
+    return fake_open
 
 
 class SearchRuntimeTests(unittest.TestCase):
@@ -132,22 +151,42 @@ class SearchRuntimeTests(unittest.TestCase):
         self.assertEqual(3, snapshot["peak_active_source_tasks"])
         self.assertEqual(3, snapshot["source_started"])
 
-    def test_overdue_source_tasks_are_tracked_as_a_gauge(self):
+    def test_overdue_tokens_are_resolved_exactly_once(self):
         # A source dropped at the deadline keeps running; the gauge has to fall
-        # again once its future finishes, otherwise idle reclamation would
-        # never see a quiet process.
+        # again once its future finishes, otherwise idle reclamation would never
+        # see a quiet process. Several sources can be overdue at once and their
+        # futures finish in any order, so a resolve must release the caller's
+        # own slot only - a duplicate or replayed call must not cancel another
+        # task's mark.
         runtime = make_runtime()
 
-        runtime.mark_source_overdue()
-        runtime.mark_source_overdue()
+        first = runtime.mark_source_overdue()
+        second = runtime.mark_source_overdue()
+        self.assertIsNot(first, second)
         self.assertEqual(2, runtime.snapshot()["overdue_source_tasks"])
 
-        runtime.resolve_source_overdue()
+        self.assertTrue(runtime.resolve_source_overdue(first))
         self.assertEqual(1, runtime.snapshot()["overdue_source_tasks"])
 
-        runtime.resolve_source_overdue()
-        runtime.resolve_source_overdue()
+        self.assertFalse(runtime.resolve_source_overdue(first))
+        self.assertEqual(1, runtime.snapshot()["overdue_source_tasks"])
+
+        self.assertTrue(runtime.resolve_source_overdue(second))
         self.assertEqual(0, runtime.snapshot()["overdue_source_tasks"])
+
+    def test_foreign_overdue_tokens_never_move_the_gauge(self):
+        # A stale token from an earlier request - or from another runtime - must
+        # be inert, so no gauge can be driven below zero.
+        runtime = make_runtime()
+        other = make_runtime()
+        foreign = other.mark_source_overdue()
+
+        for token in (None, "token", 0, object(), foreign):
+            with self.subTest(token=token):
+                self.assertFalse(runtime.resolve_source_overdue(token))
+
+        self.assertEqual(0, runtime.snapshot()["overdue_source_tasks"])
+        self.assertEqual(1, other.snapshot()["overdue_source_tasks"])
 
     def test_cache_counters_are_recorded(self):
         runtime = make_runtime()
@@ -187,48 +226,86 @@ class SearchRuntimeTests(unittest.TestCase):
 
         self.assertEqual(SNAPSHOT_KEYS, set(runtime.snapshot()))
 
-    def test_activity_is_stamped_with_the_injected_clock(self):
-        ticks = iter([10.0, 20.0, 30.0, 40.0])
-        runtime = SearchRuntime(clock=lambda: next(ticks), memory_reader=lambda: {})
+    def test_snapshot_survives_a_raising_memory_reader(self):
+        # snapshot() is called from inside the fan-out; a /proc read that blows
+        # up has to degrade to "unknown" instead of aborting a search request.
+        def explode():
+            raise OSError("smaps_rollup vanished")
 
-        self.assertEqual(10.0, runtime.last_activity_at)
+        runtime = SearchRuntime(clock=lambda: 100.0, memory_reader=explode)
+
         with runtime.request(category_count=1, family_count=1):
-            self.assertEqual(20.0, runtime.last_activity_at)
-        self.assertEqual(30.0, runtime.last_activity_at)
+            snapshot = runtime.snapshot()
 
-    def test_reset_clears_counters_and_gauges(self):
-        runtime = make_runtime()
+        self.assertEqual(SNAPSHOT_KEYS, set(snapshot))
+        self.assertIsNone(snapshot["rss_kib"])
+        self.assertIsNone(snapshot["pss_kib"])
+        self.assertIsNone(snapshot["threads"])
+        self.assertEqual(1, snapshot["active_requests"])
 
-        with runtime.request(category_count=2, family_count=1):
-            with runtime.source_task():
-                runtime.record_source_outcome("completed")
-        runtime.mark_source_overdue()
+    def test_non_mapping_memory_readings_are_ignored(self):
+        for readings in (None, [("rss_kib", 4096)], "rss_kib=4096", 42):
+            with self.subTest(readings=readings):
+                runtime = SearchRuntime(
+                    clock=lambda: 100.0, memory_reader=lambda value=readings: value
+                )
 
-        runtime.reset()
+                snapshot = runtime.snapshot()
 
-        self.assertEqual(make_runtime().snapshot(), runtime.snapshot())
+                self.assertEqual(SNAPSHOT_KEYS, set(snapshot))
+                self.assertIsNone(snapshot["rss_kib"])
+                self.assertIsNone(snapshot["pss_kib"])
+                self.assertIsNone(snapshot["threads"])
 
-    def test_concurrent_source_tasks_are_counted_exactly(self):
+    def test_non_integer_memory_readings_are_dropped(self):
+        # Only int-or-None may reach the fixed memory fields: a string or float
+        # reading would put unbounded, reader-controlled text into the logs, and
+        # bool is an int subclass that is never a KiB or thread count.
+        runtime = make_runtime({"rss_kib": "4096 kB", "pss_kib": 2048.5, "threads": True})
+
+        snapshot = runtime.snapshot()
+
+        self.assertIsNone(snapshot["rss_kib"])
+        self.assertIsNone(snapshot["pss_kib"])
+        self.assertIsNone(snapshot["threads"])
+
+    def test_runtime_has_no_global_reset_hook(self):
+        # A public reset() lets one caller zero the counters while another
+        # thread sits inside request()/source_task(), whose finally block then
+        # decrements a fresh zero into a negative gauge. Tests build their own
+        # SearchRuntime (or patch the singleton) instead.
+        self.assertFalse(hasattr(make_runtime(), "reset"))
+
+    def test_concurrent_source_tasks_overlap_and_are_counted_exactly(self):
         # The fan-out runs one worker per source, so every counter update has to
-        # survive concurrent threads without losing increments.
+        # survive concurrent threads without losing increments. Holding all
+        # workers inside source_task() at the same time also proves the peak
+        # gauge records the real high-water mark instead of a serialized 1.
         runtime = make_runtime()
         workers = 8
-        barrier = Barrier(workers)
+        entered = Barrier(workers, timeout=15)
+        failures = []
 
         def work():
-            barrier.wait(5)
-            with runtime.source_task():
-                runtime.record_source_outcome("completed")
+            try:
+                with runtime.source_task():
+                    entered.wait()
+                    runtime.record_source_outcome("completed")
+            except Exception as error:
+                failures.append(error)
 
         threads = [Thread(target=work) for _ in range(workers)]
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(10)
+            thread.join(20)
 
+        self.assertEqual([], failures)
+        self.assertEqual([], [thread for thread in threads if thread.is_alive()])
         snapshot = runtime.snapshot()
         self.assertEqual(workers, snapshot["source_started"])
         self.assertEqual(workers, snapshot["source_completed"])
+        self.assertEqual(workers, snapshot["peak_active_source_tasks"])
         self.assertEqual(0, snapshot["active_source_tasks"])
 
     def test_module_singleton_is_a_search_runtime(self):
@@ -268,10 +345,35 @@ class ProcessMemoryTests(unittest.TestCase):
 
     def test_unreadable_proc_file_yields_no_fields(self):
         # smaps_rollup is absent on some kernels and containers; a missing file
-        # must degrade to "unknown", never raise into a search request.
-        self.assertEqual(
-            {}, _read_proc_fields("/proc/self/does-not-exist", {"Pss": "pss_kib"})
-        )
+        # must degrade to "unknown", never raise into a search request. The
+        # module's own open() is patched so the suite never touches disk.
+        with patch("quasarr.search.runtime.open", side_effect=OSError("denied")):
+            self.assertEqual(
+                {},
+                _read_proc_fields("/proc/self/smaps_rollup", {"Pss": "pss_kib"}),
+            )
+
+    def test_linux_readings_are_collected_from_both_proc_files(self):
+        with (
+            patch("quasarr.search.runtime.sys.platform", "linux"),
+            patch("quasarr.search.runtime.open", fake_proc_opener(PROC_FILES)),
+        ):
+            self.assertEqual(
+                {"rss_kib": 123456, "pss_kib": 65432, "threads": 17},
+                read_process_memory(),
+            )
+
+    def test_partial_proc_readings_leave_the_rest_unknown(self):
+        available = {"/proc/self/status": PROC_FILES["/proc/self/status"]}
+
+        with (
+            patch("quasarr.search.runtime.sys.platform", "linux"),
+            patch("quasarr.search.runtime.open", fake_proc_opener(available)),
+        ):
+            self.assertEqual(
+                {"rss_kib": 123456, "pss_kib": None, "threads": 17},
+                read_process_memory(),
+            )
 
 
 if __name__ == "__main__":

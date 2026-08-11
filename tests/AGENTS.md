@@ -17,7 +17,7 @@ Hermetic unit tests for Quasarr, built exclusively on the standard-library `unit
 - `shared_state` is always faked (MagicMock with a `.values` dict, SimpleNamespace, or a small local class whose `values["config"]` is a callable returning dicts) - except the storage-layer tests above, which mutate the real module in `setUp`.
 - There is no fixtures directory and no shared test-helpers module: each file defines its own `FakeResponse`/`FakeSession`/fake shared_state inline.
 - Run the full suite after touching shared providers, download flow, search behavior, or notification logic. Per root change discipline, tests change only when the intended behavior in the covered area changed or the existing test is incorrect.
-- `test_search_runtime.py` covers `quasarr/search/runtime.py`: it builds `SearchRuntime` with an injected clock and memory reader (never the module singleton's real ones), and asserts the snapshot key set exactly, so a counter carrying a source initial, query, or category ID fails the suite.
+- `test_search_runtime.py` covers `quasarr/search/runtime.py`: it builds `SearchRuntime` with an injected clock and memory reader (never the module singleton's real ones), and asserts the snapshot key set exactly, so a counter carrying a source initial, query, or category ID fails the suite. The `/proc` reader is driven through `patch("quasarr.search.runtime.open", ...)` with in-memory file content, so no test reads a real `/proc` path or any other file.
 
 ## Work Guidance
 
