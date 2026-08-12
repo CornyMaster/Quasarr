@@ -1402,9 +1402,35 @@ class SponsorsHelperApiTests(unittest.TestCase):
             ["tolink."],
             cooldown_service=FakeCooldownService(),
             excluded_package_ids=[uppercase_category],
+            enforce_package_contract=True,
         )
 
         self.assertEqual(PACKAGE_B, package_id)
+
+    def test_package_contract_applies_without_a_cooldown_service(self):
+        protected_packages = [
+            protected_package(
+                "Quasarr_Movies_" + "0" * 32,
+                "Uppercase.Category",
+                [["https://tolink.invalid/container/1", "tolink"]],
+            ),
+            protected_package(
+                PACKAGE_B,
+                "Conforming.Second",
+                [["https://tolink.invalid/container/2", "tolink"]],
+            ),
+        ]
+
+        # The contract follows the helper's capability, not cooldown filtering:
+        # a capable helper can only exclude IDs the exclusion list accepts.
+        package_id, data, _ = select_helper_package(
+            protected_packages,
+            ["tolink."],
+            enforce_package_contract=True,
+        )
+
+        self.assertEqual(PACKAGE_B, package_id)
+        self.assertEqual("Conforming.Second", data["title"])
 
     def test_exclusions_ignore_invalid_duplicates_and_cap_valid_ids_at_100(self):
         package_ids = [f"Quasarr_movies_{index:032x}" for index in range(101)]

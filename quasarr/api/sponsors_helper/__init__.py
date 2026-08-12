@@ -21,7 +21,7 @@ from quasarr.providers.crypter_cooldowns import (
     crypter_blocks_deferred,
     normalize_crypter_key,
 )
-from quasarr.providers.log import info, warn
+from quasarr.providers.log import debug, info, warn
 from quasarr.providers.notifications import update_release_notification
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
 from quasarr.providers.statistics import StatsHelper
@@ -152,13 +152,30 @@ def normalize_excluded_package_ids(package_ids):
     return frozenset(normalized_ids)
 
 
+def _log_safe_package_id(package_id):
+    """Persisted keys are untrusted input; keep them out of the log grammar."""
+    sanitized = "".join(
+        character if character.isalnum() or character in "_-" else "?"
+        for character in package_id[:64]
+    )
+    return sanitized or "<empty>"
+
+
 def select_helper_package(
     protected_packages,
     supported_url_patterns,
     supported_mirrors=None,
     cooldown_service=None,
     excluded_package_ids=None,
+    enforce_package_contract=False,
 ):
+    """Pick the next protected package to hand out.
+
+    `enforce_package_contract` follows the helper's advertised capability, not
+    the cooldown service: a capable helper reports and excludes packages by
+    canonical ID, so a non-canonical row it can never name must never be
+    selected - in any block mode - or it starves every later package.
+    """
     excluded_package_ids = normalize_excluded_package_ids(excluded_package_ids)
     cooldown_snapshots = {}
 
@@ -166,10 +183,13 @@ def select_helper_package(
         if not isinstance(package, (list, tuple)) or len(package) < 2:
             continue
         package_id = package[0]
-        if not isinstance(package_id, str) or (
-            cooldown_service is not None
-            and not PACKAGE_ID_PATTERN.fullmatch(package_id)
-        ):
+        if not isinstance(package_id, str):
+            continue
+        if enforce_package_contract and not PACKAGE_ID_PATTERN.fullmatch(package_id):
+            debug(
+                "Skipping protected package outside the package ID contract: "
+                f"{_log_safe_package_id(package_id)}"
+            )
             continue
         if package_id in excluded_package_ids:
             continue
@@ -511,7 +531,9 @@ def setup_sponsors_helper_routes(app):
                 and CRYPTER_DEFER_CAPABILITY in capabilities
             )
             # Legacy block mode selects exactly like an incapable helper: no
-            # cooldown service is built, so no hold can gate this handout.
+            # cooldown service is built, so no hold can gate this handout. The
+            # package ID contract still applies, because it is what makes the
+            # helper's exclusions expressible.
             cooldown_service = (
                 CrypterCooldownService(shared_state)
                 if defer_capable and crypter_blocks_deferred(shared_state)
@@ -524,6 +546,7 @@ def setup_sponsors_helper_routes(app):
                     supported_mirrors,
                     cooldown_service=cooldown_service,
                     excluded_package_ids=payload.get("excluded_package_ids"),
+                    enforce_package_contract=True,
                 )
             else:
                 selected_package = select_helper_package(

@@ -33,6 +33,9 @@ EVIDENCE_PACKAGE_IDS = (
     "Quasarr_movies_" + "c" * 32,
     "Quasarr_movies_" + "d" * 32,
 )
+# Sorts ahead of every canonical ID below, so selection reaches it first.
+MALFORMED_PACKAGE_ID = "Quasarr_Movies_" + "e" * 32
+CUSTOM_CATEGORY_PACKAGE_ID = "Quasarr_movies4k_" + "f" * 32
 REASON = "ip_block_suspected"
 NOW = 1_700_000_000
 COOLED_LINK = ["https://filecrypt.invalid/container/1", "filecrypt"]
@@ -604,6 +607,64 @@ class CrypterBlockModeBehaviorTests(unittest.TestCase):
         # Exclusions are in-flight handout state, not a cooldown hold, so the
         # legacy bypass must not resurrect duplicate handouts.
         self.assertEqual("Alternative.Package", excluded["to_decrypt"]["name"])
+
+    def test_fail_mode_capable_selection_still_enforces_the_package_contract(self):
+        self.state.databases["protected"].update_store(
+            MALFORMED_PACKAGE_ID, protected_blob("Malformed.Identifier", [CLEAR_LINK])
+        )
+        self.state.values["crypter_block_mode"] = "fail"
+        reads_before = self._cooldown_reads()
+
+        # A non-canonical ID cannot be normalized into an exclusion, so handing
+        # it out would starve every later package permanently.
+        selected, built = self.call_to_decrypt(
+            self.capable_payload(excluded_package_ids=[MALFORMED_PACKAGE_ID])
+        )
+
+        self.assertEqual("Cooled.Package", selected["to_decrypt"]["name"])
+        self.assertEqual(PACKAGE_ID, selected["to_decrypt"]["id"])
+        self.assertEqual([], built)
+        self.assertEqual(reads_before, self._cooldown_reads())
+
+    def test_fail_mode_capable_exclusions_honor_custom_category_ids(self):
+        self.state.databases["protected"].update_store(
+            CUSTOM_CATEGORY_PACKAGE_ID,
+            protected_blob("Custom.Category.Package", [CLEAR_LINK]),
+        )
+        self.state.values["crypter_block_mode"] = "fail"
+
+        selected, _ = self.call_to_decrypt(self.capable_payload())
+        self.assertEqual("Custom.Category.Package", selected["to_decrypt"]["name"])
+
+        excluded, built = self.call_to_decrypt(
+            self.capable_payload(excluded_package_ids=[CUSTOM_CATEGORY_PACKAGE_ID])
+        )
+
+        self.assertEqual("Cooled.Package", excluded["to_decrypt"]["name"])
+        self.assertEqual([], built)
+
+    def test_fail_mode_legacy_helper_keeps_selecting_malformed_ids(self):
+        self.state.databases["protected"].update_store(
+            MALFORMED_PACKAGE_ID, protected_blob("Malformed.Identifier", [CLEAR_LINK])
+        )
+        self.state.values["crypter_block_mode"] = "fail"
+
+        selected, built = self.call_to_decrypt({"supported_urls": list(HELPER_URLS)})
+
+        # Without the capability the helper cannot exclude anything, so the
+        # legacy selector keeps its exact pre-cooldown behavior.
+        self.assertEqual("Malformed.Identifier", selected["to_decrypt"]["name"])
+        self.assertEqual([], built)
+
+    def test_defer_mode_capable_selection_still_enforces_the_package_contract(self):
+        self.state.databases["protected"].update_store(
+            MALFORMED_PACKAGE_ID, protected_blob("Malformed.Identifier", [CLEAR_LINK])
+        )
+
+        selected, built = self.call_to_decrypt(self.capable_payload())
+
+        self.assertEqual("Alternative.Package", selected["to_decrypt"]["name"])
+        self.assertEqual([self.state], built)
 
     def test_legacy_helper_request_is_identical_in_both_modes(self):
         payload = {"supported_urls": list(HELPER_URLS)}
