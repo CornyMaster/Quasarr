@@ -152,9 +152,9 @@ class LazyFlareSolverrSession:
                     "Could not create FlareSolverr session for Cloudflare bypass"
                 )
 
-        # Browser solves can take longer than a plain search request. Keep the
-        # caller's HTTP budget for the initial request, but never give an
-        # actual FlareSolverr solve less than the existing session budget.
+        # Browser solves can take longer than a plain search request, so a solve
+        # asks for the session budget instead of the caller's HTTP timeout. The
+        # clamp still caps that at whatever the worker budget has left.
         checkpoint()
         solver_timeout = clamp_timeout(max(timeout, SESSION_REQUEST_TIMEOUT_SECONDS))
         # Only forward the flaresolverr-next JS extras when a caller asked for them,

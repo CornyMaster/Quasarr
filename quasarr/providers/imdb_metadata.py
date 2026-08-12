@@ -160,6 +160,12 @@ class IMDbHTML:
         solver_timeout = request_timeout(60)
         if solver_timeout is None:
             return None
+        # Both timeouts are resolved before the try: refusing to start because
+        # the worker is out of time is the deadline stopping the source, not a
+        # solver failure, and must not be swallowed as one.
+        post_timeout = request_timeout(solver_timeout + 10)
+        if post_timeout is None:
+            return None
         try:
             post_data = {
                 "cmd": "request.get",
@@ -167,9 +173,6 @@ class IMDbHTML:
                 "maxTimeout": solver_timeout * 1000,
             }
 
-            post_timeout = request_timeout(solver_timeout + 10)
-            if post_timeout is None:
-                return None
             response = requests.post(
                 flaresolverr_url,
                 json=post_data,

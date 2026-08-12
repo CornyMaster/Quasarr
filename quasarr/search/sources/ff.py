@@ -86,9 +86,12 @@ class Source(AbstractSearchSource):
             timeout = _remaining_feed_timeout(start_time)
             if timeout is None:
                 break
-            timeout = min(timeout, clamp_timeout(timeout))
 
             try:
+                # Clamped inside the try: the budget can expire between the
+                # checkpoint above and here, and stopping then must still answer
+                # with the dates already collected.
+                timeout = min(timeout, clamp_timeout(timeout))
                 r = cf_session.get(
                     f"https://{host}/updates/{formatted_date}#list",
                     headers,

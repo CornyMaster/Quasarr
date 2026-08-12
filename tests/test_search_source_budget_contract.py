@@ -475,6 +475,88 @@ class SourceBudgetBehaviorTests(unittest.TestCase):
         search_marked.assert_not_called()
 
 
+class FakeReleaseBudgetTests(unittest.TestCase):
+    """A response that serves fakes is never an answer, budget or no budget."""
+
+    def _page_session(self, first_page):
+        session = MagicMock()
+        session.get.side_effect = [first_page] + [FakeResponse([]) for _ in range(4)]
+        return session
+
+    @staticmethod
+    def _fake_serving_page():
+        return FakeResponse(
+            [
+                {
+                    "release": "Synthetic.Movie.2031.1080p.WEB.h264-GROUP",
+                    "size": 1073741824,
+                    "when": 1700000000,
+                },
+                {"release": "Synthetic.Movie.2031.Fake", "fake": True},
+            ]
+        )
+
+    def test_fake_release_answers_empty_when_the_budget_runs_out_first(self):
+        from quasarr.search.sources import dd
+
+        clock = ManualClock(0.0)
+
+        def spend_budget(*_args):
+            # The last release parsed before the fake one uses up the budget.
+            clock.now = 10.0
+            return "download://synthetic"
+
+        state = shared_state_for("dd")
+        with (
+            patch.object(
+                dd,
+                "retrieve_and_validate_session",
+                return_value=self._page_session(self._fake_serving_page()),
+            ),
+            patch.object(dd, "create_and_persist_session") as invalidated,
+            patch.object(dd, "is_valid_release", return_value=True),
+            patch.object(dd, "generate_download_link", side_effect=spend_budget),
+            patch.object(dd, "mark_hostname_issue") as marked,
+            patch.object(dd, "clear_hostname_issue"),
+            use_search_budget(10.0, clock=clock),
+        ):
+            releases = dd.Source().search(
+                state, 0.0, SEARCH_CAT_MOVIES, "Synthetic Movie"
+            )
+
+        self.assertEqual([], releases)
+        # No time left to log back in, but the fakes must not be answered with.
+        invalidated.assert_not_called()
+        marked.assert_not_called()
+
+    def test_fake_release_still_invalidates_the_session_while_time_remains(self):
+        from quasarr.search.sources import dd
+
+        state = shared_state_for("dd")
+        with (
+            patch.object(
+                dd,
+                "retrieve_and_validate_session",
+                return_value=self._page_session(self._fake_serving_page()),
+            ),
+            patch.object(dd, "create_and_persist_session") as invalidated,
+            patch.object(dd, "is_valid_release", return_value=True),
+            patch.object(
+                dd, "generate_download_link", return_value="download://synthetic"
+            ),
+            patch.object(dd, "mark_hostname_issue") as marked,
+            patch.object(dd, "clear_hostname_issue"),
+            use_search_budget(10.0, clock=ManualClock(0.0)),
+        ):
+            releases = dd.Source().search(
+                state, 0.0, SEARCH_CAT_MOVIES, "Synthetic Movie"
+            )
+
+        self.assertEqual([], releases)
+        invalidated.assert_called_once_with(state)
+        marked.assert_not_called()
+
+
 class SharedProviderBudgetTests(unittest.TestCase):
     def test_arr_clients_clamp_requests_to_the_worker_budget(self):
         from quasarr.providers import radarr_api, sonarr_api

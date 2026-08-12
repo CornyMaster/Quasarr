@@ -4,7 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from quasarr.providers import imdb_metadata
-from quasarr.search.sources.helpers.budget import use_search_budget
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    use_search_budget,
+)
 
 
 class ManualClock:
@@ -13,6 +16,26 @@ class ManualClock:
 
     def __call__(self):
         return self.now
+
+
+class ClockSpentAfter:
+    """Wall clock for a budget that runs out after a known number of reads.
+
+    `IMDbHTML._request` reads the budget twice for every timeout it computes -
+    once for `checkpoint()`, once for `clamp_timeout()`. Four reads therefore
+    carry the direct request and the solver's own maxTimeout, and the fifth is
+    the POST timeout, which is the read that used to sit inside the solver's
+    `try` and be reported as a solver failure.
+    """
+
+    def __init__(self, reads_before_spent, deadline):
+        self._reads_before_spent = reads_before_spent
+        self._deadline = deadline
+        self.reads = 0
+
+    def __call__(self):
+        self.reads += 1
+        return 0.0 if self.reads <= self._reads_before_spent else self._deadline
 
 
 class LocalizedTitleDeadlineTests(unittest.TestCase):
@@ -125,6 +148,44 @@ class LocalizedTitleDeadlineTests(unittest.TestCase):
 
         self.assertIsNone(html)
         post.assert_not_called()
+
+    def test_the_flaresolverr_fallback_does_not_log_a_spent_budget_as_a_failure(self):
+        # Refusing to start a solve because the worker is out of time is the
+        # budget stopping the source, not FlareSolverr failing: swallowing it
+        # here hides the deadline and mislabels the host.
+        clock = ClockSpentAfter(4, deadline=10.0)
+        with (
+            patch.object(
+                imdb_metadata.requests, "get", side_effect=RuntimeError("unreachable")
+            ),
+            patch.object(imdb_metadata.requests, "post") as post,
+            patch.object(
+                imdb_metadata,
+                "_get_config",
+                return_value={"url": "https://solver.invalid"},
+            ),
+            patch.object(
+                imdb_metadata,
+                "_get_db",
+                return_value=SimpleNamespace(retrieve=lambda _key: None),
+            ),
+            patch.object(imdb_metadata, "debug") as logged,
+            use_search_budget(10.0, clock=clock),
+        ):
+            with self.assertRaises(SearchBudgetExhausted):
+                imdb_metadata.IMDbHTML._request(
+                    "https://metadata.invalid/releaseinfo/", "fr"
+                )
+
+        post.assert_not_called()
+        self.assertEqual(
+            [],
+            [
+                call
+                for call in logged.call_args_list
+                if "FlareSolverr request failed" in str(call)
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -161,8 +161,14 @@ class Source(AbstractSearchSource):
                         debug(
                             f"Release {release.get('release')} marked as fake. Invalidating session..."
                         )
-                        checkpoint()
-                        create_and_persist_session(shared_state)
+                        try:
+                            checkpoint()
+                            create_and_persist_session(shared_state)
+                        except SearchBudgetExhausted:
+                            # No time left to log back in - but a response that
+                            # serves fakes is still not an answer, so nothing
+                            # collected from it may be handed back.
+                            pass
                         return []
                     else:
                         title = release.get("release")
