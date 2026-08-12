@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import threading
 import unittest
 from unittest import mock
 
@@ -11,9 +12,13 @@ from quasarr.api.sponsors_helper import (
     select_helper_package,
     setup_sponsors_helper_routes,
 )
+from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 
 PACKAGE_A = "Quasarr_movies_00000000000000000000000000000000"
 PACKAGE_B = "Quasarr_movies_11111111111111111111111111111111"
+PACKAGE_C = "Quasarr_movies_22222222222222222222222222222222"
+PACKAGE_D = "Quasarr_movies_33333333333333333333333333333333"
+NONCONFORMING_PACKAGE = "Quasarr_movies_00000000000000000000000000000001"
 NOW = 1_700_000_000
 
 
@@ -106,6 +111,52 @@ class FakeCooldownService:
         return True
 
 
+class AtomicDatabase:
+    def __init__(self, rows=None):
+        self.rows = dict(rows or {})
+        self.lock = threading.Lock()
+        self.before_mutation = None
+
+    def retrieve(self, key):
+        with self.lock:
+            return self.rows.get(key)
+
+    def retrieve_all_titles(self):
+        with self.lock:
+            items = [[key, value] for key, value in sorted(self.rows.items())]
+            return items or None
+
+    def mutate_value(self, key, mutator):
+        with self.lock:
+            if self.before_mutation is not None:
+                before_mutation = self.before_mutation
+                self.before_mutation = None
+                before_mutation()
+            value = mutator(self.rows.get(key))
+            if value is not None and not isinstance(value, str):
+                raise TypeError("mutator must return str or None")
+            if value is None:
+                self.rows.pop(key, None)
+            else:
+                self.rows[key] = value
+            return value
+
+
+class AtomicSharedState:
+    def __init__(self, protected_rows):
+        self.values = {}
+        self.databases = {
+            "protected": AtomicDatabase(protected_rows),
+            "crypter_cooldowns": AtomicDatabase(),
+        }
+
+    def get_db(self, table):
+        return self.databases[table]
+
+    def update(self, key, value):
+        self.values[key] = value
+
+
 class SponsorsHelperApiTests(unittest.TestCase):
     def call_to_decrypt(self, protected_packages, payload, cooldown_service=None):
         app = Bottle()
@@ -131,7 +182,6 @@ class SponsorsHelperApiTests(unittest.TestCase):
             mock.patch(
                 "quasarr.api.sponsors_helper.CrypterCooldownService",
                 return_value=cooldown_service or FakeCooldownService(),
-                create=True,
             ) as cooldown_type,
         ):
             return route.callback(), cooldown_type
@@ -402,6 +452,28 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual(PACKAGE_B, package_id)
         self.assertEqual("Unrelated.Second", data["title"])
 
+    def test_unresolved_he_like_link_remains_eligible(self):
+        protected_packages = [
+            protected_package(
+                PACKAGE_A,
+                "Unresolved.HE.Link",
+                [["https://source.invalid/release", "he"]],
+            )
+        ]
+
+        package_id, _, links = select_helper_package(
+            protected_packages,
+            ["container."],
+            supported_mirrors=["he"],
+            cooldown_service=FakeCooldownService(cooling_crypters={"filecrypt"}),
+        )
+
+        self.assertEqual(PACKAGE_A, package_id)
+        self.assertEqual(
+            [["https://source.invalid/release", "he"]],
+            links,
+        )
+
     def test_provisional_hold_skips_only_matching_package_and_crypter(self):
         service = FakeCooldownService(package_defers={PACKAGE_A: package_defer()})
         protected_packages = [
@@ -471,7 +543,34 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual(PACKAGE_B, second_package)
         self.assertEqual([(PACKAGE_A, "filecrypt")], service.probe_consumptions)
 
-    def test_failed_probe_consumption_skips_the_whole_package(self):
+    def test_queued_probe_is_not_consumed_after_hold_clears(self):
+        service = FakeCooldownService(
+            package_defers={
+                PACKAGE_A: package_defer(active=False, probe_requested=True)
+            }
+        )
+        protected_packages = [
+            protected_package(
+                PACKAGE_A,
+                "Recovered.Hold",
+                [["https://filecrypt.invalid/container/1", "filecrypt"]],
+            )
+        ]
+
+        package_id, _, links = select_helper_package(
+            protected_packages,
+            ["filecrypt."],
+            cooldown_service=service,
+        )
+
+        self.assertEqual(PACKAGE_A, package_id)
+        self.assertEqual(
+            [["https://filecrypt.invalid/container/1", "filecrypt"]],
+            links,
+        )
+        self.assertEqual([], service.probe_consumptions)
+
+    def test_failed_probe_consumption_drops_only_probe_dependent_links(self):
         service = FakeCooldownService(
             cooling_crypters={"filecrypt"},
             package_defers={PACKAGE_A: package_defer(probe_requested=True)},
@@ -493,14 +592,110 @@ class SponsorsHelperApiTests(unittest.TestCase):
             ),
         ]
 
-        package_id, _, _ = select_helper_package(
+        package_id, _, links = select_helper_package(
             protected_packages,
             ["filecrypt.", "tolink."],
             cooldown_service=service,
         )
 
-        self.assertEqual(PACKAGE_B, package_id)
+        self.assertEqual(PACKAGE_A, package_id)
+        self.assertEqual(
+            [["https://tolink.invalid/container/1", "tolink"]],
+            links,
+        )
         self.assertEqual([(PACKAGE_A, "filecrypt")], service.probe_consumptions)
+
+    def test_real_cooldown_selection_survives_probe_race_and_malformed_rows(self):
+        state = AtomicSharedState(
+            {
+                "0-invalid-package": json.dumps(
+                    {
+                        "title": "Invalid.Identifier",
+                        "links": [
+                            ["https://tolink.invalid/container/invalid", "tolink"]
+                        ],
+                        "password": "",
+                    }
+                ),
+                PACKAGE_A: "{malformed-json",
+                NONCONFORMING_PACKAGE: json.dumps(
+                    {
+                        "links": [
+                            ["https://tolink.invalid/container/no-title", "tolink"]
+                        ],
+                        "password": "",
+                    }
+                ),
+                PACKAGE_B: json.dumps(
+                    {
+                        "title": "Probe.Race.Alternate",
+                        "links": [
+                            ["https://filecrypt.invalid/container/1", "filecrypt"],
+                            ["https://tolink.invalid/container/1", "tolink"],
+                        ],
+                        "password": "",
+                    }
+                ),
+            }
+        )
+        service = CrypterCooldownService(state)
+        for package_id, fingerprint_character in (
+            (PACKAGE_B, "a"),
+            (PACKAGE_C, "b"),
+            (PACKAGE_D, "c"),
+        ):
+            decision = service.observe(
+                "filecrypt",
+                package_id,
+                fingerprint_character * 64,
+                "ip_block_suspected",
+            )
+        service.defer_package(
+            PACKAGE_B,
+            "filecrypt",
+            "ip_block_suspected",
+            decision["package_retry_after_epoch"],
+            observation_holds=0,
+        )
+        service.request_probe([PACKAGE_B])
+        protected_database = state.databases["protected"]
+        race_observed = []
+
+        def consume_probe_elsewhere():
+            package = json.loads(protected_database.rows[PACKAGE_B])
+            package["deferred"]["probe_requested"] = False
+            protected_database.rows[PACKAGE_B] = json.dumps(package)
+            race_observed.append(PACKAGE_B)
+
+        protected_database.before_mutation = consume_probe_elsewhere
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(
+            route
+            for route in app.routes
+            if route.rule == "/sponsors_helper/api/to_decrypt/"
+        )
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.shared_state", state),
+            mock.patch(
+                "quasarr.api.sponsors_helper.request",
+                mock.Mock(
+                    json={
+                        "supported_urls": ["filecrypt.", "tolink."],
+                        "capabilities": ["crypter_defer_v1"],
+                    }
+                ),
+            ),
+        ):
+            result = route.callback()
+
+        self.assertEqual([PACKAGE_B], race_observed)
+        self.assertEqual("Probe.Race.Alternate", result["to_decrypt"]["name"])
+        self.assertEqual(
+            [["https://tolink.invalid/container/1", "tolink"]],
+            result["to_decrypt"]["url"],
+        )
 
     def test_exclusions_ignore_invalid_duplicates_and_cap_valid_ids_at_100(self):
         package_ids = [f"Quasarr_movies_{index:032x}" for index in range(101)]

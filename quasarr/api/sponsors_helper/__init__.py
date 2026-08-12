@@ -159,11 +159,23 @@ def select_helper_package(
     cooldown_snapshots = {}
 
     for package in protected_packages:
+        if not isinstance(package, (list, tuple)) or len(package) < 2:
+            continue
         package_id = package[0]
+        if not isinstance(package_id, str) or (
+            cooldown_service is not None
+            and not PACKAGE_ID_PATTERN.fullmatch(package_id)
+        ):
+            continue
         if package_id in excluded_package_ids:
             continue
 
-        data = json.loads(package[1])
+        try:
+            data = json.loads(package[1])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or not {"title", "password"}.issubset(data):
+            continue
         if "disabled" in data:
             continue
 
@@ -214,6 +226,7 @@ def select_helper_package(
 
         package_defer = cooldown_service.get_package_defer(package_id)
         eligible_supported_links = []
+        probe_dependent_links = []
         probe_crypter = None
 
         for link in supported_links:
@@ -242,8 +255,9 @@ def select_helper_package(
 
             if blocked and not probe_requested:
                 continue
-            if probe_requested:
+            if blocked and probe_requested:
                 probe_crypter = crypter
+                probe_dependent_links.append(link)
             eligible_supported_links.append(link)
 
         if not eligible_supported_links:
@@ -251,7 +265,13 @@ def select_helper_package(
         if probe_crypter and not cooldown_service.consume_probe(
             package_id, probe_crypter
         ):
-            continue
+            eligible_supported_links = [
+                link
+                for link in eligible_supported_links
+                if link not in probe_dependent_links
+            ]
+            if not eligible_supported_links:
+                continue
 
         unsupported_links = prioritized_links[len(supported_links) :]
         return package_id, data, eligible_supported_links + unsupported_links
