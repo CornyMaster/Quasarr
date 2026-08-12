@@ -38,12 +38,18 @@ class FakeClock:
 
 
 class FakeDatabase:
-    def __init__(self):
+    def __init__(self, tables=None):
         self.rows = {}
+        self.tables = {} if tables is None else tables
         self.lock = threading.Lock()
         self.mutation_count = 0
         self.retrieve_count = 0
         self.before_mutation = None
+
+    def _peer(self, table):
+        if table not in self.tables:
+            self.tables[table] = FakeDatabase(self.tables)
+        return self.tables[table]
 
     def retrieve(self, key):
         self.retrieve_count += 1
@@ -67,15 +73,40 @@ class FakeDatabase:
                 self.rows[key] = value
             return value
 
+    def mutate_values(self, targets, mutator):
+        """One transaction over several tables, like the sqlite primitive."""
+        with self.lock:
+            self.mutation_count += 1
+            if self.before_mutation is not None:
+                before_mutation = self.before_mutation
+                self.before_mutation = None
+                before_mutation()
+            databases = [self._peer(table) for table, _key in targets]
+            values = mutator(
+                tuple(
+                    database.rows.get(key)
+                    for database, (_table, key) in zip(databases, targets, strict=True)
+                )
+            )
+            for database, (_table, key), value in zip(
+                databases, targets, values, strict=True
+            ):
+                if value is None:
+                    database.rows.pop(key, None)
+                else:
+                    database.rows[key] = value
+            return tuple(values)
+
 
 class FakeSharedState:
     def __init__(self, cooldown_hours=24):
         self.values = {"crypter_cooldown_hours": cooldown_hours}
-        self.databases = {
-            "crypter_cooldowns": FakeDatabase(),
-        }
+        self.databases = {}
+        self.databases["crypter_cooldowns"] = FakeDatabase(self.databases)
 
     def get_db(self, table):
+        if table not in self.databases:
+            self.databases[table] = FakeDatabase(self.databases)
         return self.databases[table]
 
 

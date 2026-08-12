@@ -31,8 +31,9 @@ class FakeClock:
 
 
 class FakeDatabase:
-    def __init__(self, frozen=False):
+    def __init__(self, frozen=False, tables=None):
         self.rows = {}
+        self.tables = {} if tables is None else tables
         self.lock = threading.Lock()
         self.frozen = frozen
         self.mutation_count = 0
@@ -40,6 +41,11 @@ class FakeDatabase:
         # One-shot hook simulating a concurrent writer that lands just before
         # the next write of this table starts reading.
         self.before_write = None
+
+    def _peer(self, table):
+        if table not in self.tables:
+            self.tables[table] = FakeDatabase(tables=self.tables)
+        return self.tables[table]
 
     def _interleave(self, key):
         hook, self.before_write = self.before_write, None
@@ -77,6 +83,28 @@ class FakeDatabase:
                 self.rows[key] = value
             return value
 
+    def mutate_values(self, targets, mutator):
+        """One transaction over several tables, like the sqlite primitive."""
+        self._interleave(targets[0][1])
+        with self.lock:
+            self.mutation_count += 1
+            databases = [self._peer(table) for table, _key in targets]
+            values = mutator(
+                tuple(
+                    database.rows.get(key)
+                    for database, (_table, key) in zip(databases, targets, strict=True)
+                )
+            )
+            for database, (_table, key), value in zip(
+                databases, targets, values, strict=True
+            ):
+                if value is None:
+                    if not database.frozen:
+                        database.rows.pop(key, None)
+                else:
+                    database.rows[key] = value
+            return tuple(values)
+
     def delete_exact(self, key, value):
         self._interleave(key)
         with self.lock:
@@ -105,14 +133,17 @@ class FakeSharedState:
             "database": self.get_db,
             "external_address": "https://quasarr.invalid",
         }
-        self.databases = {
-            "protected": FakeDatabase(frozen=frozen_protected),
-            "failed": FakeDatabase(),
-            "crypter_cooldowns": FakeDatabase(),
-        }
+        self.databases = {}
+        self.databases["protected"] = FakeDatabase(
+            frozen=frozen_protected, tables=self.databases
+        )
+        for table in ("failed", "crypter_cooldowns"):
+            self.databases[table] = FakeDatabase(tables=self.databases)
         self.device_calls = 0
 
     def get_db(self, table):
+        if table not in self.databases:
+            self.databases[table] = FakeDatabase(tables=self.databases)
         return self.databases[table]
 
     def get_device(self):

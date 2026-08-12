@@ -8,9 +8,22 @@ from json import loads
 from typing import Any, Dict
 
 from quasarr.providers.crypter_cooldowns import (
+    CRYPTER_EVENT_FIELDS,
+    CRYPTER_EVENT_KEY,
+    CRYPTER_EVENT_TABLE,
     CrypterCooldownService,
     crypter_blocks_deferred,
+    decode_pending_crypter_events,
 )
+from quasarr.providers.log import debug, warn
+
+# The linkcrypter services record their transitions in one durable ledger row;
+# these are the cumulative counters that row is drained into.
+CRYPTER_EVENT_COUNTERS = {
+    "observations": "crypter_block_observations",
+    "cooldowns": "crypter_cooldowns",
+    "probes": "crypter_probes",
+}
 
 
 class StatsHelper:
@@ -63,34 +76,73 @@ class StatsHelper:
         current = self._get_stat(key, 0)
         db.update_store(key, str(current + count))
 
-    def _increment_transition(self, key: str):
-        """Increment one state-transition counter inside a single transaction.
+    def _get_event_db(self):
+        return self.shared_state.values["database"](CRYPTER_EVENT_TABLE)
 
-        Transition counters are written from concurrent request handlers, so
-        they read and write in one `mutate_value()` transaction instead of a
-        separate read and write that can lose a committed increment.
+    def pending_crypter_events(self) -> Dict[str, int]:
+        """Linkcrypter transitions that are recorded but not counted yet.
+
+        The ledger is written by the transactions that perform the transitions,
+        so it holds every event a failed or missing flush has not moved into the
+        counters. An unreadable row is worth nothing and is pruned here.
         """
+        database = self._get_event_db()
+        counts, readable = decode_pending_crypter_events(
+            database.retrieve(CRYPTER_EVENT_KEY)
+        )
+        if not readable:
+            warn("Discarding an unreadable linkcrypter transition ledger row")
+            database.mutate_value(CRYPTER_EVENT_KEY, lambda _current_value: None)
+        return counts
 
-        def add_one(current_value):
-            try:
-                current = int(current_value) if current_value is not None else 0
-            except (ValueError, TypeError):
-                current = 0
-            return str(current + 1)
+    def flush_crypter_events(self):
+        """Move the durable linkcrypter ledger into the cumulative counters.
 
-        self._get_db().mutate_value(key, add_one)
+        One transaction adds the pending counts and clears the ledger, so an
+        interrupted flush leaves every event pending and a repeated flush can
+        never count one twice.
+        """
+        pending = self.pending_crypter_events()
+        if not any(pending.values()):
+            return
 
-    def increment_crypter_block_observations(self):
-        """Count one newly recorded linkcrypter block observation"""
-        self._increment_transition("crypter_block_observations")
+        targets = ((CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY),) + tuple(
+            ("statistics", CRYPTER_EVENT_COUNTERS[field])
+            for field in CRYPTER_EVENT_FIELDS
+        )
 
-    def increment_crypter_cooldowns(self):
-        """Count one linkcrypter entering cooldown"""
-        self._increment_transition("crypter_cooldowns")
+        def move(current_values):
+            counts, _readable = decode_pending_crypter_events(current_values[0])
+            moved = [None]
+            for field, current_value in zip(
+                CRYPTER_EVENT_FIELDS, current_values[1:], strict=True
+            ):
+                try:
+                    current = int(current_value) if current_value is not None else 0
+                except (ValueError, TypeError):
+                    current = 0
+                moved.append(str(current + counts[field]))
+            return moved
 
-    def increment_crypter_probes(self):
-        """Count one queued availability probe that was actually spent"""
-        self._increment_transition("crypter_probes")
+        self._get_db().mutate_values(targets, move)
+
+    def _reconcile_crypter_events(self) -> Dict[str, int]:
+        """Flush the ledger and report whatever could not be flushed.
+
+        Reading statistics must never fail on a write problem, and an event that
+        stays pending must still be visible, so it is added to the stored
+        counter for this read instead of being dropped or counted twice.
+        """
+        try:
+            self.flush_crypter_events()
+            return dict.fromkeys(CRYPTER_EVENT_FIELDS, 0)
+        except Exception as error:
+            debug(f"Deferring the linkcrypter statistics flush: {error}")
+        try:
+            return self.pending_crypter_events()
+        except Exception as error:
+            debug(f"Pending linkcrypter transitions are unreadable: {error}")
+            return dict.fromkeys(CRYPTER_EVENT_FIELDS, 0)
 
     def increment_package_with_links(self, links):
         """Increment package downloaded and links processed for one package, or failed download if no links
@@ -264,6 +316,7 @@ class StatsHelper:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get all current statistics"""
+        pending_crypter_events = self._reconcile_crypter_events()
         stats = {
             "packages_downloaded": self._get_stat("packages_downloaded", 0),
             "links_processed": self._get_stat("links_processed", 0),
@@ -278,12 +331,9 @@ class StatsHelper:
                 "failed_decryptions_automatic", 0
             ),
             "failed_decryptions_manual": self._get_stat("failed_decryptions_manual", 0),
-            "crypter_block_observations": self._get_stat(
-                "crypter_block_observations", 0
-            ),
-            "crypter_cooldowns": self._get_stat("crypter_cooldowns", 0),
-            "crypter_probes": self._get_stat("crypter_probes", 0),
         }
+        for field, key in CRYPTER_EVENT_COUNTERS.items():
+            stats[key] = self._get_stat(key, 0) + pending_crypter_events[field]
 
         # Calculate totals and rates
         total_captcha_decryptions = (

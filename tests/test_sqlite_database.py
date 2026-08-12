@@ -146,6 +146,78 @@ class SQLiteDatabaseTests(unittest.TestCase):
             writer._conn.close()
             reader._conn.close()
 
+    def test_mutate_values_commits_every_table_of_one_decision(self):
+        writer = DataBase("crypter_cooldowns")
+        reader = DataBase("crypter_events")
+        writer.update_store("filecrypt", "record")
+
+        try:
+            result = writer.mutate_values(
+                (("crypter_cooldowns", "filecrypt"), ("crypter_events", "pending")),
+                lambda current_values: (f"{current_values[0]}-updated", "counted"),
+            )
+
+            self.assertEqual(("record-updated", "counted"), result)
+            self.assertEqual("record-updated", writer.retrieve("filecrypt"))
+            # The second table is created on demand and committed together.
+            self.assertEqual("counted", reader.retrieve("pending"))
+        finally:
+            writer._conn.close()
+            reader._conn.close()
+
+    def test_mutate_values_rolls_back_every_table_on_failure(self):
+        writer = DataBase("crypter_cooldowns")
+        events = DataBase("crypter_events")
+        writer.update_store("filecrypt", "record")
+        events.update_store("pending", "counted")
+
+        def explode(_current_values):
+            raise RuntimeError("decision failed")
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "decision failed"):
+                writer.mutate_values(
+                    (("crypter_cooldowns", "filecrypt"), ("crypter_events", "pending")),
+                    explode,
+                )
+
+            self.assertEqual("record", writer.retrieve("filecrypt"))
+            self.assertEqual("counted", events.retrieve("pending"))
+        finally:
+            writer._conn.close()
+            events._conn.close()
+
+    def test_mutate_values_rejects_unusable_targets_and_returns(self):
+        db = DataBase("crypter_cooldowns")
+
+        try:
+            with self.assertRaises(ValueError):
+                db.mutate_values((), lambda _current_values: ())
+            with self.assertRaises(ValueError):
+                db.mutate_values(
+                    (("crypter_events", "pending"), ("crypter_events", "pending")),
+                    lambda current_values: current_values,
+                )
+            with self.assertRaises(ValueError):
+                db.mutate_values(
+                    (("crypter_events; DROP TABLE failed", "pending"),),
+                    lambda current_values: current_values,
+                )
+            with self.assertRaises(TypeError):
+                db.mutate_values(
+                    (("crypter_cooldowns", "filecrypt"),),
+                    lambda _current_values: ("first", "second"),
+                )
+            with self.assertRaises(TypeError):
+                db.mutate_values(
+                    (("crypter_cooldowns", "filecrypt"),),
+                    lambda _current_values: (17,),
+                )
+
+            self.assertIsNone(db.retrieve("filecrypt"))
+        finally:
+            db._conn.close()
+
     def test_delete_exact_removes_only_one_matching_row_and_commits(self):
         writer = DataBase("failed")
         reader = DataBase("failed")

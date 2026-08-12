@@ -116,10 +116,21 @@ class FakeCooldownService:
 
 
 class AtomicDatabase:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, tables=None):
         self.rows = dict(rows or {})
+        self.tables = {} if tables is None else tables
         self.lock = threading.Lock()
         self.before_mutation = None
+
+    def _peer(self, table):
+        if table not in self.tables:
+            self.tables[table] = AtomicDatabase(tables=self.tables)
+        return self.tables[table]
+
+    def _interleave(self):
+        hook, self.before_mutation = self.before_mutation, None
+        if hook is not None:
+            hook()
 
     def retrieve(self, key):
         with self.lock:
@@ -140,10 +151,7 @@ class AtomicDatabase:
 
     def mutate_value(self, key, mutator):
         with self.lock:
-            if self.before_mutation is not None:
-                before_mutation = self.before_mutation
-                self.before_mutation = None
-                before_mutation()
+            self._interleave()
             value = mutator(self.rows.get(key))
             if value is not None and not isinstance(value, str):
                 raise TypeError("mutator must return str or None")
@@ -153,17 +161,43 @@ class AtomicDatabase:
                 self.rows[key] = value
             return value
 
+    def mutate_values(self, targets, mutator):
+        """One transaction over several tables, like the sqlite primitive."""
+        with self.lock:
+            self._interleave()
+            databases = [self._peer(table) for table, _key in targets]
+            values = mutator(
+                tuple(
+                    database.rows.get(key)
+                    for database, (_table, key) in zip(databases, targets, strict=True)
+                )
+            )
+            for value in values:
+                if value is not None and not isinstance(value, str):
+                    raise TypeError("mutator must return str or None")
+            for database, (_table, key), value in zip(
+                databases, targets, values, strict=True
+            ):
+                if value is None:
+                    database.rows.pop(key, None)
+                else:
+                    database.rows[key] = value
+            return tuple(values)
+
 
 class AtomicSharedState:
     def __init__(self, protected_rows):
-        self.databases = {
-            "protected": AtomicDatabase(protected_rows),
-            "crypter_cooldowns": AtomicDatabase(),
-            "statistics": AtomicDatabase(),
-        }
+        self.databases = {}
+        self.databases["protected"] = AtomicDatabase(
+            protected_rows, tables=self.databases
+        )
+        for table in ("crypter_cooldowns", "statistics"):
+            self.databases[table] = AtomicDatabase(tables=self.databases)
         self.values = {"database": self.get_db}
 
     def get_db(self, table):
+        if table not in self.databases:
+            self.databases[table] = AtomicDatabase(tables=self.databases)
         return self.databases[table]
 
     def update(self, key, value):
@@ -330,9 +364,12 @@ class SponsorsHelperApiTests(unittest.TestCase):
         deferred = service.get_package_defer(PACKAGE_A)
         self.assertEqual(1, deferred.get("observation_holds") if deferred else None)
         fail.assert_not_called()
+        # The transition is counted by the transaction that recorded it, so the
+        # route never depends on statistics storage at all.
+        self.assertEqual([], stats.mock_calls)
         self.assertEqual(
-            ["increment_crypter_block_observations"],
-            [call[0] for call in stats.return_value.method_calls],
+            {"observations": 1, "cooldowns": 0, "probes": 0},
+            json.loads(state.databases["crypter_events"].rows["pending"]),
         )
         notify.assert_not_called()
 
@@ -562,11 +599,12 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual(404, context.exception.status_code)
         self.assertEqual("observing", service.snapshot("filecrypt")["state"])
         fail.assert_not_called()
-        # The evidence survives the rejected package, so its observation counts
-        # while no failure statistic is touched.
+        # The evidence survives the rejected package, so its observation stays
+        # counted in the durable ledger while no statistic is touched here.
+        self.assertEqual([], stats.mock_calls)
         self.assertEqual(
-            ["increment_crypter_block_observations"],
-            [call[0] for call in stats.return_value.method_calls],
+            {"observations": 1, "cooldowns": 0, "probes": 0},
+            json.loads(state.databases["crypter_events"].rows["pending"]),
         )
         notify.assert_not_called()
 
@@ -612,10 +650,7 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual(500, context.exception.status_code)
         self.assertEqual(original, state.databases["protected"].rows[PACKAGE_A])
         fail.assert_not_called()
-        self.assertEqual(
-            ["increment_crypter_block_observations"],
-            [call[0] for call in stats.return_value.method_calls],
-        )
+        self.assertEqual([], stats.mock_calls)
         notify.assert_not_called()
 
     def test_crypter_access_clear_returns_exact_response_and_clears_all_state(self):

@@ -27,6 +27,10 @@ PACKAGE_DEFER_KEY = "deferred"
 MAXIMUM_OBSERVATION_HOLDS = 1
 DEFAULT_CRYPTER_BLOCK_MODE = "defer"
 LEGACY_CRYPTER_BLOCK_MODE = "fail"
+CRYPTER_EVENT_TABLE = "crypter_events"
+CRYPTER_EVENT_KEY = "pending"
+CRYPTER_EVENT_FIELDS = ("observations", "cooldowns", "probes")
+MAXIMUM_PENDING_CRYPTER_EVENTS = 1_000_000
 _PACKAGE_DEFER_KEYS = frozenset(
     {
         "crypter",
@@ -191,6 +195,54 @@ def _available_snapshot():
     }
 
 
+def decode_pending_crypter_events(value):
+    """Decode the durable transition ledger into its bounded counters.
+
+    The ledger is one row of three counters and nothing else, so it can never
+    carry a package ID, link, or linkcrypter. Returns the counters plus whether
+    the stored row was readable, because an unreadable row is worth nothing and
+    must be pruned instead of blocking every later flush.
+    """
+    empty = dict.fromkeys(CRYPTER_EVENT_FIELDS, 0)
+    if value is None:
+        return empty, True
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return empty, False
+    if not isinstance(decoded, dict) or set(decoded) != set(CRYPTER_EVENT_FIELDS):
+        return empty, False
+
+    counts = {}
+    for field in CRYPTER_EVENT_FIELDS:
+        amount = decoded[field]
+        if type(amount) is not int or not 0 <= amount <= MAXIMUM_PENDING_CRYPTER_EVENTS:
+            return empty, False
+        counts[field] = amount
+    return counts, True
+
+
+def encode_pending_crypter_events(counts):
+    """Encode the ledger, or None once nothing is pending so the row is dropped."""
+    bounded = {
+        field: min(max(counts.get(field, 0), 0), MAXIMUM_PENDING_CRYPTER_EVENTS)
+        for field in CRYPTER_EVENT_FIELDS
+    }
+    if not any(bounded.values()):
+        return None
+    return json.dumps(bounded, separators=(",", ":"), sort_keys=True)
+
+
+def _add_pending_crypter_events(current_value, **deltas):
+    """Add transition deltas to the ledger, leaving the row alone when empty."""
+    if not any(deltas.values()):
+        return current_value
+    counts, _readable = decode_pending_crypter_events(current_value)
+    for field, delta in deltas.items():
+        counts[field] += delta
+    return encode_pending_crypter_events(counts)
+
+
 class CrypterCooldownService:
     def __init__(self, shared_state, clock=time.time):
         self._shared_state = shared_state
@@ -270,8 +322,9 @@ class CrypterCooldownService:
         """Record one block observation and report what it changed.
 
         `recorded` and `cooldown_started` are decided inside the same
-        transaction that writes the record, so a caller counting semantic
-        transitions never has to re-derive them from a later read.
+        transaction that writes the record, and that transaction also adds them
+        to the durable event ledger, so no crash between the two can lose or
+        repeat a transition and no caller has to re-derive one from a later read.
         """
         crypter = normalize_crypter_key(crypter)
         package_id = _validate_package_id(package_id)
@@ -353,7 +406,20 @@ class CrypterCooldownService:
             return _encode_record(record)
 
         database = self._shared_state.get_db("crypter_cooldowns")
-        database.mutate_value(crypter, update_record)
+
+        def record_and_count(current_values):
+            record_value, ledger_value = current_values
+            new_record = update_record(record_value)
+            return new_record, _add_pending_crypter_events(
+                ledger_value,
+                observations=int(decision["recorded"]),
+                cooldowns=int(decision["cooldown_started"]),
+            )
+
+        database.mutate_values(
+            (("crypter_cooldowns", crypter), (CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY)),
+            record_and_count,
+        )
         if invalid_record["found"]:
             self._warn_invalid_record(crypter)
         return decision
@@ -479,13 +545,16 @@ class CrypterCooldownService:
             self._warn_invalid_package_defer(package_id)
             return None
 
-    def _mutate_deferred_package(self, package_id, decide):
+    def _mutate_deferred_package(self, package_id, decide, count_events=None):
         """Run one atomic protected-row transaction gated on live defer metadata.
 
         `decide(current_value, package, deferred)` runs inside the transaction
         and only for a readable package that still carries valid defer metadata,
-        so no caller can act on a package state it observed earlier. Returns
-        "not_found", "not_deferred", or "deferred".
+        so no caller can act on a package state it observed earlier.
+        `count_events()` reports the transition deltas the same transaction must
+        add to the durable event ledger, so the decision and its accounting can
+        never be committed apart. Returns "not_found", "not_deferred", or
+        "deferred".
         """
         outcome = {"status": "not_found", "invalid": False}
 
@@ -504,7 +573,25 @@ class CrypterCooldownService:
             outcome["status"] = "deferred"
             return decide(current_value, package, deferred)
 
-        self._shared_state.get_db("protected").mutate_value(package_id, update_package)
+        database = self._shared_state.get_db("protected")
+        if count_events is None:
+            database.mutate_value(package_id, update_package)
+        else:
+
+            def decide_and_count(current_values):
+                package_value, ledger_value = current_values
+                new_package = update_package(package_value)
+                return new_package, _add_pending_crypter_events(
+                    ledger_value, **count_events()
+                )
+
+            database.mutate_values(
+                (
+                    ("protected", package_id),
+                    (CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY),
+                ),
+                decide_and_count,
+            )
         if outcome["invalid"]:
             self._warn_invalid_package_defer(package_id)
         return outcome["status"]
@@ -550,7 +637,9 @@ class CrypterCooldownService:
         """Atomically spend a queued probe before the package is handed out.
 
         Clearing the flag inside the same transaction that reads it means a
-        crashed consumer cannot replay one probe into an unbounded retry loop.
+        crashed consumer cannot replay one probe into an unbounded retry loop,
+        and counting the spent probe in that same transaction means the count
+        can never disagree with the handout it belongs to.
         """
         package_id = _validate_package_id(package_id)
         crypter = normalize_crypter_key(crypter)
@@ -564,7 +653,11 @@ class CrypterCooldownService:
             consumed["done"] = True
             return json.dumps(package)
 
-        self._mutate_deferred_package(package_id, spend_probe)
+        self._mutate_deferred_package(
+            package_id,
+            spend_probe,
+            count_events=lambda: {"probes": int(consumed["done"])},
+        )
         return consumed["done"]
 
     def delete_deferred_package(self, package_id):

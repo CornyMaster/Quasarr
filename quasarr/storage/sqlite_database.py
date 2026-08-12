@@ -21,6 +21,9 @@ Locking contract:
     Config/DataBase operation; it must return a string or None without side effects.
     It must finish on the calling thread rather than spawning or delegating work.
     The nested-call guard is thread-local and does not reject unrelated threads.
+- `mutate_values` is the same contract for several keys at once. Every table of
+    a Quasarr database lives in one file, so one transaction on one connection
+    commits all of them together or none of them.
 - `delete_exact` holds one SQLite write transaction while deleting at most one
     lowest-rowid row whose key and value both match.
 """
@@ -201,15 +204,17 @@ class DataBase(object):
         except sqlite3.Error as e:
             warn(f"Quasarr.db rollback after failed operation also failed: {e}")
 
-    def _ensure_table(self):
+    def _ensure_table(self, table=None):
+        table = self._table if table is None else table
+
         def operation():
             try:
                 if not self._conn.execute(
                     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?;",
-                    (self._table,),
+                    (table,),
                 ).fetchall():
                     self._conn.execute(
-                        f"CREATE TABLE IF NOT EXISTS {self._table} (key, value)"
+                        f"CREATE TABLE IF NOT EXISTS {table} (key, value)"
                     )
                     self._conn.commit()
             except sqlite3.OperationalError:
@@ -217,6 +222,16 @@ class DataBase(object):
                 raise
 
         self._with_retry(operation)
+
+    def _select_value(self, table, key):
+        query = f"SELECT value FROM {table} WHERE key=?"
+        result = self._conn.execute(query, (key,)).fetchone()
+        return result[0] if result else None
+
+    def _upsert_value(self, table, key, value):
+        self._conn.execute(f"DELETE FROM {table} WHERE key=?", (key,))
+        if value is not None:
+            self._conn.execute(f"INSERT INTO {table} VALUES (?, ?)", (key, value))
 
     @with_lock(lock)
     def retrieve(self, key):
@@ -286,21 +301,61 @@ class DataBase(object):
 
         try:
             self._with_retry(lambda: self._conn.execute("BEGIN IMMEDIATE"))
-            query = f"SELECT value FROM {self._table} WHERE key=?"
-            result = self._conn.execute(query, (key,)).fetchone()
-            current_value = result[0] if result else None
+            current_value = self._select_value(self._table, key)
             with reject_locked_calls_from_callback():
                 new_value = mutator(current_value)
             if new_value is not None and not isinstance(new_value, str):
                 raise TypeError("mutator must return str or None")
 
-            delete_query = f"DELETE FROM {self._table} WHERE key=?"
-            self._conn.execute(delete_query, (key,))
-            if new_value is not None:
-                insert_query = f"INSERT INTO {self._table} VALUES (?, ?)"
-                self._conn.execute(insert_query, (key, new_value))
+            self._upsert_value(self._table, key, new_value)
             self._conn.commit()
             return new_value
+        except Exception:
+            self._rollback()
+            raise
+
+    @with_lock(lock)
+    def mutate_values(self, targets, mutator):
+        """Atomically replace or delete several values in one transaction.
+
+        `targets` is a sequence of unique `(table, key)` pairs of the same
+        database file. The side-effect-free callback receives the current values
+        in that order and returns one replacement per target, so a caller can
+        commit a decision and its bookkeeping together or not at all.
+        """
+        if not callable(mutator):
+            raise TypeError("mutator must be callable")
+        resolved = []
+        for table, key in targets:
+            target = (self._validate_table_name(table), key)
+            if target in resolved:
+                raise ValueError("mutate_values targets must be unique")
+            resolved.append(target)
+        if not resolved:
+            raise ValueError("mutate_values needs at least one target")
+
+        for table, _key in resolved:
+            self._ensure_table(table)
+
+        try:
+            self._with_retry(lambda: self._conn.execute("BEGIN IMMEDIATE"))
+            current_values = tuple(
+                self._select_value(table, key) for table, key in resolved
+            )
+            with reject_locked_calls_from_callback():
+                new_values = mutator(current_values)
+            if not isinstance(new_values, (list, tuple)) or len(new_values) != len(
+                resolved
+            ):
+                raise TypeError("mutator must return one value per target")
+            for new_value in new_values:
+                if new_value is not None and not isinstance(new_value, str):
+                    raise TypeError("mutator must return str or None")
+
+            for (table, key), new_value in zip(resolved, new_values, strict=True):
+                self._upsert_value(table, key, new_value)
+            self._conn.commit()
+            return tuple(new_values)
         except Exception:
             self._rollback()
             raise

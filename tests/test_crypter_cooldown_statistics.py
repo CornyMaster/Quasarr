@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
-from types import SimpleNamespace
+from contextlib import contextmanager
 from unittest import mock
 
 from bottle import Bottle, HTTPError
@@ -30,6 +30,9 @@ OBSERVATIONS_KEY = "crypter_block_observations"
 COOLDOWNS_KEY = "crypter_cooldowns"
 PROBES_KEY = "crypter_probes"
 DEFERRED_KEY = "deferred_packages"
+EVENT_TABLE = "crypter_events"
+EVENT_KEY = "pending"
+NO_EVENTS = {"observations": 0, "cooldowns": 0, "probes": 0}
 FAILURE_KEYS = (
     "failed_downloads",
     "failed_decryptions_automatic",
@@ -53,11 +56,40 @@ class MutableClock:
         return self.now
 
 
+class UnavailableTable:
+    """Fail statistics access without disturbing the file the events share."""
+
+    WRITE_METHODS = frozenset(
+        {
+            "store",
+            "update_store",
+            "mutate_value",
+            "mutate_values",
+            "delete",
+            "delete_exact",
+        }
+    )
+
+    def __init__(self, database, writes_only):
+        self._database = database
+        self._writes_only = writes_only
+
+    def __getattr__(self, name):
+        if self._writes_only and name not in self.WRITE_METHODS:
+            return getattr(self._database, name)
+
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError("statistics storage unavailable")
+
+        return unavailable
+
+
 class RealDatabaseSharedState:
     """Shared state backed by the real SQLite layer, one connection per table."""
 
     def __init__(self, dbfile, block_mode="defer"):
         self._databases = {}
+        self._unavailable = {}
         self.values = {
             "dbfile": dbfile,
             "database": self.get_db,
@@ -68,7 +100,18 @@ class RealDatabaseSharedState:
     def get_db(self, table):
         if table not in self._databases:
             self._databases[table] = DataBase(table)
-        return self._databases[table]
+        database = self._databases[table]
+        if table in self._unavailable:
+            return UnavailableTable(database, self._unavailable[table])
+        return database
+
+    @contextmanager
+    def statistics_unavailable(self, writes_only=False):
+        self._unavailable["statistics"] = writes_only
+        try:
+            yield
+        finally:
+            self._unavailable.pop("statistics", None)
 
     def update(self, key, value):
         self.values[key] = value
@@ -121,6 +164,26 @@ class CrypterStatisticsTestCase(unittest.TestCase):
             key: stats[key]
             for key in (OBSERVATIONS_KEY, COOLDOWNS_KEY, PROBES_KEY, DEFERRED_KEY)
         }
+
+    def ledger(self):
+        return self.state.get_db(EVENT_TABLE).retrieve(EVENT_KEY)
+
+    def pending_events(self):
+        raw = self.ledger()
+        return NO_EVENTS if raw is None else json.loads(raw)
+
+    @contextmanager
+    def rejecting_single_row_writes_to(self, table):
+        """Bookkeeping outside the deciding transaction is a losable write."""
+        original_mutate_value = DataBase.mutate_value
+
+        def reject(database, key, mutator):
+            if database._table == table:
+                raise AssertionError(f'"{table}" was written by a second call')
+            return original_mutate_value(database, key, mutator)
+
+        with mock.patch.object(DataBase, "mutate_value", reject):
+            yield
 
     # --- route drivers --------------------------------------------------
 
@@ -333,6 +396,16 @@ class CrypterProbeCounterTests(CrypterStatisticsTestCase):
         self.assertEqual(1, self.counters()[PROBES_KEY])
         self.assertFalse(self.service.get_package_defer(PACKAGE_A)["probe_requested"])
 
+    def test_a_probe_consumption_that_spends_nothing_counts_nothing(self):
+        self.enter_cooldown()
+
+        # Deferred without a queued probe, and a package that does not exist.
+        self.assertFalse(self.service.consume_probe(PACKAGE_A, CRYPTER))
+        self.assertFalse(self.service.consume_probe(PACKAGE_D, CRYPTER))
+
+        self.assertEqual(0, self.counters()[PROBES_KEY])
+        self.assertIsNone(self.ledger())
+
     def test_a_repeated_blocked_probe_report_counts_no_new_transition(self):
         self.enter_cooldown()
         self.service.request_probe([PACKAGE_A])
@@ -478,11 +551,226 @@ class DeferNonEffectTests(CrypterStatisticsTestCase):
         )
 
 
-class CounterAtomicityTests(CrypterStatisticsTestCase):
-    def test_a_competing_write_between_read_and_write_cannot_be_lost(self):
+class CrypterEventLedgerTests(CrypterStatisticsTestCase):
+    """Statistics storage may fail; the recorded transitions may not be lost."""
+
+    def test_a_statistics_outage_never_changes_the_defer_response_or_the_hold(self):
+        self.store_protected(PACKAGE_A)
+
+        with self.state.statistics_unavailable():
+            result = self.report_block(PACKAGE_A, "a")
+
+        self.assertEqual(
+            {
+                "success": True,
+                "instruction": "hold",
+                "state": "observing",
+                "evidence_count": 1,
+                "retry_after_epoch": NOW + OBSERVATION_WINDOW,
+                "hold_type": "provisional",
+            },
+            result,
+        )
+        self.assertEqual(
+            1, self.service.get_package_defer(PACKAGE_A)["observation_holds"]
+        )
+        self.assertEqual(
+            {"observations": 1, "cooldowns": 0, "probes": 0}, self.pending_events()
+        )
+
+        self.assertEqual(1, self.counters()[OBSERVATIONS_KEY])
+        self.assertIsNone(self.ledger())
+
+    def test_a_cooldown_transition_recorded_during_an_outage_counts_once(self):
+        for package_id in (PACKAGE_A, PACKAGE_B, PACKAGE_C):
+            self.store_protected(package_id)
+
+        with self.state.statistics_unavailable():
+            final = self.report_block_series(
+                ((PACKAGE_A, "a"), (PACKAGE_B, "b"), (PACKAGE_C, "c"))
+            )
+
+        self.assertEqual("cooldown", final["instruction"])
+        self.assertEqual(
+            {"observations": 3, "cooldowns": 1, "probes": 0}, self.pending_events()
+        )
+
+        # The helper retries the report whose statistic never landed.
+        self.report_block(PACKAGE_C, "c")
+
+        self.assertEqual(
+            {
+                OBSERVATIONS_KEY: 3,
+                COOLDOWNS_KEY: 1,
+                PROBES_KEY: 0,
+                DEFERRED_KEY: 3,
+            },
+            self.counters(),
+        )
+        self.assertEqual(3, self.stats.get_stats()[OBSERVATIONS_KEY])
+
+    def test_a_restarted_helper_reconciles_events_from_a_previous_process(self):
+        for package_id in (PACKAGE_A, PACKAGE_B, PACKAGE_C):
+            self.store_protected(package_id)
+        with self.state.statistics_unavailable():
+            self.report_block_series(
+                ((PACKAGE_A, "a"), (PACKAGE_B, "b"), (PACKAGE_C, "c"))
+            )
+
+        restarted_state = RealDatabaseSharedState(self.dbfile)
+        self.addCleanup(restarted_state.close)
+        restarted = StatsHelper(restarted_state, clock=self.clock)
+        first_read = restarted.get_stats()
+        second_read = restarted.get_stats()
+
+        self.assertEqual(3, first_read[OBSERVATIONS_KEY])
+        self.assertEqual(1, first_read[COOLDOWNS_KEY])
+        self.assertEqual(3, second_read[OBSERVATIONS_KEY])
+        self.assertEqual(1, second_read[COOLDOWNS_KEY])
+        self.assertIsNone(self.ledger())
+
+    def test_a_probe_spent_during_an_outage_still_hands_out_the_package_once(self):
+        self.enter_cooldown()
+        self.service.request_probe([PACKAGE_A])
+
+        with self.state.statistics_unavailable():
+            handout = self.request_handout()
+
+        self.assertEqual(PACKAGE_A, handout["to_decrypt"]["id"])
+        self.assertFalse(self.service.get_package_defer(PACKAGE_A)["probe_requested"])
+        self.assertEqual(1, self.counters()[PROBES_KEY])
+
+        with self.assertRaises(HTTPError) as context:
+            self.request_handout()
+
+        self.assertEqual(404, context.exception.status_code)
+        self.assertEqual(1, self.counters()[PROBES_KEY])
+
+    def test_totals_report_events_that_could_not_be_flushed_yet(self):
+        self.store_protected(PACKAGE_A)
+        self.report_block(PACKAGE_A, "a")
+
+        with self.state.statistics_unavailable(writes_only=True):
+            during_outage = self.stats.get_stats()
+
+        self.assertEqual(1, during_outage[OBSERVATIONS_KEY])
+        self.assertEqual(
+            "0", self.state.get_db("statistics").retrieve(OBSERVATIONS_KEY)
+        )
+
+        # Reporting the pending event never counts it a second time.
+        self.assertEqual(1, self.counters()[OBSERVATIONS_KEY])
+        self.assertEqual(
+            "1", self.state.get_db("statistics").retrieve(OBSERVATIONS_KEY)
+        )
+
+    def test_clearing_a_linkcrypter_never_erases_unflushed_events(self):
+        with self.state.statistics_unavailable():
+            self.enter_cooldown()
+            self.report_clear(PACKAGE_A)
+            self.assertEqual("deleted", self.service.delete_deferred_package(PACKAGE_B))
+
+        self.assertIsNone(self.state.get_db("crypter_cooldowns").retrieve(CRYPTER))
+        self.assertEqual(
+            {
+                OBSERVATIONS_KEY: 3,
+                COOLDOWNS_KEY: 1,
+                PROBES_KEY: 0,
+                DEFERRED_KEY: 1,
+            },
+            self.counters(),
+        )
+
+    def test_a_transition_is_never_recorded_by_a_separate_write(self):
+        for package_id in (PACKAGE_A, PACKAGE_B, PACKAGE_C):
+            self.store_protected(package_id)
+
+        with self.rejecting_single_row_writes_to(EVENT_TABLE):
+            self.report_block_series(
+                ((PACKAGE_A, "a"), (PACKAGE_B, "b"), (PACKAGE_C, "c"))
+            )
+            self.service.request_probe([PACKAGE_A])
+            self.request_handout()
+
+        self.assertEqual(
+            {"observations": 3, "cooldowns": 1, "probes": 1}, self.pending_events()
+        )
+
+    def test_the_event_ledger_stores_only_bounded_counters(self):
+        self.enter_cooldown()
+        self.service.request_probe([PACKAGE_A])
+        self.request_handout()
+
+        raw = self.ledger()
+
+        self.assertEqual(
+            {"cooldowns": 1, "observations": 3, "probes": 1}, json.loads(raw)
+        )
+        self.assertEqual(
+            [[EVENT_KEY, raw]],
+            self.state.get_db(EVENT_TABLE).retrieve_all_titles(),
+        )
+        for identifier in (
+            PACKAGE_A,
+            PACKAGE_B,
+            PACKAGE_C,
+            CRYPTER,
+            "a" * 64,
+            "filecrypt.invalid",
+        ):
+            with self.subTest(identifier=identifier):
+                self.assertNotIn(identifier, raw)
+
+    def test_an_unreadable_ledger_row_is_pruned_instead_of_blocking_the_counters(self):
+        self.store_protected(PACKAGE_A)
+        self.report_block(PACKAGE_A, "a")
+        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, "{not json")
+
+        self.assertEqual(0, self.counters()[OBSERVATIONS_KEY])
+        self.assertIsNone(self.ledger())
+
+        self.store_protected(PACKAGE_B)
+        self.report_block(PACKAGE_B, "b")
+
+        self.assertEqual(1, self.counters()[OBSERVATIONS_KEY])
+
+
+class FlushAtomicityTests(CrypterStatisticsTestCase):
+    def pend_one_observation(self, package_id, fingerprint_character):
+        self.store_protected(package_id)
+        with self.state.statistics_unavailable():
+            self.report_block(package_id, fingerprint_character)
+
+    def test_a_failure_inside_the_flush_transaction_moves_nothing(self):
+        self.pend_one_observation(PACKAGE_A, "a")
+        original_mutate_values = DataBase.mutate_values
+
+        def interrupt_after_deciding(database, entries, mutator):
+            def raising_mutator(current_values):
+                mutator(current_values)
+                raise RuntimeError("flush interrupted")
+
+            return original_mutate_values(database, entries, raising_mutator)
+
+        with (
+            mock.patch.object(DataBase, "mutate_values", interrupt_after_deciding),
+            self.assertRaises(RuntimeError),
+        ):
+            self.stats.flush_crypter_events()
+
+        self.assertEqual(
+            {"observations": 1, "cooldowns": 0, "probes": 0}, self.pending_events()
+        )
+        self.assertEqual(
+            "0", self.state.get_db("statistics").retrieve(OBSERVATIONS_KEY)
+        )
+        self.assertEqual(1, self.counters()[OBSERVATIONS_KEY])
+
+    def test_a_competing_counter_write_during_a_flush_cannot_be_lost(self):
         statistics_db = self.state.get_db("statistics")
-        self.stats.increment_crypter_block_observations()
-        self.assertEqual("1", statistics_db.retrieve(OBSERVATIONS_KEY))
+        self.pend_one_observation(PACKAGE_A, "a")
+        self.assertEqual(1, self.counters()[OBSERVATIONS_KEY])
+        self.pend_one_observation(PACKAGE_B, "b")
         competing = {"written": False}
         original_retrieve = DataBase.retrieve
 
@@ -502,52 +790,55 @@ class CounterAtomicityTests(CrypterStatisticsTestCase):
             return value
 
         with mock.patch.object(DataBase, "retrieve", retrieve_then_write):
-            self.stats.increment_crypter_block_observations()
+            self.stats.flush_crypter_events()
 
-        # A read-then-write increment reads 1, lets the competing write commit
-        # 100, and then stores 2 - losing a committed value.
+        # A read-then-write flush reads 1, lets the competing write commit 100,
+        # and then stores 2 - losing a committed value.
         self.assertEqual(
             "101" if competing["written"] else "2",
             statistics_db.retrieve(OBSERVATIONS_KEY),
         )
 
-    def test_concurrent_increments_from_separate_connections_are_all_recorded(self):
-        connections = []
-        guard = threading.Lock()
-
-        def database(table):
-            instance = DataBase(table)
-            with guard:
-                connections.append(instance)
-            return instance
-
-        state = SimpleNamespace(values={"database": database})
+    def test_concurrent_flushes_move_every_event_exactly_once(self):
+        for package_id in (PACKAGE_A, PACKAGE_B, PACKAGE_C):
+            self.store_protected(package_id)
+        with self.state.statistics_unavailable():
+            self.report_block_series(
+                ((PACKAGE_A, "a"), (PACKAGE_B, "b"), (PACKAGE_C, "c"))
+            )
         errors = []
+        start = threading.Barrier(3)
 
         def worker():
+            state = RealDatabaseSharedState(self.dbfile)
             try:
-                helper = StatsHelper(state)
-                for _ in range(4):
-                    helper.increment_crypter_block_observations()
+                helper = StatsHelper(state, clock=self.clock)
+                start.wait(30)
+                helper.flush_crypter_events()
             except Exception as error:  # pragma: no cover - reported below
                 errors.append(error)
+            finally:
+                state.close()
 
         threads = [threading.Thread(target=worker) for _ in range(3)]
-        try:
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(60)
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
 
-            self.assertEqual([], errors)
-            for thread in threads:
-                self.assertFalse(thread.is_alive())
-            self.assertEqual(
-                "12", self.state.get_db("statistics").retrieve(OBSERVATIONS_KEY)
-            )
-        finally:
-            for connection in connections:
-                connection._conn.close()
+        self.assertEqual([], errors)
+        for thread in threads:
+            self.assertFalse(thread.is_alive())
+        self.assertIsNone(self.ledger())
+        self.assertEqual(
+            {
+                OBSERVATIONS_KEY: 3,
+                COOLDOWNS_KEY: 1,
+                PROBES_KEY: 0,
+                DEFERRED_KEY: 3,
+            },
+            self.counters(),
+        )
 
 
 if __name__ == "__main__":

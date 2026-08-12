@@ -55,9 +55,15 @@ def protected_blob(title, links):
 
 
 class MemoryTable:
-    def __init__(self):
+    def __init__(self, tables=None):
         self.rows = {}
+        self.tables = {} if tables is None else tables
         self.retrieve_count = 0
+
+    def _peer(self, table):
+        if table not in self.tables:
+            self.tables[table] = MemoryTable(self.tables)
+        return self.tables[table]
 
     def retrieve(self, key):
         self.retrieve_count += 1
@@ -80,19 +86,38 @@ class MemoryTable:
             self.rows[key] = value
         return value
 
+    def mutate_values(self, targets, mutator):
+        """One transaction over several tables, like the sqlite primitive."""
+        self.retrieve_count += 1
+        databases = [self._peer(table) for table, _key in targets]
+        values = mutator(
+            tuple(
+                database.rows.get(key)
+                for database, (_table, key) in zip(databases, targets, strict=True)
+            )
+        )
+        for database, (_table, key), value in zip(
+            databases, targets, values, strict=True
+        ):
+            if value is None:
+                database.rows.pop(key, None)
+            else:
+                database.rows[key] = value
+        return tuple(values)
+
 
 class BlockModeSharedState:
     def __init__(self, mode=_UNSET):
         self.values = {"crypter_cooldown_hours": 24}
         if mode is not _UNSET:
             self.values["crypter_block_mode"] = mode
-        self.databases = {
-            "protected": MemoryTable(),
-            "failed": MemoryTable(),
-            "crypter_cooldowns": MemoryTable(),
-        }
+        self.databases = {}
+        for table in ("protected", "failed", "crypter_cooldowns"):
+            self.databases[table] = MemoryTable(self.databases)
 
     def get_db(self, table):
+        if table not in self.databases:
+            self.databases[table] = MemoryTable(self.databases)
         return self.databases[table]
 
     def get_device(self):
