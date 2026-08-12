@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import copy
+import json
 import threading
 import unittest
 from contextlib import ExitStack
@@ -11,9 +12,15 @@ from bottle import Bottle
 
 from quasarr.api import get_api
 from quasarr.api.config import setup_config
-from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
+from quasarr.api.sponsors_helper import (
+    CRYPTER_DEFER_CAPABILITY,
+    setup_sponsors_helper_routes,
+)
 from quasarr.constants import CRYPTER_BLOCK_SETTINGS_TABLE
+from quasarr.downloads.packages import get_packages
+from quasarr.providers import shared_state as provider_shared_state
 from quasarr.providers.auth import audit_route_auth_modes
+from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 from quasarr.storage.setup import (
     get_crypter_block_settings_data,
     initialize_crypter_block_settings,
@@ -21,12 +28,87 @@ from quasarr.storage.setup import (
 )
 
 PACKAGE_ID = "Quasarr_movies_" + "a" * 32
+ALTERNATIVE_PACKAGE_ID = "Quasarr_movies_" + "b" * 32
+EVIDENCE_PACKAGE_IDS = (
+    "Quasarr_movies_" + "c" * 32,
+    "Quasarr_movies_" + "d" * 32,
+)
+REASON = "ip_block_suspected"
+NOW = 1_700_000_000
+COOLED_LINK = ["https://filecrypt.invalid/container/1", "filecrypt"]
+CLEAR_LINK = ["https://tolink.invalid/container/2", "tolink"]
+HELPER_URLS = ["filecrypt.", "tolink."]
 DEFER_PAYLOAD = {
     "package_id": PACKAGE_ID,
     "crypter": "filecrypt",
-    "reason_code": "ip_block_suspected",
+    "reason_code": REASON,
     "link_fingerprint": "b" * 64,
 }
+_UNSET = object()
+
+
+def protected_blob(title, links):
+    return json.dumps({"title": title, "links": links, "password": "", "size_mb": 1024})
+
+
+class MemoryTable:
+    def __init__(self):
+        self.rows = {}
+        self.retrieve_count = 0
+
+    def retrieve(self, key):
+        self.retrieve_count += 1
+        return self.rows.get(key)
+
+    def retrieve_all_titles(self):
+        items = [[key, value] for key, value in sorted(self.rows.items())]
+        return items if items else None
+
+    def update_store(self, key, value):
+        self.rows[key] = value
+        return True
+
+    def mutate_value(self, key, mutator):
+        self.retrieve_count += 1
+        value = mutator(self.rows.get(key))
+        if value is None:
+            self.rows.pop(key, None)
+        else:
+            self.rows[key] = value
+        return value
+
+
+class BlockModeSharedState:
+    def __init__(self, mode=_UNSET):
+        self.values = {"crypter_cooldown_hours": 24}
+        if mode is not _UNSET:
+            self.values["crypter_block_mode"] = mode
+        self.databases = {
+            "protected": MemoryTable(),
+            "failed": MemoryTable(),
+            "crypter_cooldowns": MemoryTable(),
+        }
+
+    def get_db(self, table):
+        return self.databases[table]
+
+    def get_device(self):
+        return mock.Mock()
+
+    def update(self, key, value):
+        self.values[key] = value
+
+
+class FakeCache:
+    linkgrabber_packages = []
+    linkgrabber_links = []
+    downloader_packages = []
+    downloader_links = []
+    is_collecting = False
+
+    @staticmethod
+    def get_stats():
+        return {}
 
 
 class MemorySettingsDatabase:
@@ -253,6 +335,14 @@ class CapturingServer:
 
 
 class DashboardControlsTests(unittest.TestCase):
+    def setUp(self):
+        # get_api() installs its dict as the process-global shared state, and
+        # `crypter_block_mode` now steers selection and queue projection, so a
+        # leaked "fail" here would silently rewrite later tests.
+        previous_values = provider_shared_state.values
+        previous_lock = provider_shared_state.lock
+        self.addCleanup(provider_shared_state.set_state, previous_values, previous_lock)
+
     def _render_dashboard(self):
         shared_values = {
             "port": 8080,
@@ -356,12 +446,217 @@ class DashboardControlsTests(unittest.TestCase):
             '<input type="number" id="crypter-cooldown-hours" min="24" step="1" value="72">',
             link_protection_html,
         )
+        # The mode is the operator's escape hatch, so the section must say what
+        # each mode does and that switching back restores the recorded blocks.
+        self.assertIn("Fail restores the legacy behavior", link_protection_html)
+        self.assertIn("kept but ignored until you switch back", link_protection_html)
         self.assertNotIn('type="password"', link_protection_html)
         self.assertNotIn("http://", link_protection_html)
         self.assertNotIn("https://", link_protection_html)
         self.assertIn("quasarrApiFetch('/api/crypter-block/settings'", html)
         self.assertIn("mode: modeSelect.value", html)
         self.assertIn("cooldown_hours: Number.parseInt", html)
+
+
+class CrypterBlockModeBehaviorTests(unittest.TestCase):
+    """`fail` is the operator's escape hatch, so it must restore the exact
+    pre-cooldown behavior instead of only short-circuiting `/defer/`. Every
+    case below runs against real persisted cooldown and package defer metadata
+    and asserts that metadata survives the switch, because a confirmed cooldown
+    otherwise outlives the setting change by at least 24 hours."""
+
+    def setUp(self):
+        self.clock = lambda: NOW
+        self.state = BlockModeSharedState(mode="defer")
+        protected = self.state.databases["protected"]
+        protected.update_store(
+            PACKAGE_ID, protected_blob("Cooled.Package", [COOLED_LINK])
+        )
+        protected.update_store(
+            ALTERNATIVE_PACKAGE_ID,
+            protected_blob("Alternative.Package", [CLEAR_LINK]),
+        )
+        service = CrypterCooldownService(self.state, clock=self.clock)
+        # Three distinct observations are the confirmed-cooldown threshold, so
+        # the crypter itself - not just this package - is held.
+        for index, package_id in enumerate((PACKAGE_ID, *EVIDENCE_PACKAGE_IDS)):
+            decision = service.observe("filecrypt", package_id, f"{index}" * 64, REASON)
+        self.assertEqual("cooldown", decision["state"])
+        service.defer_package(
+            PACKAGE_ID,
+            "filecrypt",
+            REASON,
+            decision["package_retry_after_epoch"],
+            0,
+        )
+        self.persisted = self._persisted_rows()
+
+    def _persisted_rows(self):
+        return {
+            table: copy.deepcopy(database.rows)
+            for table, database in self.state.databases.items()
+        }
+
+    def _cooldown_reads(self):
+        return self.state.databases["crypter_cooldowns"].retrieve_count
+
+    def call_to_decrypt(self, payload):
+        """Returns the response plus every shared_state the hot path built a
+        cooldown service for; an empty list proves no cooldown read happened."""
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(
+            route
+            for route in app.routes
+            if route.rule == "/sponsors_helper/api/to_decrypt/"
+        )
+        built = []
+
+        def build_service(shared_state):
+            built.append(shared_state)
+            return CrypterCooldownService(shared_state, clock=self.clock)
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.shared_state", self.state),
+            mock.patch("quasarr.api.sponsors_helper.request", mock.Mock(json=payload)),
+            mock.patch(
+                "quasarr.api.sponsors_helper.CrypterCooldownService", build_service
+            ),
+        ):
+            return route.callback(), built
+
+    def call_get_packages(self):
+        built = []
+
+        def build_service(shared_state):
+            built.append(shared_state)
+            return CrypterCooldownService(shared_state, clock=self.clock)
+
+        with (
+            mock.patch(
+                "quasarr.downloads.packages.JDPackageCache", return_value=FakeCache()
+            ),
+            mock.patch(
+                "quasarr.downloads.packages.get_download_category_from_package_id",
+                return_value="movies",
+            ),
+            mock.patch(
+                "quasarr.downloads.packages.CrypterCooldownService", build_service
+            ),
+        ):
+            downloads = get_packages(self.state, auto_start=False)
+        queue = {item["nzo_id"]: item for item in downloads["queue"]}
+        return queue, built
+
+    def capable_payload(self, **extra):
+        payload = {
+            "supported_urls": list(HELPER_URLS),
+            "capabilities": [CRYPTER_DEFER_CAPABILITY],
+        }
+        payload.update(extra)
+        return payload
+
+    def test_mode_switch_flips_capable_selection_in_both_directions(self):
+        payload = self.capable_payload()
+
+        held, _ = self.call_to_decrypt(payload)
+        self.assertEqual("Alternative.Package", held["to_decrypt"]["name"])
+
+        self.state.values["crypter_block_mode"] = "fail"
+        reads_before = self._cooldown_reads()
+        legacy, built = self.call_to_decrypt(payload)
+
+        self.assertEqual("Cooled.Package", legacy["to_decrypt"]["name"])
+        self.assertEqual([COOLED_LINK], legacy["to_decrypt"]["url"])
+        # The cached mode alone decides; the hot path never reads cooldown state.
+        self.assertEqual([], built)
+        self.assertEqual(reads_before, self._cooldown_reads())
+
+        self.state.values["crypter_block_mode"] = "defer"
+        restored, _ = self.call_to_decrypt(payload)
+
+        self.assertEqual("Alternative.Package", restored["to_decrypt"]["name"])
+        self.assertEqual(self.persisted, self._persisted_rows())
+
+    def test_fail_mode_offers_every_alternative_link_of_one_package(self):
+        self.state.databases["protected"].rows.pop(ALTERNATIVE_PACKAGE_ID)
+        self.state.databases["protected"].update_store(
+            PACKAGE_ID, protected_blob("Cooled.Package", [COOLED_LINK, CLEAR_LINK])
+        )
+        payload = self.capable_payload()
+
+        held, _ = self.call_to_decrypt(payload)
+        # Defer mode drops only the cooled link of the very same package.
+        self.assertEqual([CLEAR_LINK], held["to_decrypt"]["url"])
+
+        self.state.values["crypter_block_mode"] = "fail"
+        legacy, _ = self.call_to_decrypt(payload)
+
+        self.assertEqual([COOLED_LINK, CLEAR_LINK], legacy["to_decrypt"]["url"])
+
+    def test_fail_mode_still_honors_capable_exclusions(self):
+        self.state.values["crypter_block_mode"] = "fail"
+
+        excluded, _ = self.call_to_decrypt(
+            self.capable_payload(excluded_package_ids=[PACKAGE_ID])
+        )
+
+        # Exclusions are in-flight handout state, not a cooldown hold, so the
+        # legacy bypass must not resurrect duplicate handouts.
+        self.assertEqual("Alternative.Package", excluded["to_decrypt"]["name"])
+
+    def test_legacy_helper_request_is_identical_in_both_modes(self):
+        payload = {"supported_urls": list(HELPER_URLS)}
+
+        deferred_mode, _ = self.call_to_decrypt(payload)
+        self.state.values["crypter_block_mode"] = "fail"
+        fail_mode, built = self.call_to_decrypt(payload)
+
+        self.assertEqual(deferred_mode, fail_mode)
+        self.assertEqual("Cooled.Package", fail_mode["to_decrypt"]["name"])
+        self.assertEqual([], built)
+
+    def test_mode_switch_flips_the_queue_projection_in_both_directions(self):
+        held, _ = self.call_get_packages()
+        self.assertEqual(
+            "[Waiting for linkcrypter retry] Cooled.Package",
+            held[PACKAGE_ID]["filename"],
+        )
+        self.assertTrue(held[PACKAGE_ID]["deferred"]["active"])
+
+        self.state.values["crypter_block_mode"] = "fail"
+        reads_before = self._cooldown_reads()
+        legacy, built = self.call_get_packages()
+
+        item = legacy[PACKAGE_ID]
+        self.assertEqual("protected", item["type"])
+        self.assertEqual("[CAPTCHA not solved!] Cooled.Package", item["filename"])
+        self.assertNotIn("deferred", item)
+        self.assertEqual([], built)
+        self.assertEqual(reads_before, self._cooldown_reads())
+
+        self.state.values["crypter_block_mode"] = "defer"
+        restored, _ = self.call_get_packages()
+
+        self.assertEqual(
+            "[Waiting for linkcrypter retry] Cooled.Package",
+            restored[PACKAGE_ID]["filename"],
+        )
+        self.assertEqual(self.persisted, self._persisted_rows())
+
+    def test_unknown_and_missing_modes_fall_back_to_defer(self):
+        for mode in (_UNSET, None, "", "FAIL", "pause", 0):
+            with self.subTest(mode=mode):
+                if mode is _UNSET:
+                    self.state.values.pop("crypter_block_mode", None)
+                else:
+                    self.state.values["crypter_block_mode"] = mode
+
+                selected, _ = self.call_to_decrypt(self.capable_payload())
+                queue, _ = self.call_get_packages()
+
+                self.assertEqual("Alternative.Package", selected["to_decrypt"]["name"])
+                self.assertTrue(queue[PACKAGE_ID]["deferred"]["active"])
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ _RECORD_KEYS = {
 _OBSERVATION_KEYS = {"package_id", "link_fingerprint", "seen_at_epoch"}
 PACKAGE_DEFER_KEY = "deferred"
 MAXIMUM_OBSERVATION_HOLDS = 1
+DEFAULT_CRYPTER_BLOCK_MODE = "defer"
+LEGACY_CRYPTER_BLOCK_MODE = "fail"
 _PACKAGE_DEFER_KEYS = frozenset(
     {
         "crypter",
@@ -35,6 +37,18 @@ _PACKAGE_DEFER_KEYS = frozenset(
         "observation_holds",
     }
 )
+
+
+def crypter_blocks_deferred(shared_state):
+    """Whether cooldown and package defer holds may gate a linkcrypter.
+
+    Reads the cached block mode only, so hot paths never touch the settings
+    table. Anything but the exact legacy mode defers, and the legacy mode is a
+    pure bypass: persisted cooldown and defer metadata stay untouched so
+    switching back restores the held state.
+    """
+    mode = shared_state.values.get("crypter_block_mode", DEFAULT_CRYPTER_BLOCK_MODE)
+    return mode != LEGACY_CRYPTER_BLOCK_MODE
 
 
 def normalize_crypter_key(value):

@@ -214,6 +214,12 @@ class SponsorsHelperApiTests(unittest.TestCase):
         protected_db.retrieve_all_titles.return_value = protected_packages
 
         with (
+            # Cooldown-aware selection only applies in the default block mode,
+            # so pin it instead of inheriting process-global shared state.
+            mock.patch.dict(
+                "quasarr.api.sponsors_helper.shared_state.values",
+                {"crypter_block_mode": "defer"},
+            ),
             mock.patch("quasarr.api.sponsors_helper.shared_state.update"),
             mock.patch(
                 "quasarr.api.sponsors_helper.shared_state.get_db",

@@ -18,6 +18,7 @@ from quasarr.providers import shared_state
 from quasarr.providers.auth import require_api_key
 from quasarr.providers.crypter_cooldowns import (
     CrypterCooldownService,
+    crypter_blocks_deferred,
     normalize_crypter_key,
 )
 from quasarr.providers.log import info, warn
@@ -372,7 +373,7 @@ def setup_sponsors_helper_routes(app):
         if not required_fields.issubset(data):
             return abort(400, "Missing defer report fields")
 
-        if shared_state.values.get("crypter_block_mode", "defer") == "fail":
+        if not crypter_blocks_deferred(shared_state):
             return {
                 "success": True,
                 "instruction": "legacy_failure",
@@ -505,15 +506,23 @@ def setup_sponsors_helper_routes(app):
             # Issue #350: only hand SponsorsHelper packages where at least one URL
             # matches the helper's advertised support, and move that URL to the front.
             capabilities = payload.get("capabilities")
-            if (
+            defer_capable = (
                 isinstance(capabilities, (list, tuple, set))
                 and CRYPTER_DEFER_CAPABILITY in capabilities
-            ):
+            )
+            # Legacy block mode selects exactly like an incapable helper: no
+            # cooldown service is built, so no hold can gate this handout.
+            cooldown_service = (
+                CrypterCooldownService(shared_state)
+                if defer_capable and crypter_blocks_deferred(shared_state)
+                else None
+            )
+            if defer_capable:
                 selected_package = select_helper_package(
                     protected,
                     supported_url_patterns,
                     supported_mirrors,
-                    cooldown_service=CrypterCooldownService(shared_state),
+                    cooldown_service=cooldown_service,
                     excluded_package_ids=payload.get("excluded_package_ids"),
                 )
             else:

@@ -5,11 +5,14 @@
 from bottle import request, response
 
 from quasarr.constants import CRYPTER_BLOCK_SETTINGS_TABLE
-from quasarr.providers.crypter_cooldowns import MINIMUM_COOLDOWN_HOURS
+from quasarr.providers.crypter_cooldowns import (
+    DEFAULT_CRYPTER_BLOCK_MODE,
+    LEGACY_CRYPTER_BLOCK_MODE,
+    MINIMUM_COOLDOWN_HOURS,
+)
 from quasarr.storage.sqlite_database import DataBase
 
-DEFAULT_CRYPTER_BLOCK_MODE = "defer"
-CRYPTER_BLOCK_MODES = frozenset({"defer", "fail"})
+CRYPTER_BLOCK_MODES = frozenset({DEFAULT_CRYPTER_BLOCK_MODE, LEGACY_CRYPTER_BLOCK_MODE})
 
 
 def _coerce_mode(value, default):

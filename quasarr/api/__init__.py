@@ -421,6 +421,9 @@ def get_api(shared_state_dict, shared_state_lock):
                             <input type="number" id="crypter-cooldown-hours" min="24" step="1" value="{crypter_cooldown_hours}">
                         </div>
                     </div>
+                    <p class="api-hint setting-row-hint">
+                        Defer keeps affected releases waiting in the queue until the cooldown expires. Fail restores the legacy behavior immediately: releases fail again so *arr grabs an alternative, and recorded blocks are kept but ignored until you switch back.
+                    </p>
                     <div id="crypter-block-status" class="notification-status"></div>
                     <p>{render_button("Save Block Settings", "primary", {"onclick": "saveCrypterBlockSettings()", "type": "button", "id": "crypterBlockSaveBtn"})}</p>
                 </div>

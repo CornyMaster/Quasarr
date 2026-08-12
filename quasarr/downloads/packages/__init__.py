@@ -16,6 +16,7 @@ from quasarr.constants import (
 )
 from quasarr.providers.crypter_cooldowns import (
     CrypterCooldownService,
+    crypter_blocks_deferred,
     decode_package_defer,
 )
 from quasarr.providers.jd_cache import JDPackageCache
@@ -379,7 +380,13 @@ def get_packages(shared_state, _cache=None, auto_start=True):
     )
 
     if protected_packages:
-        cooldown_service = CrypterCooldownService(shared_state)
+        # Legacy block mode renders the pre-cooldown queue: stored defer
+        # metadata is left untouched and simply never projected.
+        cooldown_service = (
+            CrypterCooldownService(shared_state)
+            if crypter_blocks_deferred(shared_state)
+            else None
+        )
         cooldown_snapshots = {}
         for package in protected_packages:
             package_id = package[0]
@@ -397,8 +404,10 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                     "type": "protected",
                     "package_id": package_id,
                 }
-                deferred = _project_package_defer(
-                    cooldown_service, data, cooldown_snapshots
+                deferred = (
+                    _project_package_defer(cooldown_service, data, cooldown_snapshots)
+                    if cooldown_service is not None
+                    else None
                 )
                 if deferred:
                     entry["deferred"] = deferred
