@@ -26,6 +26,10 @@ from quasarr.providers.log import (
 )
 from quasarr.search.cache import SearchCache as SearchCache  # explicit re-export
 from quasarr.search.cache import search_cache
+from quasarr.search.reclaim import (
+    IdleMemoryReclaimer as IdleMemoryReclaimer,  # explicit re-export
+)
+from quasarr.search.reclaim import trim_native_heap as trim_native_heap
 from quasarr.search.runtime import search_runtime
 from quasarr.search.singleflight import (
     SearchSingleFlight as SearchSingleFlight,  # explicit re-export

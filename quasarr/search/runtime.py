@@ -99,6 +99,7 @@ class SearchRuntime:
         self._active_source_tasks = 0
         self._overdue_tokens: set[_OverdueToken] = set()
         self._peak_active_source_tasks = 0
+        self._idle_reclaimer = None
 
     @contextmanager
     def request(
@@ -109,12 +110,14 @@ class SearchRuntime:
             self._counters["categories_planned"] += int(category_count)
             self._counters["families_planned"] += int(family_count)
             self._active_requests += 1
+            self._cancel_idle_reclaim_locked()
         try:
             yield self
         finally:
             with self._lock:
                 self._counters["requests_completed"] += 1
                 self._active_requests -= 1
+                self._schedule_idle_reclaim_locked()
 
     @contextmanager
     def source_task(self) -> Iterator["SearchRuntime"]:
@@ -124,11 +127,13 @@ class SearchRuntime:
             self._peak_active_source_tasks = max(
                 self._peak_active_source_tasks, self._active_source_tasks
             )
+            self._cancel_idle_reclaim_locked()
         try:
             yield self
         finally:
             with self._lock:
                 self._active_source_tasks -= 1
+                self._schedule_idle_reclaim_locked()
 
     def record_source_outcome(self, outcome: str) -> None:
         if outcome not in SOURCE_OUTCOMES:
@@ -152,6 +157,7 @@ class SearchRuntime:
         token = _OverdueToken()
         with self._lock:
             self._overdue_tokens.add(token)
+            self._cancel_idle_reclaim_locked()
         return token
 
     def resolve_source_overdue(self, token: object) -> bool:
@@ -162,7 +168,16 @@ class SearchRuntime:
             if token not in self._overdue_tokens:
                 return False
             self._overdue_tokens.remove(token)
+            self._schedule_idle_reclaim_locked()
             return True
+
+    def is_idle(self) -> bool:
+        with self._lock:
+            return self._is_idle_locked()
+
+    def set_idle_reclaimer(self, reclaimer) -> None:
+        with self._lock:
+            self._idle_reclaimer = reclaimer
 
     def snapshot(self) -> dict[str, int | None]:
         readings = self._memory_readings()
@@ -194,6 +209,29 @@ class SearchRuntime:
     def _increment(self, key: str) -> None:
         with self._lock:
             self._counters[key] += 1
+
+    def _is_idle_locked(self) -> bool:
+        return (
+            self._active_requests == 0
+            and self._active_source_tasks == 0
+            and not self._overdue_tokens
+        )
+
+    def _cancel_idle_reclaim_locked(self) -> None:
+        if self._idle_reclaimer is None:
+            return
+        try:
+            self._idle_reclaimer.cancel_for_activity()
+        except Exception:
+            pass
+
+    def _schedule_idle_reclaim_locked(self) -> None:
+        if self._idle_reclaimer is None or not self._is_idle_locked():
+            return
+        try:
+            self._idle_reclaimer.schedule_if_quiet()
+        except Exception:
+            pass
 
 
 search_runtime = SearchRuntime()

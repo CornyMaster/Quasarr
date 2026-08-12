@@ -84,7 +84,7 @@ class SearchCache:
             search_runtime.record_cache_eviction()
 
     def sweep(self, now: float | None = None) -> int:
-        """Drop every expired entry and return how many were removed."""
+        """Drop expired entries, release the cache lock, and return the count."""
         with self._lock:
             return self._sweep_locked(self._clock() if now is None else now)
 
