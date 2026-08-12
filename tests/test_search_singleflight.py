@@ -4,9 +4,10 @@
 
 import time
 import unittest
-from concurrent.futures import Future
+from concurrent.futures import Future, as_completed
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import ExitStack
-from threading import Barrier, Event, Lock, Thread
+from threading import Barrier, Event, Lock, Thread, get_ident
 from typing import cast
 from unittest.mock import patch
 
@@ -59,12 +60,15 @@ class RecordingSingleFlight(SearchSingleFlight):
         super().__init__()
         self.keys = []
         self.handles = []
+        self.leader_recorded = Event()
 
     def submit(self, key, executor, func, deadline):
         shared_work = super().submit(key, executor, func, deadline)
         with self._lock:
             self.keys.append(key)
             self.handles.append(shared_work)
+            if shared_work.is_leader:
+                self.leader_recorded.set()
         return shared_work
 
 
@@ -254,6 +258,7 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
     def test_follower_timeout_never_cancels_the_running_leader(self):
         source_started = Event()
         follower_arrived = Event()
+        follower_timed_out = Event()
         release_source = Event()
         self.addCleanup(release_source.set)
         runtime = NotifyingRuntime(follower_arrived)
@@ -265,9 +270,22 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
         release = {"details": {"title": "Leader.Result"}}
 
         def search():
+            if not singleflight.leader_recorded.wait(10):
+                raise RuntimeError("leader handle was not recorded")
             source_started.set()
-            release_source.wait(10)
+            release_source.wait()
             return [release]
+
+        def follower_clock():
+            return 101.0 if follower_arrived.is_set() else 100.0
+
+        follower_thread = get_ident()
+
+        def expire_follower_wait(futures, timeout):
+            if get_ident() == follower_thread:
+                follower_timed_out.set()
+                raise FutureTimeoutError
+            return as_completed(futures, timeout=timeout)
 
         source = make_source("sf", search)
 
@@ -288,14 +306,21 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
             leader.start()
             self.assertTrue(source_started.wait(10))
 
-            follower = SearchExecutor(deadline=time.time() + 0.25)
+            follower = SearchExecutor(deadline=101.0, clock=follower_clock)
             follower.add(source, (state, 0.0, 2000), {}, use_cache=True)
-            follower_response = follower.run_all()[0]
+            with patch("quasarr.search.as_completed", expire_follower_wait):
+                follower_response = follower.run_all()[0]
 
             self.assertTrue(follower_arrived.is_set())
-            leader_work, follower_work = singleflight.handles
-            self.assertTrue(leader_work.is_leader)
-            self.assertFalse(follower_work.is_leader)
+            self.assertTrue(follower_timed_out.is_set())
+            leader_handles = [work for work in singleflight.handles if work.is_leader]
+            follower_handles = [
+                work for work in singleflight.handles if not work.is_leader
+            ]
+            self.assertEqual(1, len(leader_handles))
+            self.assertEqual(1, len(follower_handles))
+            leader_work = leader_handles[0]
+            follower_work = follower_handles[0]
             self.assertIs(leader_work.future, follower_work.future)
             self.assertFalse(leader_work.future.cancelled())
             self.assertFalse(leader_work.future.done())
