@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import timezone
 from email.utils import parsedate_to_datetime
-from threading import Lock
 
 from quasarr.constants import (
     SEARCH_CAT_BOOKS,
@@ -25,6 +24,8 @@ from quasarr.providers.log import (
     trace,
     warn,
 )
+from quasarr.search.cache import SearchCache as SearchCache  # explicit re-export
+from quasarr.search.cache import search_cache
 from quasarr.search.runtime import search_runtime
 from quasarr.search.sources import get_sources
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
@@ -509,43 +510,3 @@ class SearchExecutor:
             executor.shutdown(wait=False, cancel_futures=True)
 
         return results, bar_str, all_cached, min_ttl
-
-
-class SearchCache:
-    def __init__(self):
-        self.last_cleaned = time.time()
-        self.cache = {}
-        self._lock = Lock()
-
-    def clean(self, now):
-        with self._lock:
-            self._clean_locked(now)
-
-    def _clean_locked(self, now):
-        if now - self.last_cleaned < 60:
-            return
-        keys_to_delete = [k for k, (_, exp) in self.cache.items() if now >= exp]
-        for k in keys_to_delete:
-            del self.cache[k]
-        self.last_cleaned = now
-
-    def get(self, key):
-        now = time.time()
-        with self._lock:
-            val, exp = self.cache.get(key, (None, 0))
-            if now < exp:
-                return (val, exp)
-
-            # Clean up stale key opportunistically.
-            if key in self.cache:
-                del self.cache[key]
-            return (None, 0)
-
-    def set(self, key, value, ttl=300):
-        now = time.time()
-        with self._lock:
-            self.cache[key] = (value, now + ttl)
-            self._clean_locked(now)
-
-
-search_cache = SearchCache()
