@@ -193,6 +193,22 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
         self.assertEqual(count, len(results))
 
 
+class RecordingCache(SearchCache):
+    """Cache that records every write it is asked to perform.
+
+    A repeated write leaves no trace in the cache's own state - the second one
+    only replaces the first - so the call count has to be observed here.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.writes = []
+
+    def set(self, key, value, ttl=300):
+        self.writes.append((key, ttl))
+        super().set(key, value, ttl=ttl)
+
+
 class SearchCacheEligibilityTests(unittest.TestCase):
     """Only an ordinary, complete release list produced at or before the
     deadline may be written to the cache."""
@@ -255,6 +271,22 @@ class SearchCacheEligibilityTests(unittest.TestCase):
         self.assertEqual([], results)
         self.assertEqual({}, self.cache.cache)
         self.assertEqual(1, self.runtime.snapshot()["source_errored"])
+
+    def test_an_eligible_result_is_written_to_the_cache_exactly_once(self):
+        # Writing the same key twice is not a harmless repeat: two collectors
+        # racing on one key can interleave so the older list lands last, and
+        # every write also re-sweeps and re-reports its evictions.
+        self.cache = RecordingCache()
+
+        results, _, _, _ = self.run_one(
+            FakeSource("on", lambda: [{"details": {"title": "On.Time"}}]),
+            time.time() + 5.0,
+        )
+
+        self.assertEqual(["On.Time"], [r["details"]["title"] for r in results])
+        # One completed, eligible future - so exactly one write.
+        self.assertEqual(1, len(self.cache.writes))
+        self.assertEqual(1, len(self.cache.cache))
 
 
 class MetadataWarmingDeadlineTests(unittest.TestCase):

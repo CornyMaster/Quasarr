@@ -515,7 +515,6 @@ class SearchExecutor:
                         if cache_meta and _is_cacheable(future, completion, deadline):
                             cache_key, cache_ttl = cache_meta
                             search_cache.set(cache_key, res, ttl=cache_ttl)
-                            search_cache.set(cache_key, res, ttl=cache_ttl)
                         runtime.record_source_outcome("completed")
                     except Exception as e:
                         runtime.record_source_outcome("errored")
