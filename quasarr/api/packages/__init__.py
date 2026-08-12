@@ -20,7 +20,10 @@ from quasarr.downloads.packages import (
 )
 from quasarr.providers import shared_state
 from quasarr.providers.auth import require_api_key
-from quasarr.providers.crypter_cooldowns import CrypterCooldownService
+from quasarr.providers.crypter_cooldowns import (
+    CrypterCooldownService,
+    crypter_blocks_deferred,
+)
 from quasarr.providers.html_templates import render_button, render_centered_html
 from quasarr.storage.categories import get_download_category_emoji
 
@@ -534,6 +537,11 @@ def setup_packages_routes(app):
                 "success": False,
                 "message": "package_ids must be a list",
             }
+        if not crypter_blocks_deferred(shared_state):
+            return {
+                "success": False,
+                "message": "Linkcrypter blocks are in fail mode",
+            }
         return CrypterCooldownService(shared_state).request_probe(package_ids)
 
     @app.delete("/api/packages/deferred")
@@ -758,6 +766,17 @@ def setup_packages_routes(app):
                     );
                 }}
 
+                // Matches by value instead of a built selector, so a package ID can never
+                // reach a query, and IDs that stopped being rendered stay dropped.
+                function restoreDeferredSelection(packageIds) {{
+                    const selected = new Set(packageIds);
+                    if (!selected.size) return;
+
+                    document.querySelectorAll('.deferred-package-select').forEach(checkbox => {{
+                        if (selected.has(checkbox.value)) checkbox.checked = true;
+                    }});
+                }}
+
                 function showDeferredActionResult(result, successKey) {{
                     const statusElement = document.getElementById('deferred-action-status');
                     if (!statusElement) return;
@@ -889,7 +908,9 @@ def setup_packages_routes(app):
                             const html = await response.text();
                             const container = document.getElementById('packages-content');
                             if (container && html) {{
+                                const selectedDeferredIds = selectedDeferredPackageIds();
                                 container.innerHTML = html;
+                                restoreDeferredSelection(selectedDeferredIds);
                                 restoreCollapseState();
                                 updateDeferredCountdowns();
                                 // Restore scroll position after content update

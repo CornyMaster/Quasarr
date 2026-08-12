@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 
 import json
+import re
 import unittest
+from html.parser import HTMLParser
 from types import SimpleNamespace
 from unittest import mock
 
@@ -137,6 +139,122 @@ def route_callback(app, method, rule):
         for route in app.routes
         if route.method == method and route.rule == rule
     )
+
+
+def render_packages_page():
+    app = Bottle()
+    packages_api.setup_packages_routes(app)
+    page_route = route_callback(app, "GET", "/packages")
+
+    with (
+        mock.patch.dict(packages_api.shared_state.values, {"device": object()}),
+        mock.patch.object(packages_api, "request", SimpleNamespace(query={})),
+        mock.patch.object(packages_api, "_render_packages_content", return_value=""),
+    ):
+        return page_route()
+
+
+def render_deferred_fragment(package_ids):
+    downloads = {
+        "queue": [
+            queue_item(
+                package_id,
+                f"[Waiting for linkcrypter retry] Deferred {package_id[-4:]}",
+                deferred_block(),
+            )
+            for package_id in package_ids
+        ],
+        "history": [],
+    }
+
+    with mock.patch.object(packages_api, "get_packages", return_value=downloads):
+        return packages_api._render_packages_content()
+
+
+class DeferredSelectParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.checkboxes = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "input":
+            return
+        attributes = dict(attrs)
+        classes = (attributes.get("class") or "").split()
+        if "deferred-package-select" not in classes:
+            return
+        self.checkboxes.append(
+            (attributes.get("value", ""), "checked" in attributes),
+        )
+
+
+class RefreshDom:
+    """Stand-in for the deferred checkboxes inside `#packages-content`.
+
+    Only the operations the refresh cycle performs on them are modelled, so the
+    order extracted from the shipped script can be replayed against real server
+    output instead of matched as text.
+    """
+
+    def __init__(self, fragment):
+        self.checkboxes = []
+        self.replace(fragment)
+
+    def replace(self, fragment):
+        parser = DeferredSelectParser()
+        parser.feed(fragment)
+        self.checkboxes = [
+            {"value": value, "checked": checked} for value, checked in parser.checkboxes
+        ]
+
+    def check(self, *values):
+        wanted = set(values)
+        for checkbox in self.checkboxes:
+            if checkbox["value"] in wanted:
+                checkbox["checked"] = True
+
+    def restore_selection(self, package_ids):
+        selected = set(package_ids)
+        for checkbox in self.checkboxes:
+            if checkbox["value"] in selected:
+                checkbox["checked"] = True
+
+    def selected_values(self):
+        return [
+            checkbox["value"] for checkbox in self.checkboxes if checkbox["checked"]
+        ]
+
+
+def javascript_function_body(source, name):
+    start = source.index(f"function {name}(")
+    opening = source.index("{", start)
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1 : index]
+    raise AssertionError(f"unbalanced braces in {name}")
+
+
+REFRESH_SELECTION_STEPS = (
+    ("snapshot", re.compile(r"const (\w+) = selectedDeferredPackageIds\(\);")),
+    ("replace", re.compile(r"container\.innerHTML = (html);")),
+    ("restore", re.compile(r"restoreDeferredSelection\((\w+)\);")),
+)
+
+
+def refresh_selection_steps(body):
+    found = []
+    for name, pattern in REFRESH_SELECTION_STEPS:
+        match = pattern.search(body)
+        if match is None:
+            raise AssertionError(f"refreshContent performs no {name} step")
+        found.append((match.start(), name, match.group(1)))
+    found.sort()
+    return [(name, argument) for _, name, argument in found]
 
 
 class DeferredPackagesRenderingTests(unittest.TestCase):
@@ -321,6 +439,59 @@ class DeferredPackagesRenderingTests(unittest.TestCase):
         self.assertIn("await refreshContent()", rendered)
 
 
+class DeferredSelectionRefreshTests(unittest.TestCase):
+    def test_background_refresh_keeps_selection_of_still_rendered_packages(self):
+        page = render_packages_page()
+        body = javascript_function_body(page, "refreshContent")
+        steps = refresh_selection_steps(body)
+
+        self.assertEqual(
+            ["snapshot", "replace", "restore"], [name for name, _ in steps]
+        )
+        captured_name = steps[0][1]
+        # The restore must consume exactly what the snapshot captured, and that
+        # binding must not outlive one refresh, or a cleared package would keep
+        # re-selecting itself on every later cycle.
+        self.assertEqual(captured_name, steps[2][1])
+        self.assertEqual(page.count(captured_name), body.count(captured_name))
+
+        before = render_deferred_fragment([PACKAGE_A, PACKAGE_B])
+        after = render_deferred_fragment([PACKAGE_A, PACKAGE_C])
+        self.assertEqual([], RefreshDom(after).selected_values())
+
+        dom = RefreshDom(before)
+        dom.check(PACKAGE_A, PACKAGE_B)
+
+        captured = None
+        for name, _ in steps:
+            if name == "snapshot":
+                captured = dom.selected_values()
+            elif name == "replace":
+                dom.replace(after)
+            else:
+                dom.restore_selection(captured)
+
+        self.assertEqual([PACKAGE_A, PACKAGE_B], captured)
+        self.assertEqual([PACKAGE_A], dom.selected_values())
+
+    def test_selection_restore_matches_values_without_building_selectors(self):
+        page = render_packages_page()
+        restore = javascript_function_body(page, "restoreDeferredSelection")
+
+        self.assertIn("new Set(", restore)
+        self.assertIn("'.deferred-package-select'", restore)
+        self.assertLess(
+            restore.index("selected.has(checkbox.value)"),
+            restore.index("checkbox.checked = true"),
+        )
+
+        for argument in re.findall(r"querySelectorAll?\(([^)]*)\)", page):
+            with self.subTest(selector=argument):
+                # A quoted literal cannot carry a concatenation or a template
+                # placeholder, so no package value can reach a query.
+                self.assertRegex(argument.strip(), r"""^('[^']*'|"[^"]*")$""")
+
+
 class DeferredPackagesRouteTests(unittest.TestCase):
     def setUp(self):
         self.app = Bottle()
@@ -389,6 +560,9 @@ class DeferredPackagesRouteTests(unittest.TestCase):
         delete_route = route_callback(self.app, "DELETE", "/api/packages/deferred")
 
         with (
+            mock.patch.dict(
+                packages_api.shared_state.values, {"crypter_block_mode": "defer"}
+            ),
             mock.patch.object(
                 packages_api,
                 "request",
@@ -511,6 +685,62 @@ class DeferredPackagesRouteTests(unittest.TestCase):
         )
         self.assertNotIn(PACKAGE_A, state.protected.rows)
         self.assertIn(PACKAGE_B, state.protected.rows)
+        self.assertIn(PACKAGE_D, state.protected.rows)
+        self.assertEqual(0, state.device_calls)
+
+    def test_fail_block_mode_makes_probe_inert_but_keeps_delete_working(self):
+        state = DeferredApiState()
+        state.values["crypter_block_mode"] = "fail"
+        state.add_package(PACKAGE_A, deferred=True)
+        state.add_package(PACKAGE_D, deferred=True)
+        probe_route = route_callback(self.app, "POST", "/api/packages/deferred/probe")
+        delete_route = route_callback(self.app, "DELETE", "/api/packages/deferred")
+
+        with (
+            mock.patch.object(packages_api, "shared_state", state),
+            mock.patch.object(packages_api, "CrypterCooldownService") as service,
+            mock.patch.object(
+                packages_api,
+                "request",
+                SimpleNamespace(json={"package_ids": [PACKAGE_A]}),
+            ),
+        ):
+            probe_result = probe_route()
+
+        self.assertEqual(
+            {
+                "success": False,
+                "message": "Linkcrypter blocks are in fail mode",
+            },
+            probe_result,
+        )
+        service.assert_not_called()
+        # `fail` is a read bypass: no hold exists to probe, and the persisted
+        # defer metadata must survive a flip back to `defer` untouched.
+        self.assertEqual(
+            {
+                "crypter": "filecrypt",
+                "reason_code": "ip_block_suspected",
+                "since_epoch": 1_700_000_000,
+                "retry_after_epoch": RETRY_AFTER,
+                "probe_requested": False,
+                "observation_holds": 1,
+            },
+            json.loads(state.protected.rows[PACKAGE_A])["deferred"],
+        )
+
+        with (
+            mock.patch.object(packages_api, "shared_state", state),
+            mock.patch.object(
+                packages_api,
+                "request",
+                SimpleNamespace(json={"package_ids": [PACKAGE_A]}),
+            ),
+        ):
+            delete_result = delete_route()
+
+        self.assertEqual({"deleted": [PACKAGE_A], "rejected": []}, delete_result)
+        self.assertNotIn(PACKAGE_A, state.protected.rows)
         self.assertIn(PACKAGE_D, state.protected.rows)
         self.assertEqual(0, state.device_calls)
 
