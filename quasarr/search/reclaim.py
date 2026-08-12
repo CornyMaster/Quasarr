@@ -188,6 +188,8 @@ class IdleMemoryReclaimer:
             summary["gc_collected"] = self._collector()
             summary["native_heap_trimmed"] = bool(self._native_trimmer())
         except Exception:
+            with self._lock:
+                self._last_collection_at = now
             summary["failed"] = True
         finally:
             if summary["performed"] or summary["failed"]:

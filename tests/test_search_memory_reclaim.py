@@ -299,6 +299,36 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         timers.timers[0].fire()
         self.assertEqual([100.0, 400.0], collections)
 
+    def test_a_failed_reclaim_attempt_obeys_the_five_minute_rate_limit(self):
+        clock = FakeClock()
+        timers = FakeTimerFactory()
+
+        class FailingCache:
+            def __init__(self):
+                self.calls = 0
+
+            def sweep(self):
+                self.calls += 1
+                raise RuntimeError("synthetic sweep failure")
+
+        cache = FailingCache()
+        reclaimer = self.make_reclaimer(
+            cache=cache,
+            clock=clock,
+            timers=timers,
+        )
+
+        first = reclaimer.collect_and_trim()
+        clock.advance(1)
+        second = reclaimer.collect_and_trim()
+        reclaimer.schedule_if_quiet()
+
+        self.assertTrue(first["failed"])
+        self.assertFalse(second["performed"])
+        self.assertFalse(second["failed"])
+        self.assertEqual(1, cache.calls)
+        self.assertEqual(299, timers.timers[0].interval)
+
     def test_cache_sweep_precedes_gc_trim_and_pss_after_reading(self):
         runtime = SearchRuntime(memory_reader=lambda: {})
         events = []
