@@ -2,7 +2,11 @@
 
 import unittest
 
-from quasarr.downloads.packages import get_links_status, is_not_downloadable
+from quasarr.downloads.packages import (
+    get_links_status,
+    is_not_downloadable,
+    is_quasarr_package,
+)
 
 PACKAGE = {"uuid": 1, "name": "Synthetic.Release.Example"}
 
@@ -20,6 +24,32 @@ def make_link(
         "finished": finished,
         "statusIconKey": status_icon,
     }
+
+
+class IsQuasarrPackageTests(unittest.TestCase):
+    def test_accepts_every_download_category_the_settings_allow(self):
+        # add_download_category() accepts ^[a-z0-9]+$, so any package ID built
+        # from a custom category must satisfy the canonical ID contract too.
+        for category in ("movies", "tv", "movies4k", "4k", "docs2"):
+            with self.subTest(category=category):
+                self.assertTrue(is_quasarr_package(f"Quasarr_{category}_" + "a1" * 16))
+
+    def test_rejects_ids_outside_the_package_id_contract(self):
+        for package_id in (
+            "Quasarr_Movies_" + "a" * 32,  # uppercase category
+            "Quasarr_movies-4k_" + "a" * 32,  # punctuation in category
+            "Quasarr_movies_4k_" + "a" * 32,  # extra separator
+            "Quasarr__" + "a" * 32,  # empty category
+            "Quasarr_movies_" + "A" * 32,  # uppercase hash
+            "Quasarr_movies_" + "g" * 32,  # non-hex hash
+            "Quasarr_movies_" + "a" * 31,  # short hash
+            "quasarr_movies_" + "a" * 32,  # wrong prefix casing
+            "0-invalid-package",
+            "",
+            None,
+        ):
+            with self.subTest(package_id=package_id):
+                self.assertFalse(is_quasarr_package(package_id))
 
 
 class IsNotDownloadableTests(unittest.TestCase):

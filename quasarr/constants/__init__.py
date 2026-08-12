@@ -413,7 +413,9 @@ FILECRYPT_ENABLED_TABLE = "filecrypt_enabled"
 PACKAGE_ID_PREFIX = "Quasarr_"
 
 # Regex for strict Quasarr ID validation: Quasarr_{category}_{32_char_hash}
-PACKAGE_ID_PATTERN = re.compile(r"^Quasarr_[a-z]+_[a-f0-9]{32}$")
+# The category charset must stay in sync with add_download_category(), which
+# accepts lowercase letters and digits (e.g. a custom "movies4k" category).
+PACKAGE_ID_PATTERN = re.compile(r"^Quasarr_[a-z0-9]+_[a-f0-9]{32}$")
 
 
 # ==============================================================================

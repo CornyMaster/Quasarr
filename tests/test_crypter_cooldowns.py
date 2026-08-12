@@ -385,10 +385,27 @@ class CrypterCooldownServiceTests(unittest.TestCase):
             "filecrypt", self.shared_state.databases["crypter_cooldowns"].rows
         )
 
+    def test_observations_accept_custom_category_package_ids(self):
+        # Custom download categories may contain digits, so evidence for a
+        # "movies4k" package must be recorded like any other package.
+        custom_package = "Quasarr_movies4k_" + "4" * 32
+
+        self.service.observe("filecrypt", custom_package, "a" * 64, REASON)
+
+        stored = json.loads(
+            self.shared_state.databases["crypter_cooldowns"].rows["filecrypt"]
+        )
+        self.assertEqual(
+            [custom_package],
+            [observation["package_id"] for observation in stored["observations"]],
+        )
+
     def test_invalid_observations_raise_without_database_writes(self):
         invalid = (
             ("hide", PACKAGE_A, "a" * 64, REASON),
             ("filecrypt", "invalid-package", "a" * 64, REASON),
+            ("filecrypt", "Quasarr_Movies_" + "0" * 32, "a" * 64, REASON),
+            ("filecrypt", "Quasarr_movies-4k_" + "0" * 32, "a" * 64, REASON),
             ("filecrypt", PACKAGE_A, "A" * 64, REASON),
             ("filecrypt", PACKAGE_A, "a" * 63, REASON),
             ("filecrypt", PACKAGE_A, "z" * 64, REASON),

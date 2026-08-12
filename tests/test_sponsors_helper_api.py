@@ -18,6 +18,9 @@ PACKAGE_A = "Quasarr_movies_00000000000000000000000000000000"
 PACKAGE_B = "Quasarr_movies_11111111111111111111111111111111"
 PACKAGE_C = "Quasarr_movies_22222222222222222222222222222222"
 PACKAGE_D = "Quasarr_movies_33333333333333333333333333333333"
+# Custom download categories may contain digits (add_download_category allows
+# ^[a-z0-9]+$), so package IDs built from them are canonical Quasarr IDs.
+CUSTOM_CATEGORY_PACKAGE = "Quasarr_movies4k_44444444444444444444444444444444"
 NONCONFORMING_PACKAGE = "Quasarr_movies_00000000000000000000000000000001"
 NOW = 1_700_000_000
 
@@ -697,6 +700,94 @@ class SponsorsHelperApiTests(unittest.TestCase):
             result["to_decrypt"]["url"],
         )
 
+    def test_custom_category_package_is_selectable_during_unrelated_cooldown(self):
+        service = FakeCooldownService(cooling_crypters={"filecrypt"})
+        protected_packages = [
+            protected_package(
+                CUSTOM_CATEGORY_PACKAGE,
+                "Custom.Category.First",
+                [["https://tolink.invalid/container/1", "tolink"]],
+            ),
+            protected_package(
+                PACKAGE_B,
+                "Fallback.Second",
+                [["https://tolink.invalid/container/2", "tolink"]],
+            ),
+        ]
+
+        package_id, data, links = select_helper_package(
+            protected_packages,
+            ["tolink."],
+            cooldown_service=service,
+        )
+
+        self.assertEqual(CUSTOM_CATEGORY_PACKAGE, package_id)
+        self.assertEqual("Custom.Category.First", data["title"])
+        self.assertEqual([["https://tolink.invalid/container/1", "tolink"]], links)
+
+    def test_exclusions_honor_custom_category_package_ids(self):
+        protected_packages = [
+            protected_package(
+                CUSTOM_CATEGORY_PACKAGE,
+                "Excluded.Custom.Category",
+                [["https://tolink.invalid/container/1", "tolink"]],
+            ),
+            protected_package(
+                PACKAGE_B,
+                "Eligible.Second",
+                [["https://tolink.invalid/container/2", "tolink"]],
+            ),
+        ]
+
+        package_id, data, _ = select_helper_package(
+            protected_packages,
+            ["tolink."],
+            cooldown_service=FakeCooldownService(),
+            excluded_package_ids=[CUSTOM_CATEGORY_PACKAGE],
+        )
+
+        self.assertEqual(PACKAGE_B, package_id)
+        self.assertEqual("Eligible.Second", data["title"])
+        # Control: the same package is selected once the exclusion is dropped,
+        # so PACKAGE_B above proves exclusion rather than ID rejection.
+        self.assertEqual(
+            CUSTOM_CATEGORY_PACKAGE,
+            select_helper_package(
+                protected_packages,
+                ["tolink."],
+                cooldown_service=FakeCooldownService(),
+            )[0],
+        )
+
+    def test_selection_still_skips_ids_outside_the_package_id_contract(self):
+        uppercase_category = "Quasarr_Movies_" + "0" * 32
+        protected_packages = [
+            protected_package(
+                uppercase_category,
+                "Uppercase.Category",
+                [["https://tolink.invalid/container/1", "tolink"]],
+            ),
+            protected_package(
+                "Quasarr_movies-4k_" + "0" * 32,
+                "Punctuated.Category",
+                [["https://tolink.invalid/container/2", "tolink"]],
+            ),
+            protected_package(
+                PACKAGE_B,
+                "Conforming.Third",
+                [["https://tolink.invalid/container/3", "tolink"]],
+            ),
+        ]
+
+        package_id, _, _ = select_helper_package(
+            protected_packages,
+            ["tolink."],
+            cooldown_service=FakeCooldownService(),
+            excluded_package_ids=[uppercase_category],
+        )
+
+        self.assertEqual(PACKAGE_B, package_id)
+
     def test_exclusions_ignore_invalid_duplicates_and_cap_valid_ids_at_100(self):
         package_ids = [f"Quasarr_movies_{index:032x}" for index in range(101)]
         protected_packages = [
@@ -832,6 +923,34 @@ class SponsorsHelperApiTests(unittest.TestCase):
         )
 
         self.assertEqual("Eligible.Second", result["to_decrypt"]["name"])
+
+    def test_capable_request_returns_custom_category_package_during_cooldown(self):
+        service = FakeCooldownService(cooling_crypters={"filecrypt"})
+        protected_packages = [
+            protected_package(
+                PACKAGE_A,
+                "Cooled.First",
+                [["https://filecrypt.invalid/container/1", "filecrypt"]],
+            ),
+            protected_package(
+                CUSTOM_CATEGORY_PACKAGE,
+                "Custom.Category.Second",
+                [["https://tolink.invalid/container/2", "tolink"]],
+            ),
+        ]
+
+        result, cooldown_type = self.call_to_decrypt(
+            protected_packages,
+            {
+                "supported_urls": ["filecrypt.", "tolink."],
+                "capabilities": ["crypter_defer_v1"],
+            },
+            cooldown_service=service,
+        )
+
+        self.assertEqual("Custom.Category.Second", result["to_decrypt"]["name"])
+        self.assertEqual(CUSTOM_CATEGORY_PACKAGE, result["to_decrypt"]["id"])
+        cooldown_type.assert_called_once()
 
     def test_legacy_request_retains_exact_response_shape(self):
         protected_packages = [

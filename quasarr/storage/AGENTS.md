@@ -26,7 +26,7 @@ All persistent state: the INI config (`Quasarr.ini`) wrapped by `Config` with tr
 - Lock ordering invariant (documented in the module docstrings, which must stay accurate): the config lock may be held while acquiring the database lock, never the reverse; `DataBase` methods must never call into `quasarr.storage.config`.
 - Boolean flags in SQLite are stored as strings: `notification_settings`, `timeout_slow_mode`, and `filecrypt_enabled` store `'true'`/`'false'`; active `skip_login` and `skip_flaresolverr` preferences store only `'true'` and are cleared by deleting the row. Legacy `skip_radarr` / `skip_sonarr` rows are read during boot migration: a relevant skipped client warns, while both skipped clients reopen the required *arr setup.
 - Category DB rows contain only mutable settings (mirrors / search_sources / name / base_type); static metadata like emoji lives in constants and is stripped from rows on read. Custom search category IDs are `100000 + base id`, max 10; download category names are lowercase alnum ≤ 20 chars, max 10 custom.
-- Package-ID parsing: `get_download_category_from_package_id()` depends on the `Quasarr_{category}_{hash}` format from `constants.PACKAGE_ID_PATTERN`.
+- Package-ID parsing: `get_download_category_from_package_id()` depends on the `Quasarr_{category}_{hash}` format from `constants.PACKAGE_ID_PATTERN`, whose category charset must stay in sync with the lowercase-alnum names `add_download_category()` accepts.
 
 ## Work Guidance
 
