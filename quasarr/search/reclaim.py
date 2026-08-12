@@ -109,6 +109,8 @@ class IdleMemoryReclaimer:
         self._lock = threading.Lock()
         self._timer = None
         self._timer_token = None
+        self._timer_starting = False
+        self._schedule_pending = False
         self._last_collection_at = None
         self._collecting = False
         self._activity_generation = 0
@@ -121,6 +123,8 @@ class IdleMemoryReclaimer:
                 return
             with self._lock:
                 if self._timer is not None:
+                    if self._timer_starting:
+                        self._schedule_pending = True
                     return
                 if self._collecting:
                     self._schedule_after_collection = True
@@ -129,6 +133,8 @@ class IdleMemoryReclaimer:
             now = self._clock()
             with self._lock:
                 if self._timer is not None:
+                    if self._timer_starting:
+                        self._schedule_pending = True
                     return
                 if self._collecting:
                     self._schedule_after_collection = True
@@ -149,13 +155,17 @@ class IdleMemoryReclaimer:
                 timer.daemon = True
                 self._timer = timer
                 self._timer_token = token
+                self._timer_starting = True
         except Exception:
+            with self._lock:
+                self._schedule_pending = True
             self._log_message("Search idle memory reclaim scheduling failed")
             return
 
         try:
             if not self._runtime.is_idle():
-                self._discard_timer(token, timer)
+                if self._discard_timer(token, timer):
+                    self.schedule_if_quiet()
                 return
             with self._lock:
                 should_start = (
@@ -163,11 +173,16 @@ class IdleMemoryReclaimer:
                     and activity_generation == self._activity_generation
                 )
             if not should_start:
-                timer.cancel()
+                if self._discard_timer(token, timer, defer=True):
+                    self.schedule_if_quiet()
                 return
             timer.start()
+            with self._lock:
+                if token is self._timer_token:
+                    self._timer_starting = False
+                    self._schedule_pending = False
         except Exception:
-            self._discard_timer(token, timer)
+            self._discard_timer(token, timer, defer=True)
             self._log_message("Search idle memory reclaim timer start failed")
 
     def cancel_for_activity(self) -> None:
@@ -176,6 +191,8 @@ class IdleMemoryReclaimer:
             timer = self._timer
             self._timer = None
             self._timer_token = None
+            self._timer_starting = False
+            self._schedule_pending = False
         if timer is not None:
             try:
                 timer.cancel()
@@ -244,49 +261,68 @@ class IdleMemoryReclaimer:
 
     def _timer_fired(self, token: object, activity_generation: int) -> None:
         collection_claimed = False
+        owned_token_consumed = False
+        schedule_after_callback = False
         try:
             now = self._clock()
             with self._lock:
                 if token is not self._timer_token:
                     return
-                if activity_generation != self._activity_generation:
-                    self._timer = None
-                    self._timer_token = None
-                    return
+                owned_token_consumed = True
                 self._timer = None
                 self._timer_token = None
-                if self._collecting:
-                    return
-                if (
+                self._timer_starting = False
+                if activity_generation != self._activity_generation:
+                    self._schedule_pending = True
+                    schedule_after_callback = True
+                elif self._collecting:
+                    self._schedule_after_collection = True
+                elif (
                     self._last_collection_at is not None
                     and now - self._last_collection_at < self._minimum_interval_seconds
                 ):
-                    return
-                self._collecting = True
-                collection_claimed = True
+                    self._schedule_pending = True
+                    schedule_after_callback = True
+                else:
+                    self._collecting = True
+                    collection_claimed = True
+            if schedule_after_callback:
+                self.schedule_if_quiet()
+                return
+            if not collection_claimed:
+                return
             self._collect_claimed(_empty_summary(), now, activity_generation)
         except Exception:
             with self._lock:
                 if token is self._timer_token:
                     self._timer = None
                     self._timer_token = None
+                    self._timer_starting = False
+                    self._schedule_pending = True
+                    owned_token_consumed = True
                 if collection_claimed and self._collecting:
                     self._collecting = False
                 schedule_after_collection = self._schedule_after_collection
                 self._schedule_after_collection = False
             self._log_message("Search idle memory reclaim timer callback failed")
-            if schedule_after_collection:
+            if owned_token_consumed or schedule_after_collection:
                 self.schedule_if_quiet()
 
-    def _discard_timer(self, token: object, timer) -> None:
+    def _discard_timer(self, token: object, timer, *, defer: bool = False) -> bool:
+        should_rearm = False
         with self._lock:
             if token is self._timer_token:
                 self._timer = None
                 self._timer_token = None
+                self._timer_starting = False
+                if defer:
+                    self._schedule_pending = True
+                should_rearm = self._schedule_pending
         try:
             timer.cancel()
         except Exception:
             self._log_message("Search idle memory reclaim timer cancel failed")
+        return should_rearm
 
     def _quiet_is_unchanged(self, activity_generation: int) -> bool:
         if not self._runtime.is_idle():

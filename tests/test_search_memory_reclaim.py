@@ -1,6 +1,6 @@
 import ctypes
 import unittest
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 
 from quasarr.search.cache import SearchCache
 from quasarr.search.reclaim import (
@@ -113,6 +113,41 @@ class HandoffActivityRuntime(SearchRuntime):
         return super().is_idle()
 
 
+class ReservedTimerRaceRuntime(SearchRuntime):
+    def __init__(self):
+        super().__init__(memory_reader=lambda: {})
+        self.first_idle_checked = Event()
+        self.activity_cancelled = Event()
+        self.busy_recheck_observed = Event()
+        self.allow_busy_recheck_return = Event()
+        self.activity_schedule_returned = Event()
+        self._first_idle_check_pending = True
+
+    def is_idle(self):
+        if self._first_idle_check_pending:
+            self._first_idle_check_pending = False
+            was_idle = super().is_idle()
+            self.first_idle_checked.set()
+            if not self.activity_cancelled.wait(5):
+                raise RuntimeError("activity cancellation did not complete")
+            return was_idle
+
+        is_idle = super().is_idle()
+        if not is_idle and not self.busy_recheck_observed.is_set():
+            self.busy_recheck_observed.set()
+            if not self.allow_busy_recheck_return.wait(5):
+                raise RuntimeError("busy recheck was not released")
+        return is_idle
+
+    def _cancel_idle_reclaim(self, reclaimer):
+        super()._cancel_idle_reclaim(reclaimer)
+        self.activity_cancelled.set()
+
+    def _schedule_idle_reclaim(self, reclaimer):
+        super()._schedule_idle_reclaim(reclaimer)
+        self.activity_schedule_returned.set()
+
+
 class RecordingCache:
     def __init__(self, events=None, expired=0):
         self.events = events if events is not None else []
@@ -213,7 +248,54 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         self.assertFalse(timers.timers[1].cancelled)
         self.assertEqual(30, timers.timers[1].interval)
 
-    def test_timer_handoff_activity_aborts_and_restarts_the_full_quiet_period(self):
+    def test_discarded_unstarted_timer_rearms_after_activity_end_race(self):
+        runtime = ReservedTimerRaceRuntime()
+        timers = FakeTimerFactory()
+        reclaimer = self.make_reclaimer(runtime=runtime, timers=timers)
+        finish_activity = Event()
+        activity_entered = Event()
+        thread_errors = []
+
+        def schedule_timer():
+            try:
+                reclaimer.schedule_if_quiet()
+            except Exception as error:
+                thread_errors.append(error)
+
+        def run_activity():
+            try:
+                with runtime.request(category_count=1, family_count=1):
+                    activity_entered.set()
+                    if not finish_activity.wait(5):
+                        raise RuntimeError("activity was not released")
+            except Exception as error:
+                thread_errors.append(error)
+
+        scheduler = Thread(target=schedule_timer)
+        activity = Thread(target=run_activity)
+        scheduler.start()
+        self.assertTrue(runtime.first_idle_checked.wait(5))
+        activity.start()
+        self.assertTrue(activity_entered.wait(5))
+        self.assertTrue(runtime.busy_recheck_observed.wait(5))
+
+        finish_activity.set()
+        self.assertTrue(runtime.activity_schedule_returned.wait(5))
+        runtime.allow_busy_recheck_return.set()
+        scheduler.join(5)
+        activity.join(5)
+
+        self.assertFalse(scheduler.is_alive())
+        self.assertFalse(activity.is_alive())
+        self.assertEqual([], thread_errors)
+        self.assertTrue(runtime.is_idle())
+        self.assertEqual(2, len(timers.timers))
+        self.assertTrue(timers.timers[0].cancelled)
+        self.assertEqual(30, timers.timers[1].interval)
+        self.assertTrue(timers.timers[1].started)
+        self.assertIs(reclaimer._timer, timers.timers[1])
+
+    def test_arm_generation_restarts_after_hidden_handoff_activity(self):
         runtime = HandoffActivityRuntime()
         timers = FakeTimerFactory()
         reclaim_events = []
@@ -231,8 +313,47 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
 
         self.assertEqual(["activity"], runtime.activity_events)
         self.assertEqual([], reclaim_events)
+        self.assertEqual(1, reclaimer._activity_generation)
         self.assertEqual(2, len(timers.timers))
         self.assertEqual(30, timers.timers[1].interval)
+        self.assertTrue(timers.timers[1].started)
+
+    def test_timer_callback_during_public_collection_rearms_at_rate_limit(self):
+        timers = FakeTimerFactory()
+        sweep_started = Event()
+        release_sweep = Event()
+        summaries = []
+        thread_errors = []
+
+        class BlockingCache:
+            def sweep(self):
+                sweep_started.set()
+                if not release_sweep.wait(5):
+                    raise RuntimeError("blocked sweep was not released")
+                return 0
+
+        reclaimer = self.make_reclaimer(cache=BlockingCache(), timers=timers)
+        reclaimer.schedule_if_quiet()
+
+        def collect_publicly():
+            try:
+                summaries.append(reclaimer.collect_and_trim())
+            except Exception as error:
+                thread_errors.append(error)
+
+        collector = Thread(target=collect_publicly)
+        collector.start()
+        self.assertTrue(sweep_started.wait(5))
+
+        timers.timers[0].fire()
+        release_sweep.set()
+        collector.join(5)
+
+        self.assertFalse(collector.is_alive())
+        self.assertEqual([], thread_errors)
+        self.assertTrue(summaries[0]["performed"])
+        self.assertEqual(2, len(timers.timers))
+        self.assertEqual(300, timers.timers[1].interval)
         self.assertTrue(timers.timers[1].started)
 
     def test_timer_start_runs_outside_runtime_and_reclaimer_locks(self):
@@ -310,9 +431,9 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         self.assertEqual(2, len(timers.timers))
         self.assertTrue(timers.timers[1].started)
 
-    def test_rearm_failure_is_contained_and_state_stays_schedulable(self):
+    def test_public_collect_rearm_factory_failure_is_contained(self):
         runtime = SearchRuntime(memory_reader=lambda: {})
-        timers = FailingTimerFactory(fail_on_call=2)
+        timers = FailingTimerFactory(fail_on_call=1)
 
         class ActivityDuringSweepCache:
             def sweep(self):
@@ -325,16 +446,24 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
             timers=timers,
             cache=ActivityDuringSweepCache(),
         )
+
+        summary = reclaimer.collect_and_trim()
+
+        self.assertFalse(summary["performed"])
+        self.assertFalse(summary["failed"])
+        self.assertEqual(1, timers.calls)
+        self.assertEqual([], timers.timers)
+        self.assertFalse(reclaimer._collecting)
+        self.assertTrue(reclaimer._schedule_pending)
+
         reclaimer.schedule_if_quiet()
 
-        timers.timers[0].fire()
-        reclaimer.schedule_if_quiet()
+        self.assertEqual(2, timers.calls)
+        self.assertEqual(1, len(timers.timers))
+        self.assertTrue(timers.timers[0].started)
+        self.assertFalse(reclaimer._schedule_pending)
 
-        self.assertEqual(3, timers.calls)
-        self.assertEqual(2, len(timers.timers))
-        self.assertTrue(timers.timers[1].started)
-
-    def test_timer_start_failure_clears_the_token_for_a_later_schedule(self):
+    def test_timer_start_failure_records_one_deferred_schedule(self):
         timers = FakeTimerFactory()
 
         class StartFailureTimer(FakeTimer):
@@ -351,10 +480,16 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         reclaimer = self.make_reclaimer(timers=fail_first_start)
 
         reclaimer.schedule_if_quiet()
+
+        self.assertEqual(1, len(timers.timers))
+        self.assertIsNone(reclaimer._timer)
+        self.assertTrue(reclaimer._schedule_pending)
+
         reclaimer.schedule_if_quiet()
 
         self.assertEqual(2, len(timers.timers))
         self.assertTrue(timers.timers[1].started)
+        self.assertFalse(reclaimer._schedule_pending)
 
     def test_source_and_overdue_transitions_each_reset_the_quiet_timer(self):
         runtime = SearchRuntime(memory_reader=lambda: {})
@@ -423,7 +558,7 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         self.assertEqual([], events)
         self.assertTrue(runtime.resolve_source_overdue(token))
 
-    def test_a_cancelled_timer_callback_rechecks_runtime_state(self):
+    def test_stale_callback_cannot_consume_replacement_while_fully_idle(self):
         runtime = SearchRuntime(memory_reader=lambda: {})
         timers = FakeTimerFactory()
         events = []
@@ -437,11 +572,19 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         reclaimer.schedule_if_quiet()
         stale_callback = timers.timers[0].callback
         token = runtime.mark_source_overdue()
+        self.assertTrue(runtime.resolve_source_overdue(token))
+        replacement = timers.timers[1]
+        replacement_token = reclaimer._timer_token
 
         stale_callback()
 
+        self.assertTrue(runtime.is_idle())
         self.assertEqual([], events)
-        self.assertTrue(runtime.resolve_source_overdue(token))
+        self.assertEqual(2, len(timers.timers))
+        self.assertIs(reclaimer._timer, replacement)
+        self.assertIs(reclaimer._timer_token, replacement_token)
+        self.assertFalse(replacement.cancelled)
+        self.assertTrue(replacement.started)
 
     def test_activity_during_sweep_aborts_and_restarts_the_quiet_period(self):
         runtime = SearchRuntime(memory_reader=lambda: {})
@@ -493,6 +636,35 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         clock.advance(1)
         timers.timers[0].fire()
         self.assertEqual([100.0, 400.0], collections)
+
+    def test_rate_limited_timer_callback_rearms_for_remaining_interval(self):
+        clock = FakeClock()
+        timers = FakeTimerFactory()
+        collections = []
+        reclaimer = self.make_reclaimer(
+            clock=clock,
+            timers=timers,
+            collector=lambda: collections.append(clock()) or 0,
+        )
+        reclaimer.schedule_if_quiet()
+
+        self.assertTrue(reclaimer.collect_and_trim()["performed"])
+        clock.advance(30)
+        timers.timers[0].fire()
+
+        self.assertEqual([100.0], collections)
+        self.assertEqual(2, len(timers.timers))
+        self.assertEqual(270, timers.timers[1].interval)
+        self.assertTrue(timers.timers[1].started)
+
+    def test_public_collect_does_not_arm_without_a_deferred_schedule(self):
+        timers = FakeTimerFactory()
+        reclaimer = self.make_reclaimer(timers=timers)
+
+        summary = reclaimer.collect_and_trim()
+
+        self.assertTrue(summary["performed"])
+        self.assertEqual([], timers.timers)
 
     def test_a_failed_reclaim_attempt_obeys_the_five_minute_rate_limit(self):
         clock = FakeClock()
@@ -570,7 +742,7 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         self.assertEqual(1, len(logs))
         self.assertNotIn("must-not-be-recorded", logs[0])
 
-    def test_gc_and_trim_run_outside_cache_and_runtime_locks(self):
+    def test_gc_and_trim_run_outside_all_reclaimer_related_locks(self):
         runtime = SearchRuntime(memory_reader=lambda: {})
         cache = RecordingCache()
         lock_checks = []
@@ -580,6 +752,7 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
                 (
                     can_acquire_from_another_thread(cache.lock),
                     can_acquire_from_another_thread(runtime._lock),
+                    can_acquire_from_another_thread(reclaimer._lock),
                 )
             )
 
@@ -591,7 +764,10 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         )
 
         self.assertTrue(reclaimer.collect_and_trim()["performed"])
-        self.assertEqual([(True, True), (True, True)], lock_checks)
+        self.assertEqual(
+            [(True, True, True), (True, True, True)],
+            lock_checks,
+        )
 
     def test_reclaim_sweeps_expired_entries_without_clearing_live_entries(self):
         cache_clock = FakeClock()
