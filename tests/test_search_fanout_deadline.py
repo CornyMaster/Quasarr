@@ -1,5 +1,6 @@
 import time
 import unittest
+from contextlib import ExitStack
 from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -39,6 +40,13 @@ class ThreadScopedClock:
 
 
 class SearchFanoutDeadlineTests(unittest.TestCase):
+    def setUp(self):
+        self._patches = ExitStack()
+        self.addCleanup(self._patches.close)
+        self._patches.enter_context(
+            patch("quasarr.search.search_singleflight", SearchSingleFlight())
+        )
+
     def test_slow_source_is_dropped_instead_of_stalling_the_response(self):
         # A source that outlives the fan-out deadline must not hold up the
         # response: *arr clients disable an indexer that answers too late.
@@ -70,7 +78,7 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
         executor.add(FakeSource("sl", slow), (None, 0.0, 2000), {}, use_cache=True)
 
         with (
-            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_runtime", runtime),
             patch("quasarr.search.search_cache", cache),
         ):
             started = time.time()
@@ -126,8 +134,7 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
                     cache_category=category,
                 )
 
-        with patch("quasarr.search.search_singleflight", SearchSingleFlight()):
-            results, _, _, _ = executor.run_all()
+        results, _, _, _ = executor.run_all()
 
         self.assertEqual(
             {"AA.2000", "AA.2010", "BB.2000", "BB.2010"},
@@ -171,7 +178,7 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
         executor.add(FakeSource("sl", never_wanted), (None, 0.0, 2000), {})
         runtime = SearchRuntime(memory_reader=lambda: {})
 
-        with patch("quasarr.search.search_runtime", runtime, create=True):
+        with patch("quasarr.search.search_runtime", runtime):
             results, bar, _, _ = executor.run_all()
 
         self.assertEqual([], started)
@@ -189,7 +196,7 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
         executor.add(FakeSource("er", fail), (None, 0.0, 2000), {})
         runtime = SearchRuntime(memory_reader=lambda: {})
 
-        with patch("quasarr.search.search_runtime", runtime, create=True):
+        with patch("quasarr.search.search_runtime", runtime):
             results, bar, _, _ = executor.run_all()
 
         self.assertEqual([], results)
@@ -241,6 +248,11 @@ class SearchCacheEligibilityTests(unittest.TestCase):
     deadline may be written to the cache."""
 
     def setUp(self):
+        self._patches = ExitStack()
+        self.addCleanup(self._patches.close)
+        self._patches.enter_context(
+            patch("quasarr.search.search_singleflight", SearchSingleFlight())
+        )
         self.runtime = SearchRuntime(memory_reader=lambda: {})
         self.cache = SearchCache()
 
@@ -248,7 +260,7 @@ class SearchCacheEligibilityTests(unittest.TestCase):
         executor = SearchExecutor(deadline=deadline, clock=clock)
         executor.add(source, (None, 0.0, 2000), {}, use_cache=True)
         with (
-            patch("quasarr.search.search_runtime", self.runtime, create=True),
+            patch("quasarr.search.search_runtime", self.runtime),
             patch("quasarr.search.search_cache", self.cache),
         ):
             return executor.run_all()

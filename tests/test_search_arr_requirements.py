@@ -1,4 +1,5 @@
 import unittest
+from contextlib import ExitStack
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from quasarr.constants import (
 from quasarr.providers.utils import is_site_usable
 from quasarr.search import SearchCache, get_search_results
 from quasarr.search.runtime import SearchRuntime
+from quasarr.search.singleflight import SearchSingleFlight
 from quasarr.storage.setup.arr import (
     _arr_client_selection_form_html,
     missing_arr_client_requirement,
@@ -32,6 +34,13 @@ from quasarr.storage.setup.sonarr import _sonarr_setup_form_html, is_sonarr_skip
 
 
 class SearchArrRequirementTests(unittest.TestCase):
+    def setUp(self):
+        self._patches = ExitStack()
+        self.addCleanup(self._patches.close)
+        self._patches.enter_context(
+            patch("quasarr.search.search_singleflight", SearchSingleFlight())
+        )
+
     @staticmethod
     def _state(**clients):
         return SimpleNamespace(
@@ -157,14 +166,14 @@ class SearchArrRequirementTests(unittest.TestCase):
         with (
             patch("quasarr.api.arr.shared_state", state),
             patch("quasarr.api.arr.get_search_results", side_effect=run_search),
-            patch("quasarr.api.arr.search_runtime", runtime, create=True),
+            patch("quasarr.api.arr.search_runtime", runtime),
             patch("quasarr.api.arr.debug") as log_debug,
             patch("quasarr.api.arr.info") as log_info,
             patch("quasarr.search.get_sources", return_value={"aa": source}),
             patch("quasarr.search.get_search_category_sources", return_value=[]),
             patch("quasarr.search.get_imdb_metadata"),
             patch("quasarr.search.search_cache", SearchCache()),
-            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_runtime", runtime),
         ):
             status, body = self._call_app(
                 app,

@@ -5,6 +5,7 @@
 import time
 import unittest
 from concurrent.futures import Future
+from contextlib import ExitStack
 from threading import Barrier, Event, Lock, Thread
 from typing import cast
 from unittest.mock import patch
@@ -81,6 +82,57 @@ class ControlledExecutor:
 
 
 class SearchSingleFlightIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self._patches = ExitStack()
+        self.addCleanup(self._patches.close)
+        self._patches.enter_context(
+            patch("quasarr.search.search_singleflight", SearchSingleFlight())
+        )
+
+    def test_fresh_registry_starts_work_after_a_previous_run_times_out(self):
+        blocked_started = Event()
+        release_blocked = Event()
+        self.addCleanup(release_blocked.set)
+        first_registry = SearchSingleFlight()
+        second_calls = []
+        fresh_release = {"details": {"title": "Fresh.Release"}}
+
+        def blocked_search():
+            blocked_started.set()
+            release_blocked.wait(10)
+            return [{"details": {"title": "Blocked.Release"}}]
+
+        def fresh_search():
+            second_calls.append(True)
+            return [fresh_release]
+
+        def run_like_test(source, registry):
+            executor = SearchExecutor(deadline=time.time() + 0.2)
+            executor.add(source, (None, 0.0, 2000), {})
+            with (
+                patch(
+                    "quasarr.search.search_runtime",
+                    SearchRuntime(memory_reader=lambda: {}),
+                ),
+                patch("quasarr.search.search_cache", SearchCache()),
+                patch("quasarr.search.search_singleflight", registry),
+            ):
+                return executor.run_all()[0]
+
+        first_response = run_like_test(
+            make_source("sf", blocked_search), first_registry
+        )
+        self.assertTrue(blocked_started.is_set())
+        self.assertEqual([], first_response)
+        self.assertEqual(1, len(first_registry._flights))
+
+        second_response = run_like_test(
+            make_source("sf", fresh_search), SearchSingleFlight()
+        )
+
+        self.assertEqual([fresh_release], second_response)
+        self.assertEqual([True], second_calls)
+
     def test_identical_in_flight_cache_keys_execute_the_source_once(self):
         start = Barrier(3, timeout=10)
         source_started = Event()
@@ -123,7 +175,7 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
 
         workers = [Thread(target=run, args=(index,)) for index in range(2)]
         with (
-            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_runtime", runtime),
             patch("quasarr.search.search_cache", cache),
         ):
             for worker in workers:
@@ -179,7 +231,7 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
         leader = Thread(target=run, args=("leader", time.time() + 0.5))
         follower = Thread(target=run, args=("follower", time.time() + 10))
         with (
-            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_runtime", runtime),
             patch("quasarr.search.search_cache", cache),
             patch("quasarr.search.search_singleflight", singleflight),
         ):
@@ -229,7 +281,7 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
 
         leader = Thread(target=run_leader)
         with (
-            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_runtime", runtime),
             patch("quasarr.search.search_cache", cache),
             patch("quasarr.search.search_singleflight", singleflight),
         ):
@@ -296,7 +348,7 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
         leader = Thread(target=run, args=("leader",))
         follower = Thread(target=run, args=("follower",))
         with (
-            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_runtime", runtime),
             patch("quasarr.search.search_cache", cache),
             patch("quasarr.search.search_singleflight", singleflight),
         ):
@@ -356,7 +408,7 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
         leader = Thread(target=run, args=("leader",))
         follower = Thread(target=run, args=("follower",))
         with (
-            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_runtime", runtime),
             patch("quasarr.search.search_cache", cache),
             patch("quasarr.search.search_singleflight", singleflight),
         ):
@@ -395,7 +447,7 @@ class SearchSingleFlightIntegrationTests(unittest.TestCase):
         )
 
         with (
-            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_runtime", runtime),
             patch("quasarr.search.search_cache", cache),
             patch("quasarr.search.search_singleflight", singleflight),
         ):
