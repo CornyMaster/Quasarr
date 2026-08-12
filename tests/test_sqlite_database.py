@@ -146,6 +146,52 @@ class SQLiteDatabaseTests(unittest.TestCase):
             writer._conn.close()
             reader._conn.close()
 
+    def test_delete_exact_removes_only_one_matching_row_and_commits(self):
+        writer = DataBase("failed")
+        reader = DataBase("failed")
+        writer.store("package", "failure-before")
+        writer.store("package", "failure-before")
+        writer.store("package", "failure-after")
+
+        try:
+            self.assertTrue(writer.delete_exact("package", "failure-before"))
+            rows = reader._conn.execute(
+                "SELECT value FROM failed WHERE key=? ORDER BY rowid", ("package",)
+            ).fetchall()
+
+            self.assertEqual(
+                [("failure-before",), ("failure-after",)],
+                rows,
+            )
+            self.assertFalse(writer.delete_exact("package", "missing"))
+        finally:
+            writer._conn.close()
+            reader._conn.close()
+
+    def test_delete_exact_rolls_back_when_delete_fails(self):
+        class DeleteFailureConnection:
+            def __init__(self):
+                self.rollbacks = 0
+
+            def execute(self, query, _params=None):
+                if query == "BEGIN IMMEDIATE":
+                    return None
+                if query.startswith("DELETE FROM failed"):
+                    raise RuntimeError("delete failed")
+                raise AssertionError(f"unexpected query: {query}")
+
+            def rollback(self):
+                self.rollbacks += 1
+
+        db = object.__new__(DataBase)
+        db._table = "failed"
+        db._conn = DeleteFailureConnection()
+
+        with self.assertRaisesRegex(RuntimeError, "delete failed"):
+            db.delete_exact("package", "failure-before")
+
+        self.assertEqual(1, db._conn.rollbacks)
+
     def test_mutate_value_invalid_return_rolls_back_and_calls_once(self):
         db = DataBase("crypter_cooldowns")
         db.update_store("filecrypt", "original")

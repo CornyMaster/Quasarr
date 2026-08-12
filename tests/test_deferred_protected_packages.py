@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 
 import json
+import os
+import tempfile
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
 from quasarr.downloads import store_protected_links
 from quasarr.downloads.packages import delete_database_packages, get_packages
+from quasarr.providers import shared_state as provider_shared_state
 from quasarr.providers.crypter_cooldowns import CrypterCooldownService
+from quasarr.storage.sqlite_database import DataBase
 
 PACKAGE_A = "Quasarr_movies_00000000000000000000000000000000"
 PACKAGE_B = "Quasarr_movies_11111111111111111111111111111111"
@@ -72,6 +76,14 @@ class FakeDatabase:
             else:
                 self.rows[key] = value
             return value
+
+    def delete_exact(self, key, value):
+        self._interleave(key)
+        with self.lock:
+            if self.rows.get(key) != value or self.frozen:
+                return False
+            self.rows.pop(key)
+            return True
 
 
 class FakeCache:
@@ -768,6 +780,76 @@ class DatabasePackageDeletionTests(unittest.TestCase):
         self.assertNotIn(PACKAGE_A, self.protected.rows)
         self.assertEqual(fresh_failure, self.failed.rows[PACKAGE_A])
         self.assertEqual(0, self.shared_state.device_calls)
+
+
+class SQLiteDatabasePackageDeletionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.original_provider_values = provider_shared_state.values
+        provider_shared_state.values = {
+            "dbfile": os.path.join(self.tmpdir.name, "Quasarr.db")
+        }
+        self.databases = {
+            "protected": DataBase("protected"),
+            "failed": DataBase("failed"),
+            "crypter_cooldowns": DataBase("crypter_cooldowns"),
+        }
+        self.concurrent_failed = DataBase("failed")
+        self.device_calls = 0
+        self.values = {
+            "crypter_cooldown_hours": 24,
+            "database": self.get_db,
+        }
+        self.databases["protected"].update_store(
+            PACKAGE_A, json.dumps(protected_blob())
+        )
+        CrypterCooldownService(self, clock=FakeClock(NOW)).defer_package(
+            PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
+        )
+
+    def tearDown(self):
+        for database in self.databases.values():
+            database._conn.close()
+        self.concurrent_failed._conn.close()
+        provider_shared_state.values = self.original_provider_values
+        self.tmpdir.cleanup()
+
+    def get_db(self, table):
+        return self.databases[table]
+
+    def get_device(self):
+        self.device_calls += 1
+        return MagicMock()
+
+    def test_batch_delete_preserves_a_concurrent_duplicate_failed_row(self):
+        failed_before = json.dumps({"title": "failure before deletion"})
+        failed_after = json.dumps({"title": "failure during deletion"})
+        self.databases["failed"].store(PACKAGE_A, failed_before)
+        original_delete = CrypterCooldownService.delete_deferred_package
+
+        def delete_then_append(service, package_id):
+            outcome = original_delete(service, package_id)
+            self.assertEqual("deleted", outcome)
+            self.concurrent_failed.store(package_id, failed_after)
+            self.assertEqual(
+                [failed_before, failed_after],
+                self.databases["failed"].retrieve_all(package_id),
+            )
+            return outcome
+
+        with patch.object(
+            CrypterCooldownService,
+            "delete_deferred_package",
+            delete_then_append,
+        ):
+            result = delete_database_packages(self, [PACKAGE_A])
+
+        self.assertEqual({"deleted": [PACKAGE_A], "rejected": []}, result)
+        self.assertIsNone(self.databases["protected"].retrieve(PACKAGE_A))
+        self.assertEqual(
+            [failed_after], self.databases["failed"].retrieve_all(PACKAGE_A)
+        )
+        self.assertEqual(0, self.device_calls)
 
 
 if __name__ == "__main__":

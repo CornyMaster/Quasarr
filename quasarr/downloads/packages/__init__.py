@@ -1144,17 +1144,12 @@ def _delete_deferred_package(cooldown_service, protected_db, failed_db, package_
         return None
 
     try:
-        failed_db.mutate_value(
-            package_id,
-            lambda current_value: (
-                None if current_value == failed_snapshot else current_value
-            ),
-        )
+        deleted = failed_db.delete_exact(package_id, failed_snapshot)
     except Exception as e:
         debug(f"delete_database_packages: Failed DB delete exception: {e}")
         return "delete_failed"
 
-    if failed_db.retrieve(package_id) == failed_snapshot:
+    if not deleted:
         info(f"Verification failed: Package {package_id} still exists in the failed DB")
         return "delete_failed"
     return None

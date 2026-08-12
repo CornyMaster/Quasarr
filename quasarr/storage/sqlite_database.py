@@ -21,6 +21,8 @@ Locking contract:
     Config/DataBase operation; it must return a string or None without side effects.
     It must finish on the calling thread rather than spawning or delegating work.
     The nested-call guard is thread-local and does not reject unrelated threads.
+- `delete_exact` holds one SQLite write transaction while deleting at most one
+    lowest-rowid row whose key and value both match.
 """
 
 import sqlite3
@@ -299,6 +301,26 @@ class DataBase(object):
                 self._conn.execute(insert_query, (key, new_value))
             self._conn.commit()
             return new_value
+        except Exception:
+            self._rollback()
+            raise
+
+    @with_lock(lock)
+    def delete_exact(self, key, value):
+        """Atomically delete at most one row matching an exact key and value."""
+        try:
+            self._with_retry(lambda: self._conn.execute("BEGIN IMMEDIATE"))
+            delete_query = (
+                f"DELETE FROM {self._table} "
+                "WHERE rowid = ("
+                f"SELECT rowid FROM {self._table} "
+                "WHERE key=? AND value=? ORDER BY rowid LIMIT 1"
+                ")"
+            )
+            result = self._conn.execute(delete_query, (key, value))
+            deleted = result.rowcount == 1
+            self._conn.commit()
+            return deleted
         except Exception:
             self._rollback()
             raise
