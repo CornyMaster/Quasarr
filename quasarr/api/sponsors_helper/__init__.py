@@ -372,6 +372,16 @@ def setup_sponsors_helper_routes(app):
         if not required_fields.issubset(data):
             return abort(400, "Missing defer report fields")
 
+        if shared_state.values.get("crypter_block_mode", "defer") == "fail":
+            return {
+                "success": True,
+                "instruction": "legacy_failure",
+                "state": "available",
+                "hold_type": "none",
+                "evidence_count": 0,
+                "retry_after_epoch": 0,
+            }
+
         package_id = data.get("package_id")
         crypter = data.get("crypter")
         reason_code = data.get("reason_code")

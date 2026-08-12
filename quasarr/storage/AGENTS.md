@@ -24,13 +24,13 @@ All persistent state: the INI config (`Quasarr.ini`) wrapped by `Config` with tr
 - `DataBase.delete_exact(key, value)` is the duplicate-safe compare-and-delete primitive: one rollback-protected `BEGIN IMMEDIATE` transaction removes at most the lowest-rowid row whose key and value both match and returns whether one row was removed. Use it for targeted cleanup in tables populated through duplicate-permitting `store()`; it does not change `store()` semantics or deduplicate existing rows.
 - Mutation callbacks execute entirely on the calling thread and must not spawn or delegate work to another thread. The nested-call guard is intentionally thread-local: it rejects same-thread callback re-entry without globally rejecting unrelated operations; the database file lock still serializes competing database transactions.
 - Lock ordering invariant (documented in the module docstrings, which must stay accurate): the config lock may be held while acquiring the database lock, never the reverse; `DataBase` methods must never call into `quasarr.storage.config`.
-- Boolean flags in SQLite are stored as strings: `notification_settings`, `timeout_slow_mode`, and `filecrypt_enabled` store `'true'`/`'false'`; active `skip_login` and `skip_flaresolverr` preferences store only `'true'` and are cleared by deleting the row. Legacy `skip_radarr` / `skip_sonarr` rows are read during boot migration: a relevant skipped client warns, while both skipped clients reopen the required *arr setup.
+- Boolean flags in SQLite are stored as strings: `notification_settings`, `timeout_slow_mode`, and `filecrypt_enabled` store `'true'`/`'false'`; active `skip_login` and `skip_flaresolverr` preferences store only `'true'` and are cleared by deleting the row. Linkcrypter block behavior lives in `crypter_block_settings` as `mode='defer'|'fail'` plus a decimal `cooldown_hours` value. Legacy `skip_radarr` / `skip_sonarr` rows are read during boot migration: a relevant skipped client warns, while both skipped clients reopen the required *arr setup.
 - Category DB rows contain only mutable settings (mirrors / search_sources / name / base_type); static metadata like emoji lives in constants and is stripped from rows on read. Custom search category IDs are `100000 + base id`, max 10; download category names are lowercase alnum ≤ 20 chars, max 10 custom.
 - Package-ID parsing: `get_download_category_from_package_id()` depends on the `Quasarr_{category}_{hash}` format from `constants.PACKAGE_ID_PATTERN`, whose category charset must stay in sync with the lowercase-alnum names `add_download_category()` accepts.
 
 ## Work Guidance
 
-- Settings read from disk are pushed into shared_state (`notification_settings`, `timeout_slow_mode`, `filecrypt_enabled`) and consumers read shared_state, not disk - keep that refresh-then-cache pattern.
+- Settings read from disk are pushed into shared_state (`notification_settings`, `timeout_slow_mode`, `filecrypt_enabled`, `crypter_block_mode`, `crypter_cooldown_hours`) and consumers read shared_state, not disk - keep that refresh-then-cache pattern.
 
 ## Verification
 

@@ -404,6 +404,9 @@ PROTECTED_PATTERNS = {
 # Table storing the filecrypt kill switch flag.
 FILECRYPT_ENABLED_TABLE = "filecrypt_enabled"
 
+# Table storing linkcrypter block behavior settings.
+CRYPTER_BLOCK_SETTINGS_TABLE = "crypter_block_settings"
+
 
 # ==============================================================================
 # QUASARR PACKAGE MANAGEMENT
