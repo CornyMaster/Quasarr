@@ -12,6 +12,7 @@ from quasarr.api.sponsors_helper import (
     select_helper_package,
     setup_sponsors_helper_routes,
 )
+from quasarr.providers.auth import audit_route_auth_modes
 from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 
 PACKAGE_A = "Quasarr_movies_00000000000000000000000000000000"
@@ -161,6 +162,46 @@ class AtomicSharedState:
 
 
 class SponsorsHelperApiTests(unittest.TestCase):
+    def deferred_state(self, links=None):
+        if links is None:
+            links = [["https://filecrypt.invalid/container/1", "filecrypt"]]
+        state = AtomicSharedState(
+            dict([protected_package(PACKAGE_A, "Deferred.Package", links)])
+        )
+        service = CrypterCooldownService(state, clock=lambda: NOW)
+        decision = service.observe(
+            "filecrypt",
+            PACKAGE_A,
+            "a" * 64,
+            "ip_block_suspected",
+        )
+        service.defer_package(
+            PACKAGE_A,
+            "filecrypt",
+            "ip_block_suspected",
+            decision["package_retry_after_epoch"],
+            observation_holds=1,
+        )
+        return state, service
+
+    def call_json_route(self, rule, state, payload, cooldown_service):
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(route for route in app.routes if route.rule == rule)
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.shared_state", state),
+            mock.patch(
+                "quasarr.api.sponsors_helper.request",
+                mock.Mock(json=payload),
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.CrypterCooldownService",
+                return_value=cooldown_service,
+            ),
+        ):
+            return route.callback()
+
     def call_to_decrypt(self, protected_packages, payload, cooldown_service=None):
         app = Bottle()
         setup_sponsors_helper_routes(app)
@@ -200,6 +241,597 @@ class SponsorsHelperApiTests(unittest.TestCase):
         }
 
         self.assertEqual({"POST"}, methods)
+
+    def test_crypter_report_routes_are_post_only_and_api_key_authenticated(self):
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+
+        methods_by_rule = {
+            rule: {route.method for route in app.routes if route.rule == rule}
+            for rule in (
+                "/sponsors_helper/api/defer/",
+                "/sponsors_helper/api/crypter-access/",
+            )
+        }
+
+        self.assertEqual(
+            {
+                "/sponsors_helper/api/defer/": {"POST"},
+                "/sponsors_helper/api/crypter-access/": {"POST"},
+            },
+            methods_by_rule,
+        )
+        audit_route_auth_modes(
+            app,
+            api_key_prefixes=("/sponsors_helper/api/",),
+            public_whitelist=(),
+        )
+
+    def test_defer_first_observation_returns_exact_provisional_hold(self):
+        state = AtomicSharedState(
+            dict(
+                [
+                    protected_package(
+                        PACKAGE_A,
+                        "First.Observation",
+                        [["https://filecrypt.invalid/container/1", "filecrypt"]],
+                    )
+                ]
+            )
+        )
+        service = CrypterCooldownService(state, clock=lambda: NOW)
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.fail") as fail,
+            mock.patch("quasarr.api.sponsors_helper.StatsHelper") as stats,
+            mock.patch(
+                "quasarr.api.sponsors_helper.update_release_notification"
+            ) as notify,
+        ):
+            result = self.call_json_route(
+                "/sponsors_helper/api/defer/",
+                state,
+                {
+                    "package_id": PACKAGE_A,
+                    "crypter": "filecrypt",
+                    "reason_code": "ip_block_suspected",
+                    "link_fingerprint": "a" * 64,
+                },
+                service,
+            )
+
+        self.assertEqual(
+            {
+                "success": True,
+                "instruction": "hold",
+                "state": "observing",
+                "evidence_count": 1,
+                "retry_after_epoch": NOW + 900,
+                "hold_type": "provisional",
+            },
+            result,
+        )
+        self.assertIn(PACKAGE_A, state.databases["protected"].rows)
+        deferred = service.get_package_defer(PACKAGE_A)
+        self.assertEqual(1, deferred.get("observation_holds") if deferred else None)
+        fail.assert_not_called()
+        stats.assert_not_called()
+        notify.assert_not_called()
+
+    def test_defer_third_distinct_observation_returns_exact_cooldown(self):
+        packages = (
+            (PACKAGE_A, "a"),
+            (PACKAGE_B, "b"),
+            (PACKAGE_C, "c"),
+        )
+        state = AtomicSharedState(
+            dict(
+                protected_package(
+                    package_id,
+                    f"Observation.{fingerprint}",
+                    [
+                        [
+                            f"https://filecrypt.invalid/container/{fingerprint}",
+                            "filecrypt",
+                        ]
+                    ],
+                )
+                for package_id, fingerprint in packages
+            )
+        )
+        service = CrypterCooldownService(state, clock=lambda: NOW)
+
+        responses = []
+        for package_id, fingerprint in packages:
+            responses.append(
+                self.call_json_route(
+                    "/sponsors_helper/api/defer/",
+                    state,
+                    {
+                        "package_id": package_id,
+                        "crypter": "filecrypt",
+                        "reason_code": "ip_block_suspected",
+                        "link_fingerprint": fingerprint * 64,
+                    },
+                    service,
+                )
+            )
+        result = responses[-1]
+
+        self.assertEqual(
+            {
+                "success": True,
+                "instruction": "cooldown",
+                "state": "cooldown",
+                "evidence_count": 3,
+                "retry_after_epoch": NOW + 86_400,
+                "hold_type": "crypter_cooldown",
+            },
+            result,
+        )
+        deferred = service.get_package_defer(PACKAGE_C)
+        self.assertEqual(0, deferred.get("observation_holds") if deferred else None)
+        self.assertEqual(
+            set(state.databases["protected"].rows), {PACKAGE_A, PACKAGE_B, PACKAGE_C}
+        )
+
+    def test_defer_second_isolated_report_returns_exact_legacy_failure(self):
+        current_time = [NOW]
+        state = AtomicSharedState(
+            dict(
+                [
+                    protected_package(
+                        PACKAGE_A,
+                        "Repeated.Isolated",
+                        [["https://filecrypt.invalid/container/1", "filecrypt"]],
+                    )
+                ]
+            )
+        )
+        service = CrypterCooldownService(state, clock=lambda: current_time[0])
+        payload = {
+            "package_id": PACKAGE_A,
+            "crypter": "filecrypt",
+            "reason_code": "ip_block_suspected",
+            "link_fingerprint": "a" * 64,
+        }
+
+        first = self.call_json_route(
+            "/sponsors_helper/api/defer/", state, payload, service
+        )
+        current_time[0] += 901
+        payload["link_fingerprint"] = "b" * 64
+        second = self.call_json_route(
+            "/sponsors_helper/api/defer/", state, payload, service
+        )
+
+        self.assertEqual("hold", first["instruction"])
+        self.assertEqual(
+            {
+                "success": True,
+                "instruction": "legacy_failure",
+                "state": "observing",
+                "evidence_count": 1,
+                "retry_after_epoch": 0,
+                "hold_type": "none",
+            },
+            second,
+        )
+        self.assertIn(PACKAGE_A, state.databases["protected"].rows)
+        deferred = service.get_package_defer(PACKAGE_A)
+        self.assertEqual(1, deferred.get("observation_holds") if deferred else None)
+        self.assertEqual(
+            NOW + 900, deferred.get("retry_after_epoch") if deferred else None
+        )
+
+    def test_defer_rejects_incomplete_payload_before_persistence_access(self):
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(
+            route for route in app.routes if route.rule == "/sponsors_helper/api/defer/"
+        )
+        payloads = (
+            None,
+            [],
+            {},
+            {
+                "package_id": PACKAGE_A,
+                "crypter": "filecrypt",
+                "reason_code": "ip_block_suspected",
+            },
+        )
+
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with (
+                    mock.patch(
+                        "quasarr.api.sponsors_helper.request",
+                        mock.Mock(json=payload),
+                    ),
+                    mock.patch(
+                        "quasarr.api.sponsors_helper.CrypterCooldownService"
+                    ) as cooldown_type,
+                    self.assertRaises(HTTPError) as context,
+                ):
+                    route.callback()
+
+                self.assertEqual(400, context.exception.status_code)
+                cooldown_type.assert_not_called()
+
+    def test_defer_rejects_malformed_fields_without_writes_or_failed_side_effects(self):
+        valid_payload = {
+            "package_id": PACKAGE_A,
+            "crypter": "filecrypt",
+            "reason_code": "ip_block_suspected",
+            "link_fingerprint": "a" * 64,
+        }
+        malformed_fields = {
+            "package_id": (None, "not-a-package-id"),
+            "crypter": (None, "rapidgator"),
+            "reason_code": (None, "unknown"),
+            "link_fingerprint": (None, "A" * 64, "a" * 63),
+        }
+
+        for field, values in malformed_fields.items():
+            for value in values:
+                state = AtomicSharedState(
+                    dict(
+                        [
+                            protected_package(
+                                PACKAGE_A,
+                                "Retained.Malformed.Request",
+                                [
+                                    [
+                                        "https://filecrypt.invalid/container/1",
+                                        "filecrypt",
+                                    ]
+                                ],
+                            )
+                        ]
+                    )
+                )
+                service = CrypterCooldownService(state, clock=lambda: NOW)
+                payload = dict(valid_payload)
+                payload[field] = value
+
+                with (
+                    self.subTest(field=field, value=value),
+                    mock.patch("quasarr.api.sponsors_helper.fail") as fail,
+                    mock.patch("quasarr.api.sponsors_helper.StatsHelper") as stats,
+                    mock.patch(
+                        "quasarr.api.sponsors_helper.update_release_notification"
+                    ) as notify,
+                    self.assertRaises(HTTPError) as context,
+                ):
+                    self.call_json_route(
+                        "/sponsors_helper/api/defer/",
+                        state,
+                        payload,
+                        service,
+                    )
+
+                self.assertEqual(400, context.exception.status_code)
+                self.assertIn(PACKAGE_A, state.databases["protected"].rows)
+                self.assertEqual({}, state.databases["crypter_cooldowns"].rows)
+                fail.assert_not_called()
+                stats.assert_not_called()
+                notify.assert_not_called()
+
+    def test_defer_missing_package_keeps_evidence_without_failed_side_effects(self):
+        state = AtomicSharedState({})
+        service = CrypterCooldownService(state, clock=lambda: NOW)
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.fail") as fail,
+            mock.patch("quasarr.api.sponsors_helper.StatsHelper") as stats,
+            mock.patch(
+                "quasarr.api.sponsors_helper.update_release_notification"
+            ) as notify,
+            self.assertRaises(HTTPError) as context,
+        ):
+            self.call_json_route(
+                "/sponsors_helper/api/defer/",
+                state,
+                {
+                    "package_id": PACKAGE_A,
+                    "crypter": "filecrypt",
+                    "reason_code": "ip_block_suspected",
+                    "link_fingerprint": "a" * 64,
+                },
+                service,
+            )
+
+        self.assertEqual(404, context.exception.status_code)
+        self.assertEqual("observing", service.snapshot("filecrypt")["state"])
+        fail.assert_not_called()
+        stats.assert_not_called()
+        notify.assert_not_called()
+
+    def test_defer_database_error_retains_package_without_failed_side_effects(self):
+        package = protected_package(
+            PACKAGE_A,
+            "Retained.Database.Error",
+            [["https://filecrypt.invalid/container/1", "filecrypt"]],
+        )
+        state = AtomicSharedState(dict([package]))
+        original = state.databases["protected"].rows[PACKAGE_A]
+        service = mock.Mock()
+        service.get_package_defer.return_value = None
+        service.observe.return_value = {
+            "state": "observing",
+            "evidence_count": 1,
+            "package_retry_after_epoch": NOW + 900,
+        }
+        service.defer_package.side_effect = RuntimeError("database unavailable")
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.fail") as fail,
+            mock.patch("quasarr.api.sponsors_helper.StatsHelper") as stats,
+            mock.patch(
+                "quasarr.api.sponsors_helper.update_release_notification"
+            ) as notify,
+            self.assertRaises(HTTPError) as context,
+        ):
+            self.call_json_route(
+                "/sponsors_helper/api/defer/",
+                state,
+                {
+                    "package_id": PACKAGE_A,
+                    "crypter": "filecrypt",
+                    "reason_code": "ip_block_suspected",
+                    "link_fingerprint": "a" * 64,
+                },
+                service,
+            )
+
+        self.assertEqual(500, context.exception.status_code)
+        self.assertEqual(original, state.databases["protected"].rows[PACKAGE_A])
+        fail.assert_not_called()
+        stats.assert_not_called()
+        notify.assert_not_called()
+
+    def test_crypter_access_clear_returns_exact_response_and_clears_all_state(self):
+        state, service = self.deferred_state()
+
+        result = self.call_json_route(
+            "/sponsors_helper/api/crypter-access/",
+            state,
+            {
+                "package_id": PACKAGE_A,
+                "crypter": "filecrypt",
+                "access": "clear",
+            },
+            service,
+        )
+
+        self.assertEqual(
+            {"success": True, "state": "available", "cleared": True},
+            result,
+        )
+        self.assertEqual("available", service.snapshot("filecrypt")["state"])
+        self.assertIsNone(service.get_package_defer(PACKAGE_A))
+        retained = json.loads(state.databases["protected"].rows[PACKAGE_A])
+        self.assertEqual("Deferred.Package", retained["title"])
+        self.assertNotIn("deferred", retained)
+
+    def test_crypter_access_rejects_unknown_and_unsupported_access_without_clearing(
+        self,
+    ):
+        for access in (None, "unknown", "blocked", "CLEAR"):
+            state, service = self.deferred_state()
+
+            with (
+                self.subTest(access=access),
+                self.assertRaises(HTTPError) as context,
+            ):
+                self.call_json_route(
+                    "/sponsors_helper/api/crypter-access/",
+                    state,
+                    {
+                        "package_id": PACKAGE_A,
+                        "crypter": "filecrypt",
+                        "access": access,
+                    },
+                    service,
+                )
+
+            self.assertEqual(400, context.exception.status_code)
+            self.assertEqual("observing", service.snapshot("filecrypt")["state"])
+            self.assertIsNotNone(service.get_package_defer(PACKAGE_A))
+
+    def test_crypter_access_rejects_unprotected_key_and_mismatched_package_link(self):
+        cases = (
+            (
+                "rapidgator",
+                [["https://filecrypt.invalid/container/1", "filecrypt"]],
+            ),
+            (
+                "filecrypt",
+                [["https://tolink.invalid/container/1", "tolink"]],
+            ),
+        )
+
+        for crypter, links in cases:
+            state, service = self.deferred_state(links=links)
+
+            with (
+                self.subTest(crypter=crypter, links=links),
+                self.assertRaises(HTTPError) as context,
+            ):
+                self.call_json_route(
+                    "/sponsors_helper/api/crypter-access/",
+                    state,
+                    {
+                        "package_id": PACKAGE_A,
+                        "crypter": crypter,
+                        "access": "clear",
+                    },
+                    service,
+                )
+
+            self.assertEqual(400, context.exception.status_code)
+            self.assertEqual("observing", service.snapshot("filecrypt")["state"])
+            self.assertIsNotNone(service.get_package_defer(PACKAGE_A))
+
+    def test_crypter_access_clear_survives_later_download_failure(self):
+        state, service = self.deferred_state()
+        self.call_json_route(
+            "/sponsors_helper/api/crypter-access/",
+            state,
+            {
+                "package_id": PACKAGE_A,
+                "crypter": "filecrypt",
+                "access": "clear",
+            },
+            service,
+        )
+        state.values["helper_active"] = True
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(
+            route
+            for route in app.routes
+            if route.rule == "/sponsors_helper/api/download/"
+        )
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.shared_state", state),
+            mock.patch(
+                "quasarr.api.sponsors_helper.request",
+                mock.Mock(
+                    json={
+                        "name": "Deferred.Package",
+                        "package_id": PACKAGE_A,
+                        "urls": ["https://host.invalid/file"],
+                        "password": "",
+                        "notification": {"solvers": []},
+                    }
+                ),
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.submit_final_download_urls",
+                return_value={"success": False},
+            ),
+            mock.patch("quasarr.api.sponsors_helper.StatsHelper"),
+            self.assertRaises(HTTPError) as context,
+        ):
+            route.callback()
+
+        self.assertEqual(500, context.exception.status_code)
+        self.assertEqual("available", service.snapshot("filecrypt")["state"])
+        self.assertIsNone(service.get_package_defer(PACKAGE_A))
+
+    def test_download_success_accepts_optional_top_level_crypter(self):
+        state = AtomicSharedState({})
+        state.values["helper_active"] = True
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(
+            route
+            for route in app.routes
+            if route.rule == "/sponsors_helper/api/download/"
+        )
+        service = mock.Mock()
+        statistics = mock.Mock()
+        payload = {
+            "name": "Successful.Package",
+            "package_id": PACKAGE_A,
+            "urls": ["https://host.invalid/file"],
+            "password": "",
+            "notification": {"solvers": []},
+            "crypter": "filecrypt",
+        }
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.shared_state", state),
+            mock.patch(
+                "quasarr.api.sponsors_helper.request",
+                mock.Mock(json=payload),
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.submit_final_download_urls",
+                return_value={
+                    "success": True,
+                    "links": ["https://host.invalid/file"],
+                },
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.CrypterCooldownService",
+                return_value=service,
+            ) as cooldown_type,
+            mock.patch(
+                "quasarr.api.sponsors_helper.StatsHelper",
+                return_value=statistics,
+            ),
+        ):
+            result = route.callback()
+            payload.pop("crypter")
+            legacy_result = route.callback()
+
+        self.assertEqual(
+            "Downloaded 1 download links for Successful.Package",
+            result,
+        )
+        self.assertEqual(result, legacy_result)
+        cooldown_type.assert_called_once_with(state)
+        service.record_success.assert_called_once_with("filecrypt")
+
+    def test_download_success_survives_optional_crypter_clear_error(self):
+        state = AtomicSharedState({})
+        state.values["helper_active"] = True
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(
+            route
+            for route in app.routes
+            if route.rule == "/sponsors_helper/api/download/"
+        )
+        service = mock.Mock()
+        service.record_success.side_effect = RuntimeError("database unavailable")
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.shared_state", state),
+            mock.patch(
+                "quasarr.api.sponsors_helper.request",
+                mock.Mock(
+                    json={
+                        "name": "Successful.Package",
+                        "package_id": PACKAGE_A,
+                        "urls": ["https://host.invalid/file"],
+                        "password": "",
+                        "notification": {"solvers": []},
+                        "crypter": "filecrypt",
+                    }
+                ),
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.submit_final_download_urls",
+                return_value={
+                    "success": True,
+                    "links": ["https://host.invalid/file"],
+                },
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.CrypterCooldownService",
+                return_value=service,
+            ) as cooldown_type,
+            mock.patch("quasarr.api.sponsors_helper.StatsHelper"),
+            mock.patch("quasarr.api.sponsors_helper.info") as log_info,
+        ):
+            result = route.callback()
+
+        self.assertEqual(
+            "Downloaded 1 download links for Successful.Package",
+            result,
+        )
+        cooldown_type.assert_called_once_with(state)
+        service.record_success.assert_called_once_with("filecrypt")
+        self.assertTrue(
+            any(
+                "linkcrypter success" in str(call.args[0]).lower()
+                for call in log_info.call_args_list
+            )
+        )
 
     def test_to_decrypt_route_preserves_invalid_payload_status(self):
         app = Bottle()

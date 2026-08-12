@@ -16,7 +16,10 @@ from quasarr.downloads import (
 )
 from quasarr.providers import shared_state
 from quasarr.providers.auth import require_api_key
-from quasarr.providers.crypter_cooldowns import CrypterCooldownService
+from quasarr.providers.crypter_cooldowns import (
+    CrypterCooldownService,
+    normalize_crypter_key,
+)
 from quasarr.providers.log import info, warn
 from quasarr.providers.notifications import update_release_notification
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
@@ -354,6 +357,118 @@ def setup_sponsors_helper_routes(app):
         mirrors = get_download_category_mirrors(category)
         return {"mirrors": mirrors}
 
+    @app.post("/sponsors_helper/api/defer/")
+    @require_api_key
+    def defer_api():
+        data = request.json
+        if not isinstance(data, dict):
+            return abort(400, "Missing or invalid JSON object")
+        required_fields = {
+            "package_id",
+            "crypter",
+            "reason_code",
+            "link_fingerprint",
+        }
+        if not required_fields.issubset(data):
+            return abort(400, "Missing defer report fields")
+
+        package_id = data.get("package_id")
+        crypter = data.get("crypter")
+        reason_code = data.get("reason_code")
+        link_fingerprint = data.get("link_fingerprint")
+        service = CrypterCooldownService(shared_state)
+
+        try:
+            existing_defer = service.get_package_defer(package_id)
+            decision = service.observe(
+                crypter,
+                package_id,
+                link_fingerprint,
+                reason_code,
+            )
+
+            if decision["state"] == "cooldown":
+                instruction = "cooldown"
+                hold_type = "crypter_cooldown"
+                observation_holds = 0
+                retry_after_epoch = decision["package_retry_after_epoch"]
+            elif existing_defer and existing_defer["observation_holds"]:
+                instruction = "legacy_failure"
+                hold_type = "none"
+                observation_holds = 1
+                retry_after_epoch = 0
+            else:
+                instruction = "hold"
+                hold_type = "provisional"
+                observation_holds = 1
+                retry_after_epoch = decision["package_retry_after_epoch"]
+
+            stored_defer = service.defer_package(
+                package_id,
+                crypter,
+                reason_code,
+                decision["package_retry_after_epoch"],
+                observation_holds,
+            )
+            if stored_defer is None:
+                return abort(404, "Protected package not found")
+        except ValueError as error:
+            return abort(400, str(error))
+        except HTTPResponse:
+            raise
+        except Exception as error:
+            return abort(500, str(error))
+
+        return {
+            "success": True,
+            "instruction": instruction,
+            "state": decision["state"],
+            "evidence_count": decision["evidence_count"],
+            "retry_after_epoch": retry_after_epoch,
+            "hold_type": hold_type,
+        }
+
+    @app.post("/sponsors_helper/api/crypter-access/")
+    @require_api_key
+    def crypter_access_api():
+        data = request.json
+        if not isinstance(data, dict):
+            return abort(400, "Missing or invalid JSON object")
+        if not {"package_id", "crypter", "access"}.issubset(data):
+            return abort(400, "Missing linkcrypter access report fields")
+        if data["access"] != "clear":
+            return abort(400, "Unsupported linkcrypter access value")
+
+        package_id = data["package_id"]
+        if not isinstance(package_id, str) or not PACKAGE_ID_PATTERN.fullmatch(
+            package_id
+        ):
+            return abort(400, "Invalid package_id")
+        try:
+            crypter = normalize_crypter_key(data["crypter"])
+        except ValueError as error:
+            return abort(400, str(error))
+
+        protected_release = get_protected_release(package_id)
+        if protected_release is None:
+            return abort(404, "Protected package not found")
+        links = protected_release.get("links")
+        if not isinstance(links, list) or not any(
+            resolve_protected_crypter_key(link) == crypter for link in links
+        ):
+            return abort(400, "Package does not contain the reported linkcrypter")
+
+        service = CrypterCooldownService(shared_state)
+        try:
+            service.record_success(crypter)
+            service.clear_package_defer(package_id)
+        except ValueError as error:
+            return abort(400, str(error))
+        except Exception as error:
+            return abort(500, str(error))
+
+        return {"success": True, "state": "available", "cleared": True}
+
     @app.post("/sponsors_helper/api/to_decrypt/")
     @require_api_key
     def to_decrypt_api():
@@ -437,6 +552,7 @@ def setup_sponsors_helper_routes(app):
             download_links = data.get("urls")
             password = data.get("password")
             notification = data.get("notification")
+            reported_crypter = data.get("crypter")
 
             if not isinstance(notification, dict):
                 return abort(400, "Missing or invalid 'notification' object")
@@ -470,6 +586,13 @@ def setup_sponsors_helper_routes(app):
                 )
                 if submit_result["success"]:
                     final_links = submit_result["links"]
+                    if reported_crypter is not None:
+                        try:
+                            CrypterCooldownService(shared_state).record_success(
+                                reported_crypter
+                            )
+                        except Exception as e:
+                            info(f"Error recording linkcrypter success: {e}")
                     StatsHelper(shared_state).increment_package_with_links(final_links)
                     StatsHelper(shared_state).increment_captcha_decryptions_automatic()
 
