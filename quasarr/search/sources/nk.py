@@ -27,6 +27,11 @@ from quasarr.providers.utils import (
     is_imdb_id,
     is_valid_release,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -79,10 +84,10 @@ class Source(AbstractSearchSource):
 
         if not source_search:
             search_type = "feed"
-            timeout = FEED_REQUEST_TIMEOUT_SECONDS
+            timeout_default = FEED_REQUEST_TIMEOUT_SECONDS
         else:
             search_type = "search"
-            timeout = SEARCH_REQUEST_TIMEOUT_SECONDS
+            timeout_default = SEARCH_REQUEST_TIMEOUT_SECONDS
 
         if season:
             source_search += f" S{int(season):02d}"
@@ -95,10 +100,15 @@ class Source(AbstractSearchSource):
         data = {"search": source_search}
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(timeout_default)
             r = requests.post(url, headers=headers, data=data, timeout=timeout)
             r.raise_for_status()
             soup = BeautifulSoup(r.content, "html.parser")
             results = soup.find_all("div", class_="article-right")
+        except SearchBudgetExhausted:
+            debug(f"{search_type} budget spent before the request could start")
+            return releases
         except Exception as e:
             info(f"{search_type} load error: {e}")
             mark_hostname_issue(

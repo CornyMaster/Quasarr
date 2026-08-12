@@ -27,6 +27,11 @@ from quasarr.providers.utils import (
     is_valid_release,
     sanitize_string,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -55,11 +60,14 @@ class Source(AbstractSearchSource):
             url = f"https://{sj_host}/api/releases/latest/{days}"
 
             try:
-                r = requests.get(
-                    url, headers=headers, timeout=FEED_REQUEST_TIMEOUT_SECONDS
-                )
+                checkpoint()
+                timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
+                r = requests.get(url, headers=headers, timeout=timeout)
                 r.raise_for_status()
                 data = json.loads(r.content)
+            except SearchBudgetExhausted:
+                debug("feed budget spent; returning partial results")
+                break
             except Exception as e:
                 info(f"feed load error: {e}")
                 mark_hostname_issue(
@@ -163,11 +171,13 @@ class Source(AbstractSearchSource):
         results = []
         for query_string in query_strings:
             try:
+                checkpoint()
+                timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                 r = requests.get(
                     search_url,
                     headers=headers,
                     params={"q": query_string},
-                    timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                    timeout=timeout,
                 )
                 r.raise_for_status()
                 soup = BeautifulSoup(r.content, "html.parser")
@@ -175,6 +185,9 @@ class Source(AbstractSearchSource):
                     (result, query_string)
                     for result in soup.find_all("a", href=re.compile(r"^/serie/"))
                 )
+            except SearchBudgetExhausted:
+                debug("search budget spent; querying no further title variant")
+                break
             except Exception as e:
                 info(f"search load error: {e}")
                 mark_hostname_issue(
@@ -190,6 +203,7 @@ class Source(AbstractSearchSource):
 
         for result, query_string in results:
             try:
+                checkpoint()
                 result_title = result.get_text(strip=True)
 
                 sanitized_title = sanitize_string(result_title)
@@ -212,10 +226,12 @@ class Source(AbstractSearchSource):
                     continue
                 seen_series_urls.add(series_url)
 
+                checkpoint()
+                timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                 r = requests.get(
                     series_url,
                     headers=headers,
-                    timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                    timeout=timeout,
                 )
                 r.raise_for_status()
                 media_id_match = re.search(r'data-mediaid="([^"]+)"', r.text)
@@ -226,10 +242,12 @@ class Source(AbstractSearchSource):
                 media_id = media_id_match.group(1)
                 api_url = f"https://{sj_host}/api/media/{media_id}/releases"
 
+                checkpoint()
+                timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                 r = requests.get(
                     api_url,
                     headers=headers,
-                    timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                    timeout=timeout,
                 )
                 r.raise_for_status()
                 data = json.loads(r.content)
@@ -283,6 +301,9 @@ class Source(AbstractSearchSource):
                             }
                         )
 
+            except SearchBudgetExhausted:
+                debug("search budget spent; returning partial results")
+                break
             except Exception as e:
                 debug(f"search parse error: {e}")
                 continue

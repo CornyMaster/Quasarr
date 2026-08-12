@@ -30,6 +30,11 @@ from quasarr.providers.utils import (
     is_imdb_id,
     is_valid_release,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -58,10 +63,12 @@ class Source(AbstractSearchSource):
         headers = {"User-Agent": shared_state.values["user_agent"]}
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
             r = requests.get(
                 feed_url,
                 headers=headers,
-                timeout=FEED_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             r.raise_for_status()
 
@@ -130,6 +137,9 @@ class Source(AbstractSearchSource):
                     debug(f"Error parsing feed item: {e}")
                     continue
 
+        except SearchBudgetExhausted:
+            debug("Feed budget spent before the request could start")
+            return releases
         except Exception as e:
             warn(f"Error loading feed: {e}")
             mark_hostname_issue(self.initials, "feed", str(e))
@@ -167,10 +177,12 @@ class Source(AbstractSearchSource):
         headers = {"User-Agent": shared_state.values["user_agent"]}
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
             r = requests.get(
                 search_url,
                 headers=headers,
-                timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             r.raise_for_status()
 
@@ -186,6 +198,9 @@ class Source(AbstractSearchSource):
                 episode,
             )
 
+        except SearchBudgetExhausted:
+            debug("Search budget spent before the request could start")
+            return releases
         except Exception as e:
             warn(f"Error loading search: {e}")
             mark_hostname_issue(self.initials, "search", str(e))

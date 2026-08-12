@@ -28,6 +28,11 @@ from quasarr.providers.utils import (
     is_imdb_id,
     is_valid_release,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -94,10 +99,10 @@ class Source(AbstractSearchSource):
 
         if not source_search:
             search_type = "feed"
-            timeout = FEED_REQUEST_TIMEOUT_SECONDS
+            timeout_default = FEED_REQUEST_TIMEOUT_SECONDS
         else:
             search_type = "search"
-            timeout = SEARCH_REQUEST_TIMEOUT_SECONDS
+            timeout_default = SEARCH_REQUEST_TIMEOUT_SECONDS
 
         if episode_date is not None:
             source_search += f" {episode_date:%Y %m %d}"
@@ -113,10 +118,15 @@ class Source(AbstractSearchSource):
         params = {"s": source_search}
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(timeout_default)
             r = requests.get(url, headers=headers, params=params, timeout=timeout)
             r.raise_for_status()
             soup = BeautifulSoup(r.content, "html.parser")
             results = soup.find_all("div", class_="item")
+        except SearchBudgetExhausted:
+            debug(f"{search_type} budget spent before the request could start")
+            return releases
         except Exception as e:
             info(f"{search_type} load error: {e}")
             mark_hostname_issue(
@@ -129,6 +139,7 @@ class Source(AbstractSearchSource):
 
         for result in results:
             try:
+                checkpoint()
                 data = result.find("div", class_="data")
                 if not data:
                     continue
@@ -175,11 +186,13 @@ class Source(AbstractSearchSource):
                         debug("missing publish date for {}", title)
 
                 release_imdb_id = None
+                checkpoint()
+                timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                 try:
                     r = requests.get(
                         source,
                         headers=headers,
-                        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout=timeout,
                     )
                     soup = BeautifulSoup(r.content, "html.parser")
                 except Exception as e:
@@ -234,6 +247,9 @@ class Source(AbstractSearchSource):
                         "type": "protected",
                     }
                 )
+            except SearchBudgetExhausted:
+                debug("Search budget spent; returning partial results")
+                break
             except Exception as e:
                 debug(f"error parsing search result: {e}")
                 continue
