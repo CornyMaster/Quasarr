@@ -2,13 +2,25 @@
 # Quasarr
 # Project by https://github.com/rix1337
 
+import html
+import json
+import time
+from urllib.parse import quote
+
 from bottle import redirect, request
 
 import quasarr.providers.html_images as images
 from quasarr.api.jdownloader import get_jdownloader_disconnected_page
-from quasarr.downloads.packages import delete_package, get_packages
+from quasarr.downloads.packages import (
+    DEFERRED_STATUS_PREFIX,
+    PROTECTED_STATUS_PREFIX,
+    delete_database_packages,
+    delete_package,
+    get_packages,
+)
 from quasarr.providers import shared_state
 from quasarr.providers.auth import require_api_key
+from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 from quasarr.providers.html_templates import render_button, render_centered_html
 from quasarr.storage.categories import get_download_category_emoji
 
@@ -35,25 +47,136 @@ def _format_size(mb=None, bytes_val=None):
     return f"{mb / 1024:.1f} GB"
 
 
-def _escape_js(s):
+def _javascript_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    encoded = json.dumps(str(value), ensure_ascii=True)
     return (
-        s.replace("\\", "\\\\")
-        .replace("'", "\\'")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
+        encoded.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
     )
 
 
+def _javascript_call(function_name, *args):
+    arguments = ", ".join(_javascript_value(value) for value in args)
+    return html.escape(f"{function_name}({arguments})", quote=True)
+
+
+def _html(value):
+    return html.escape(str(value), quote=True)
+
+
+def _label(value, labels):
+    text = str(value or "unknown")
+    return labels.get(text, text.replace("_", " ").strip().capitalize())
+
+
+def _format_deferred_countdown(retry_after_epoch):
+    try:
+        remaining = max(0, int(retry_after_epoch) - int(time.time()))
+    except (TypeError, ValueError):
+        remaining = 0
+    days, remainder = divmod(remaining, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    clock = f"{hours:02}:{minutes:02}:{seconds:02}"
+    return f"{days}d {clock}" if days else clock
+
+
+def _render_deferred_queue_item(item):
+    deferred = item.get("deferred", {})
+    filename = str(item.get("filename", "Unknown"))
+    for prefix in (DEFERRED_STATUS_PREFIX, PROTECTED_STATUS_PREFIX):
+        if filename.startswith(prefix):
+            filename = filename[len(prefix) :]
+            break
+
+    package_id = str(item.get("nzo_id", ""))
+    package_id_attr = _html(package_id)
+    package_url_id = quote(package_id, safe="")
+    crypter_label = _label(
+        deferred.get("crypter"),
+        {"filecrypt": "Filecrypt", "junkies": "Junkies"},
+    )
+    reason_label = _label(
+        deferred.get("reason_code"),
+        {"ip_block_suspected": "IP access block suspected"},
+    )
+    hold_type = deferred.get("hold_type")
+    if hold_type == "crypter_cooldown":
+        state_label = "Cooldown"
+    elif hold_type == "provisional":
+        state_label = "Observing"
+    else:
+        state_label = _label(deferred.get("state"), {})
+    try:
+        evidence_count = max(0, int(deferred.get("evidence_count", 0)))
+    except (TypeError, ValueError):
+        evidence_count = 0
+    try:
+        retry_after_epoch = max(0, int(deferred.get("retry_after_epoch", 0)))
+    except (TypeError, ValueError):
+        retry_after_epoch = 0
+    probe_label = (
+        "Probe queued"
+        if deferred.get("probe_requested") is True
+        else "Probe not queued"
+    )
+
+    return f'''
+        <div class="package-card deferred-package-card" data-package-id="{package_id_attr}">
+            <div class="package-header deferred-package-header">
+                <input class="deferred-package-select" type="checkbox" value="{package_id_attr}" aria-label="Select {_html(filename)}">
+                <span class="status-emoji">⏳</span>
+                <span class="package-name">{_html(filename)}</span>
+                <span class="deferred-state">{_html(state_label)}</span>
+            </div>
+            <div class="deferred-details">
+                <span><strong>Linkcrypter:</strong> {_html(crypter_label)}</span>
+                <span><strong>Reason:</strong> {_html(reason_label)}</span>
+                <span><strong>Evidence:</strong> {evidence_count}</span>
+                <span><strong>Package ID:</strong> <code>{package_id_attr}</code></span>
+            </div>
+            <div class="deferred-retry">
+                <span>Retry in <strong class="deferred-countdown" data-retry-after-epoch="{retry_after_epoch}">{_format_deferred_countdown(retry_after_epoch)}</strong></span>
+                <span class="deferred-probe-state">{probe_label}</span>
+            </div>
+            <div class="package-actions">
+                <a class="btn-small primary-thin" href="/captcha?package_id={package_url_id}">🔓 Solve CAPTCHA</a>
+                <button class="btn-small info" type="button" onclick="checkDeferredPackage(this)">↻ Check now</button>
+                <span class="spacer"></span>
+                <button class="btn-small danger" type="button" title="Delete package" aria-label="Delete package" onclick="deleteDeferredPackage(this)">🗑️</button>
+            </div>
+        </div>
+    '''
+
+
+def _requested_package_ids():
+    try:
+        payload = request.json
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("package_ids"), list
+    ):
+        return None
+    return payload["package_ids"]
+
+
 def _render_queue_item(item):
-    filename = item.get("filename", "Unknown")
-    percentage = item.get("percentage", 0)
-    timeleft = item.get("timeleft", "??:??:??")
+    filename = str(item.get("filename", "Unknown"))
+    try:
+        percentage = max(0, min(100, int(item.get("percentage", 0))))
+    except (TypeError, ValueError):
+        percentage = 0
+    timeleft = str(item.get("timeleft", "??:??:??"))
     bytes_val = item.get("bytes", 0)
     mb = item.get("mb", 0)
-    cat = item.get("cat", "not_quasarr")
+    cat = str(item.get("cat", "not_quasarr"))
     is_archive = item.get("is_archive", False)
-    nzo_id = item.get("nzo_id", "")
-    storage = item.get("storage", "")
+    nzo_id = str(item.get("nzo_id", ""))
+    storage = str(item.get("storage", ""))
 
     is_captcha = "[CAPTCHA" in filename
     status_text = "Downloading"
@@ -93,17 +216,31 @@ def _render_queue_item(item):
         progress_html = f'<div class="progress-track"><div class="progress-fill" style="width: {percentage}%"></div></div>'
 
     # Interactive info
-    info_onclick = f"showPackageDetails('{nzo_id}', '{_escape_js(display_name)}', '{cat}', '{'Yes' if is_archive else 'No'}', '', '{timeleft}', '{size_str}', '{percentage}', '{status_text}', '{_escape_js(storage)}', {str(is_captcha).lower()})"
+    info_onclick = _javascript_call(
+        "showPackageDetails",
+        nzo_id,
+        display_name,
+        cat,
+        "Yes" if is_archive else "No",
+        "",
+        timeleft,
+        size_str,
+        percentage,
+        status_text,
+        storage,
+        is_captcha,
+    )
     info_btn = f'<button class="btn-small info" onclick="{info_onclick}">ℹ️</button>'
 
     # Action buttons - Info left, CAPTCHA/Delete right
     if is_captcha and nzo_id:
+        captcha_url = f"/captcha?package_id={quote(nzo_id, safe='')}"
         actions = f"""
             <div class="package-actions">
                 {info_btn}
-                <button class="btn-small primary-thin" onclick="location.href='/captcha?package_id={nzo_id}'">🔓 Solve CAPTCHA</button>
+                <button class="btn-small primary-thin" onclick="{_javascript_call("location.assign", captcha_url)}">🔓 Solve CAPTCHA</button>
                 <span class="spacer"></span>
-                <button class="btn-small danger" onclick="confirmDelete('{nzo_id}', '{_escape_js(display_name)}')">🗑️</button>
+                <button class="btn-small danger" onclick="{_javascript_call("confirmDelete", nzo_id, display_name)}">🗑️</button>
             </div>
         """
     elif nzo_id:
@@ -111,7 +248,7 @@ def _render_queue_item(item):
             <div class="package-actions">
                 {info_btn}
                 <span class="spacer"></span>
-                <button class="btn-small danger" onclick="confirmDelete('{nzo_id}', '{_escape_js(display_name)}')">🗑️</button>
+                <button class="btn-small danger" onclick="{_javascript_call("confirmDelete", nzo_id, display_name)}">🗑️</button>
             </div>
         """
     else:
@@ -122,9 +259,9 @@ def _render_queue_item(item):
             </div>
         """
 
-    cat_html = f'<span title="Category: {cat}">{cat_emoji}</span>'
+    cat_html = f'<span title="Category: {_html(cat)}">{cat_emoji}</span>'
     archive_html = (
-        f'<span title="Archive: {is_archive}">{archive_badge}</span>'
+        f'<span title="Archive: {_html(is_archive)}">{archive_badge}</span>'
         if is_archive
         else ""
     )
@@ -133,15 +270,15 @@ def _render_queue_item(item):
         <div class="package-card">
             <div class="package-header">
                 <span class="status-emoji">{status_emoji}</span>
-                <span class="package-name">{display_name}</span>
+                <span class="package-name">{_html(display_name)}</span>
             </div>
             <div class="package-progress">
                 {progress_html}
                 <span class="progress-percent">{percentage}%</span>
             </div>
             <div class="package-details">
-                <span>⏱️ {timeleft}</span>
-                <span>💾 {size_str}</span>
+                <span>⏱️ {_html(timeleft)}</span>
+                <span>💾 {_html(size_str)}</span>
                 {cat_html}
                 {archive_html}
             </div>
@@ -151,15 +288,15 @@ def _render_queue_item(item):
 
 
 def _render_history_item(item):
-    name = item.get("name", "Unknown")
-    status = item.get("status", "Unknown")
+    name = str(item.get("name", "Unknown"))
+    status = str(item.get("status", "Unknown"))
     bytes_val = item.get("bytes", 0)
-    category = item.get("category", "not_quasarr")
+    category = str(item.get("category", "not_quasarr"))
     is_archive = item.get("is_archive", False)
-    extraction_status = item.get("extraction_status", "")
-    fail_message = item.get("fail_message", "")
-    nzo_id = item.get("nzo_id", "")
-    storage = item.get("storage", "")
+    extraction_status = str(item.get("extraction_status", ""))
+    fail_message = str(item.get("fail_message", ""))
+    nzo_id = str(item.get("nzo_id", ""))
+    storage = str(item.get("storage", ""))
 
     is_error = status.lower() in ["failed", "error"] or fail_message
     card_class = "package-card error" if is_error else "package-card"
@@ -178,11 +315,26 @@ def _render_history_item(item):
 
     status_emoji = "❌" if is_error else "✅"
     error_html = (
-        f'<div class="package-error">⚠️ {fail_message}</div>' if fail_message else ""
+        f'<div class="package-error">⚠️ {_html(fail_message)}</div>'
+        if fail_message
+        else ""
     )
 
     # Interactive info
-    info_onclick = f"showPackageDetails('{nzo_id}', '{_escape_js(name)}', '{category}', '{'Yes' if is_archive else 'No'}', '{extraction_status}', '', '{size_str}', '', '{status}', '{_escape_js(storage)}', false)"
+    info_onclick = _javascript_call(
+        "showPackageDetails",
+        nzo_id,
+        name,
+        category,
+        "Yes" if is_archive else "No",
+        extraction_status,
+        "",
+        size_str,
+        "",
+        status,
+        storage,
+        False,
+    )
     info_btn = f'<button class="btn-small info" onclick="{info_onclick}">ℹ️</button>'
 
     # Delete button for history items
@@ -191,7 +343,7 @@ def _render_history_item(item):
             <div class="package-actions">
                 {info_btn}
                 <span class="spacer"></span>
-                <button class="btn-small danger" onclick="confirmDelete('{nzo_id}', '{_escape_js(name)}')">🗑️</button>
+                <button class="btn-small danger" onclick="{_javascript_call("confirmDelete", nzo_id, name)}">🗑️</button>
             </div>
         """
     else:
@@ -202,9 +354,9 @@ def _render_history_item(item):
             </div>
         """
 
-    cat_html = f'<span title="Category: {category}">{cat_emoji}</span>'
+    cat_html = f'<span title="Category: {_html(category)}">{cat_emoji}</span>'
     archive_html = (
-        f'<span title="Archive Status: {extraction_status}">{archive_emoji}</span>'
+        f'<span title="Archive Status: {_html(extraction_status)}">{archive_emoji}</span>'
         if is_archive
         else ""
     )
@@ -213,10 +365,10 @@ def _render_history_item(item):
         <div class="{card_class}">
             <div class="package-header">
                 <span class="status-emoji">{status_emoji}</span>
-                <span class="package-name">{name}</span>
+                <span class="package-name">{_html(name)}</span>
             </div>
             <div class="package-details">
-                <span>💾 {size_str}</span>
+                <span>💾 {_html(size_str)}</span>
                 {cat_html}
                 {archive_html}
             </div>
@@ -233,15 +385,40 @@ def _render_packages_content():
     history = downloads.get("history", [])
 
     # Separate Quasarr packages from others
-    quasarr_queue = [p for p in queue if p.get("cat") != "not_quasarr"]
+    deferred_queue = []
+    quasarr_queue = []
+    for package in queue:
+        if package.get("cat") == "not_quasarr":
+            continue
+        deferred = package.get("deferred")
+        if isinstance(deferred, dict) and deferred.get("active") is True:
+            deferred_queue.append(package)
+        else:
+            quasarr_queue.append(package)
     other_queue = [p for p in queue if p.get("cat") == "not_quasarr"]
     quasarr_history = [p for p in history if p.get("category") != "not_quasarr"]
     other_history = [p for p in history if p.get("category") == "not_quasarr"]
 
     # Check if there's anything at all
-    has_quasarr_content = quasarr_queue or quasarr_history
+    has_quasarr_content = deferred_queue or quasarr_queue or quasarr_history
     has_other_content = other_queue or other_history
     has_any_content = has_quasarr_content or has_other_content
+
+    deferred_html = ""
+    if deferred_queue:
+        deferred_items = "".join(
+            _render_deferred_queue_item(item) for item in deferred_queue
+        )
+        deferred_html = f"""
+            <div class="section deferred-section">
+                <h3>⏳ Deferred linkcrypter checks</h3>
+                <div class="deferred-toolbar">
+                    <button class="btn-small info" type="button" onclick="checkSelectedDeferred(this)">↻ Check selected</button>
+                    <button class="btn-small danger" type="button" onclick="deleteSelectedDeferred(this)">🗑️ Delete selected packages</button>
+                </div>
+                <div class="packages-list">{deferred_items}</div>
+            </div>
+        """
 
     # Build queue section (only if has items)
     queue_html = ""
@@ -304,6 +481,7 @@ def _render_packages_content():
 
     return f"""
         <div class="packages-container">
+            {deferred_html}
             {queue_html}
             {history_html}
             {other_html}
@@ -347,6 +525,32 @@ def setup_packages_routes(app):
 
         return _render_packages_content()
 
+    @app.post("/api/packages/deferred/probe")
+    @require_api_key
+    def deferred_packages_probe_api():
+        package_ids = _requested_package_ids()
+        if package_ids is None:
+            return {
+                "success": False,
+                "message": "package_ids must be a list",
+            }
+        return CrypterCooldownService(shared_state).request_probe(package_ids)
+
+    @app.delete("/api/packages/deferred")
+    @require_api_key
+    def deferred_packages_delete_api():
+        package_ids = _requested_package_ids()
+        if package_ids is None:
+            return {
+                "success": False,
+                "message": "package_ids must be a list",
+            }
+        return delete_database_packages(
+            shared_state,
+            package_ids,
+            expected_type="protected",
+        )
+
     @app.get("/api/packages/status")
     @require_api_key
     def packages_status_api():
@@ -375,8 +579,6 @@ def setup_packages_routes(app):
 
     @app.get("/packages")
     def packages_status():
-        from bottle import request
-
         try:
             device = shared_state.values["device"]
         except KeyError:
@@ -408,6 +610,8 @@ def setup_packages_routes(app):
 
             <div id="slow-warning" class="slow-warning" style="display:none;">⚠️ Slow connection detected</div>
 
+            <div id="deferred-action-status" class="deferred-action-status" aria-live="polite"></div>
+
             <div id="packages-content">
                 {packages_content}
             </div>
@@ -419,6 +623,17 @@ def setup_packages_routes(app):
                 .section {{ margin: 20px 0; }}
                 .section h3 {{ margin-bottom: 15px; padding-bottom: 8px; border-bottom: 1px solid var(--border-color, #ddd); }}
                 .packages-list {{ display: flex; flex-direction: column; gap: 10px; }}
+
+                .deferred-toolbar {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }}
+                .deferred-package-header {{ align-items: center; }}
+                .deferred-package-select {{ width: 18px; height: 18px; margin: 0; flex: 0 0 18px; }}
+                .deferred-state {{ padding: 3px 7px; border: 1px solid var(--btn-info-bg, #17a2b8); border-radius: 4px; color: var(--btn-info-bg, #17a2b8); font-size: 0.75em; font-weight: 600; }}
+                .deferred-details {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 12px; color: var(--text-muted, #666); font-size: 0.82em; text-align: left; }}
+                .deferred-details code {{ overflow-wrap: anywhere; }}
+                .deferred-retry {{ display: flex; justify-content: space-between; gap: 10px; margin-top: 9px; font-size: 0.85em; }}
+                .deferred-probe-state {{ color: var(--text-muted, #666); }}
+                .deferred-action-status {{ min-height: 1.4em; margin-bottom: 8px; color: var(--text-muted, #666); font-size: 0.85em; }}
+                a.btn-small {{ display: inline-flex; align-items: center; text-decoration: none; }}
 
                 .package-card {{
                     background: var(--card-bg, #f8f9fa);
@@ -454,6 +669,11 @@ def setup_packages_routes(app):
                 .btn-small.info:hover {{ background: var(--btn-info-bg, #17a2b8); color: white; }}
                 .btn-small.primary-thin {{ background: transparent; color: var(--btn-primary-bg, #007bff); border: 1px solid var(--btn-primary-bg, #007bff); }}
                 .btn-small.primary-thin:hover {{ background: var(--btn-primary-bg, #007bff); color: white; }}
+
+                @media (max-width: 600px) {{
+                    .deferred-details {{ grid-template-columns: 1fr; }}
+                    .deferred-retry {{ flex-direction: column; }}
+                }}
 
                 .empty-message {{ color: var(--text-muted, #888); font-style: italic; text-align: center; padding: 20px; }}
 
@@ -527,6 +747,101 @@ def setup_packages_routes(app):
                 let isFetching = false;
                 const SCROLL_STORAGE_KEY = 'quasarr_packages_scroll_y';
 
+                function deferredPackageId(button) {{
+                    return button.closest('.deferred-package-card')?.dataset.packageId || '';
+                }}
+
+                function selectedDeferredPackageIds() {{
+                    return Array.from(
+                        document.querySelectorAll('.deferred-package-select:checked'),
+                        checkbox => checkbox.value
+                    );
+                }}
+
+                function showDeferredActionResult(result, successKey) {{
+                    const statusElement = document.getElementById('deferred-action-status');
+                    if (!statusElement) return;
+
+                    const rejected = Array.isArray(result?.rejected) ? result.rejected : [];
+                    if (rejected.length) {{
+                        statusElement.textContent = rejected
+                            .map(item => String(item.package_id) + ': ' + String(item.reason))
+                            .join('; ');
+                    }} else if (result?.success === false) {{
+                        statusElement.textContent = String(result.message || 'Request failed');
+                    }} else {{
+                        const completed = Array.isArray(result?.[successKey])
+                            ? result[successKey].length
+                            : 0;
+                        statusElement.textContent = completed + ' package' + (completed === 1 ? '' : 's') + ' updated';
+                    }}
+                }}
+
+                async function runDeferredAction(button, endpoint, packageIds, method = 'POST', successKey = 'requested') {{
+                    const statusElement = document.getElementById('deferred-action-status');
+                    if (!packageIds.length) {{
+                        if (statusElement) statusElement.textContent = 'Select at least one deferred package';
+                        return;
+                    }}
+
+                    button.disabled = true;
+                    try {{
+                        const response = await quasarrApiFetch(endpoint, {{
+                            method,
+                            headers: {{ 'Content-Type': 'application/json' }},
+                            body: JSON.stringify({{ package_ids: packageIds }})
+                        }});
+                        const result = await response.json();
+                        showDeferredActionResult(result, successKey);
+                        await refreshContent();
+                    }} catch (error) {{
+                        if (statusElement) statusElement.textContent = 'Deferred package request failed';
+                    }} finally {{
+                        button.disabled = false;
+                    }}
+                }}
+
+                function checkDeferredPackage(button) {{
+                    const packageId = deferredPackageId(button);
+                    return runDeferredAction(button, '/api/packages/deferred/probe', [packageId]);
+                }}
+
+                function deleteDeferredPackage(button) {{
+                    const packageId = deferredPackageId(button);
+                    if (!window.confirm('Delete this deferred package?')) return;
+                    return runDeferredAction(button, '/api/packages/deferred', [packageId], 'DELETE', 'deleted');
+                }}
+
+                function checkSelectedDeferred(button) {{
+                    return runDeferredAction(button, '/api/packages/deferred/probe', selectedDeferredPackageIds());
+                }}
+
+                function deleteSelectedDeferred(button) {{
+                    const packageIds = selectedDeferredPackageIds();
+                    if (packageIds.length && !window.confirm('Delete the selected deferred packages?')) return;
+                    return runDeferredAction(button, '/api/packages/deferred', packageIds, 'DELETE', 'deleted');
+                }}
+
+                function formatDeferredCountdown(remaining) {{
+                    const days = Math.floor(remaining / 86400);
+                    const hours = Math.floor((remaining % 86400) / 3600);
+                    const minutes = Math.floor((remaining % 3600) / 60);
+                    const seconds = remaining % 60;
+                    const clock = [hours, minutes, seconds]
+                        .map(value => String(value).padStart(2, '0'))
+                        .join(':');
+                    return days ? days + 'd ' + clock : clock;
+                }}
+
+                function updateDeferredCountdowns() {{
+                    const now = Math.floor(Date.now() / 1000);
+                    document.querySelectorAll('.deferred-countdown').forEach(element => {{
+                        const retryAfter = Number.parseInt(element.dataset.retryAfterEpoch || '0', 10);
+                        const remaining = Number.isFinite(retryAfter) ? Math.max(0, retryAfter - now) : 0;
+                        element.textContent = formatDeferredCountdown(remaining);
+                    }});
+                }}
+
                 function saveScrollPosition() {{
                     sessionStorage.setItem(SCROLL_STORAGE_KEY, String(window.scrollY || 0));
                 }}
@@ -576,6 +891,7 @@ def setup_packages_routes(app):
                             if (container && html) {{
                                 container.innerHTML = html;
                                 restoreCollapseState();
+                                updateDeferredCountdowns();
                                 // Restore scroll position after content update
                                 restoreScrollPosition();
                                 requestAnimationFrame(restoreScrollPosition);
@@ -618,6 +934,8 @@ def setup_packages_routes(app):
 
                 // Initial collapse state setup
                 restoreCollapseState();
+                updateDeferredCountdowns();
+                window.setInterval(updateDeferredCountdowns, 1000);
                 restoreScrollPosition();
                 window.addEventListener('scroll', saveScrollPosition, {{ passive: true }});
 
@@ -647,6 +965,12 @@ def setup_packages_routes(app):
                 // Delete modal
                 let deletePackageId = null;
                 let deletePackageName = null;
+
+                function escapePackageHtml(value) {{
+                    const element = document.createElement('div');
+                    element.textContent = String(value ?? '');
+                    return element.innerHTML;
+                }}
                 
                 function confirmDelete(packageId, packageName) {{
                     // Stop any pending refresh
@@ -655,9 +979,10 @@ def setup_packages_routes(app):
                     
                     deletePackageId = packageId;
                     deletePackageName = packageName;
+                    const safePackageName = escapePackageHtml(packageName);
                     
                     const content = `
-                        <p class="modal-package-name" style="font-weight: 500; word-break: break-word; padding: 10px; background: var(--code-bg, #f5f5f5); border-radius: 6px; margin: 10px 0;">${{packageName}}</p>
+                        <p class="modal-package-name" style="font-weight: 500; word-break: break-word; padding: 10px; background: var(--code-bg, #f5f5f5); border-radius: 6px; margin: 10px 0;">${{safePackageName}}</p>
                         <div class="modal-warning" style="background: var(--error-msg-bg, #ffebee); color: var(--error-msg-color, #c62828); padding: 12px; border-radius: 6px; margin: 15px 0; font-size: 0.9em; text-align: left;">
                             <strong>⛔ Warning:</strong> This will permanently delete the package AND all associated files from disk. This action cannot be undone!
                         </div>
@@ -689,21 +1014,33 @@ def setup_packages_routes(app):
                     
                     let captchaBtn = '';
                     if (isCaptcha) {{
-                        captchaBtn = `<button class="btn-small primary-thin" onclick="location.href='/captcha?package_id=${{id}}'">🔓 Solve CAPTCHA</button>`;
+                        const captchaUrl = '/captcha?package_id=' + encodeURIComponent(String(id || ''));
+                        captchaBtn = `<button class="btn-small primary-thin" type="button" data-captcha-url="${{escapePackageHtml(captchaUrl)}}" onclick="location.href=this.dataset.captchaUrl">🔓 Solve CAPTCHA</button>`;
                     }}
+
+                    const safeId = escapePackageHtml(id);
+                    const safeName = escapePackageHtml(name);
+                    const safeCategory = escapePackageHtml(category);
+                    const safeArchive = escapePackageHtml(isArchive);
+                    const safeExtractionStatus = escapePackageHtml(extractionStatus);
+                    const safeEta = escapePackageHtml(eta);
+                    const safeSize = escapePackageHtml(size);
+                    const safePercentage = escapePackageHtml(percentage);
+                    const safeStatus = escapePackageHtml(status);
+                    const safeStorage = escapePackageHtml(storage);
                     
                     const content = `
                         <div style="text-align: left; padding: 10px;">
-                            <p style="margin-bottom: 8px;"><strong>Name:</strong></p><p style="font-family: monospace; text-align: center; background: var(--code-bg, #eee); padding: 4px; border-radius: 4px; word-break: break-word;">${{name}}</p>
-                            ${{storage ? `<p style="margin-bottom: 4px;"><strong>Storage:</strong></p><p style="margin-bottom: 8px; font-family: monospace; text-align: center; background: var(--code-bg, #eee); padding: 4px; border-radius: 4px; word-break: break-all;">${{storage}}</p>` : ''}}
-                            <p style="margin-bottom: 4px;"><strong>ID:</strong></p><p style="margin-bottom: 8px; font-family: monospace; text-align: center; background: var(--code-bg, #eee); padding: 4px; border-radius: 4px;">${{id}}</p>
-                            <p style="margin-bottom: 8px;"><strong>Status:</strong> ${{status}}</p>
-                            ${{percentage ? `<p style="margin-bottom: 8px;"><strong>Percentage:</strong> ${{percentage}}%</p>` : ''}}
-                            ${{size ? `<p style="margin-bottom: 8px;"><strong>Size:</strong> ${{size}}</p>` : ''}}
-                            ${{eta ? `<p style="margin-bottom: 8px;"><strong>ETA:</strong> ${{eta}}</p>` : ''}}
-                            <p style="margin-bottom: 8px;"><strong>Category:</strong> ${{category}}</p>
-                            <p style="margin-bottom: 8px;"><strong>Archive:</strong> ${{isArchive}}</p>
-                            ${{extractionStatus ? `<p style="margin-bottom: 8px;"><strong>Extraction Status:</strong> ${{extractionStatus}}</p>` : ''}}
+                            <p style="margin-bottom: 8px;"><strong>Name:</strong></p><p style="font-family: monospace; text-align: center; background: var(--code-bg, #eee); padding: 4px; border-radius: 4px; word-break: break-word;">${{safeName}}</p>
+                            ${{storage ? `<p style="margin-bottom: 4px;"><strong>Storage:</strong></p><p style="margin-bottom: 8px; font-family: monospace; text-align: center; background: var(--code-bg, #eee); padding: 4px; border-radius: 4px; word-break: break-all;">${{safeStorage}}</p>` : ''}}
+                            <p style="margin-bottom: 4px;"><strong>ID:</strong></p><p style="margin-bottom: 8px; font-family: monospace; text-align: center; background: var(--code-bg, #eee); padding: 4px; border-radius: 4px; overflow-wrap: anywhere;">${{safeId}}</p>
+                            <p style="margin-bottom: 8px;"><strong>Status:</strong> ${{safeStatus}}</p>
+                            ${{percentage ? `<p style="margin-bottom: 8px;"><strong>Percentage:</strong> ${{safePercentage}}%</p>` : ''}}
+                            ${{size ? `<p style="margin-bottom: 8px;"><strong>Size:</strong> ${{safeSize}}</p>` : ''}}
+                            ${{eta ? `<p style="margin-bottom: 8px;"><strong>ETA:</strong> ${{safeEta}}</p>` : ''}}
+                            <p style="margin-bottom: 8px;"><strong>Category:</strong> ${{safeCategory}}</p>
+                            <p style="margin-bottom: 8px;"><strong>Archive:</strong> ${{safeArchive}}</p>
+                            ${{extractionStatus ? `<p style="margin-bottom: 8px;"><strong>Extraction Status:</strong> ${{safeExtractionStatus}}</p>` : ''}}
                         </div>
                     `;
                     
