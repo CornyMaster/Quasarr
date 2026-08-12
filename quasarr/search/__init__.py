@@ -25,6 +25,7 @@ from quasarr.providers.log import (
     trace,
     warn,
 )
+from quasarr.search.runtime import search_runtime
 from quasarr.search.sources import get_sources
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 from quasarr.storage.categories import get_search_category_sources
@@ -376,6 +377,7 @@ class SearchExecutor:
     def run_all(self):
         results = []
         future_to_meta = {}
+        runtime = search_runtime
 
         # Track cache state
         all_cached = len(self.searches) > 0
@@ -418,6 +420,7 @@ class SearchExecutor:
                         # Nothing left to spend. Starting the work anyway would
                         # only detach a worker whose result this response can no
                         # longer use, and hit the source a second time for it.
+                        runtime.record_source_outcome("skipped")
                         skipped_badges.append(
                             f"<bg yellow><black>{source_name.upper()}</black></bg yellow>"
                         )
@@ -426,7 +429,11 @@ class SearchExecutor:
                         )
                         continue
 
-                    future = executor.submit(func)
+                    def run_source(source_func=func, task_runtime=runtime):
+                        with task_runtime.source_task():
+                            return source_func()
+
+                    future = executor.submit(run_source)
                     cache_meta = (key, ttl) if use_cache else None
                     future_to_meta[future] = (current_index, cache_meta, source_name)
                     pending_futures.append(future)
@@ -454,7 +461,9 @@ class SearchExecutor:
                         if cache_meta:
                             cache_key, cache_ttl = cache_meta
                             search_cache.set(cache_key, res, ttl=cache_ttl)
+                        runtime.record_source_outcome("completed")
                     except Exception as e:
+                        runtime.record_source_outcome("errored")
                         results_badges[index] = (
                             f"<bg red><white>{source_name.upper()}</white></bg red>"
                         )
@@ -484,6 +493,15 @@ class SearchExecutor:
                             f"Dropped from this response after "
                             f"{SEARCH_FANOUT_DEADLINE_SECONDS}s"
                         )
+                        runtime.record_source_outcome("dropped")
+                        overdue_token = runtime.mark_source_overdue()
+
+                        def resolve_overdue(
+                            _future, token=overdue_token, token_owner=runtime
+                        ):
+                            token_owner.resolve_source_overdue(token)
+
+                        future.add_done_callback(resolve_overdue)
 
             if results_badges or skipped_badges:
                 bar_str = f" [{' '.join(results_badges + skipped_badges)}]"

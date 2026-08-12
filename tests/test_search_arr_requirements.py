@@ -1,10 +1,21 @@
 import unittest
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
+from wsgiref.util import setup_testing_defaults
 
-from quasarr.constants import SEARCH_CAT_BOOKS, SEARCH_CAT_MOVIES, SEARCH_CAT_SHOWS
+from bottle import Bottle
+
+from quasarr.api.arr import setup_arr_routes
+from quasarr.constants import (
+    SEARCH_CAT_BOOKS,
+    SEARCH_CAT_MOVIES,
+    SEARCH_CAT_MOVIES_UHD,
+    SEARCH_CAT_SHOWS,
+)
 from quasarr.providers.utils import is_site_usable
-from quasarr.search import get_search_results
+from quasarr.search import SearchCache, get_search_results
+from quasarr.search.runtime import SearchRuntime
 from quasarr.storage.setup.arr import (
     _arr_client_selection_form_html,
     missing_arr_client_requirement,
@@ -84,6 +95,113 @@ class SearchArrRequirementTests(unittest.TestCase):
             )
 
         metadata_lookup.assert_called_once_with(state, "tt0000011", SEARCH_CAT_MOVIES)
+
+    def test_multi_category_request_tracks_one_cache_family_without_extra_fanout(self):
+        class State:
+            pass
+
+        class MovieSource:
+            initials = "aa"
+            supported_categories = [SEARCH_CAT_MOVIES]
+            supports_imdb = True
+            calls = 0
+
+            def search(self, *_args, **_kwargs):
+                self.calls += 1
+                return [
+                    {
+                        "details": {
+                            "title": "Synthetic.Movie.1080p",
+                            "date": "Thu, 01 Jan 2026 00:00:00 +0000",
+                            "link": "https://downloads.invalid/movie-hd",
+                            "source": "Synthetic source",
+                            "hostname": "AA",
+                            "size": 1,
+                        }
+                    },
+                    {
+                        "details": {
+                            "title": "Synthetic.Movie.2160p",
+                            "date": "Thu, 01 Jan 2026 00:00:00 +0000",
+                            "link": "https://downloads.invalid/movie-uhd",
+                            "source": "Synthetic source",
+                            "hostname": "AA",
+                            "size": 1,
+                        }
+                    },
+                ]
+
+        app = Bottle()
+        setup_arr_routes(app)
+        source = MovieSource()
+        runtime = SearchRuntime(memory_reader=lambda: {})
+        state = State()
+        state.values = {
+            "radarr_client": object(),
+            "config": lambda section: (
+                {"aa": "source.invalid"} if section == "Hostnames" else {}
+            ),
+        }
+        calls = []
+
+        def run_search(*args, **kwargs):
+            results = get_search_results(*args, **kwargs)
+            calls.append(
+                (
+                    args[2],
+                    [release["details"]["title"] for release in results],
+                )
+            )
+            return results
+
+        with (
+            patch("quasarr.api.arr.shared_state", state),
+            patch("quasarr.api.arr.get_search_results", side_effect=run_search),
+            patch("quasarr.api.arr.search_runtime", runtime, create=True),
+            patch("quasarr.api.arr.info") as log_info,
+            patch("quasarr.search.get_sources", return_value={"aa": source}),
+            patch("quasarr.search.get_search_category_sources", return_value=[]),
+            patch("quasarr.search.get_imdb_metadata"),
+            patch("quasarr.search.search_cache", SearchCache()),
+            patch("quasarr.search.search_runtime", runtime, create=True),
+        ):
+            status, body = self._call_app(
+                app,
+                "t=movie&cat=2045,2000&imdbid=tt0000012",
+                user_agent="Radarr/5.0",
+            )
+
+        self.assertEqual("200 OK", status)
+        self.assertEqual(
+            [SEARCH_CAT_MOVIES, SEARCH_CAT_MOVIES_UHD],
+            [category_id for category_id, _ in calls],
+        )
+        self.assertEqual(
+            ["Synthetic.Movie.1080p", "Synthetic.Movie.2160p"], calls[0][1]
+        )
+        self.assertEqual(["Synthetic.Movie.2160p"], calls[1][1])
+        self.assertEqual(1, source.calls)
+        self.assertIn("Synthetic.Movie.1080p", body)
+        self.assertIn("Synthetic.Movie.2160p", body)
+
+        snapshot = runtime.snapshot()
+        self.assertEqual(0, snapshot["active_requests"])
+        self.assertEqual(1, snapshot["requests_started"])
+        self.assertEqual(1, snapshot["requests_completed"])
+        self.assertEqual(2, snapshot["categories_planned"])
+        self.assertEqual(1, snapshot["families_planned"])
+
+        summary_calls = [
+            call
+            for call in log_info.call_args_list
+            if call.args and call.args[0].startswith("Search runtime summary: ")
+        ]
+        self.assertEqual(1, len(summary_calls))
+        summary = summary_calls[0].args[0]
+        self.assertNotIn("tt0000012", summary)
+        self.assertNotIn("2000", summary)
+        self.assertNotIn("2045", summary)
+        self.assertNotIn("AA", summary)
 
     def test_setup_forms_do_not_offer_arr_skip_loopholes(self):
         with (
@@ -206,6 +324,28 @@ class SearchArrRequirementTests(unittest.TestCase):
         ):
             self.assertEqual(set(), radarr_required_sites(state))
             self.assertEqual(set(), sonarr_required_sites(state))
+
+    @staticmethod
+    def _call_app(app, query_string, user_agent=""):
+        environ = {}
+        setup_testing_defaults(environ)
+        environ.update(
+            {
+                "REQUEST_METHOD": "GET",
+                "PATH_INFO": "/api",
+                "QUERY_STRING": query_string,
+                "HTTP_USER_AGENT": user_agent,
+                "wsgi.input": BytesIO(b""),
+            }
+        )
+        captured = {}
+
+        def start_response(status, headers, exc_info=None):
+            captured["status"] = status
+            captured["headers"] = headers
+
+        body = b"".join(app(environ, start_response)).decode("utf-8")
+        return captured["status"], body
 
 
 if __name__ == "__main__":

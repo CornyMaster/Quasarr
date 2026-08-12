@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from quasarr.constants import SEARCH_CAT_MOVIES
-from quasarr.search import SearchExecutor, get_search_results
+from quasarr.search import SearchCache, SearchExecutor, get_search_results
+from quasarr.search.runtime import SearchRuntime
 
 
 class FakeSource:
@@ -23,6 +24,19 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
         # response: *arr clients disable an indexer that answers too late.
         release = Event()
         self.addCleanup(release.set)
+        overdue_resolved = Event()
+        runtime = SearchRuntime(memory_reader=lambda: {})
+        cache = SearchCache()
+        resolved_tokens = []
+        resolve_source_overdue = runtime.resolve_source_overdue
+
+        def resolve_overdue(token):
+            resolved_tokens.append(token)
+            resolved = resolve_source_overdue(token)
+            overdue_resolved.set()
+            return resolved
+
+        runtime.resolve_source_overdue = resolve_overdue
 
         def fast():
             return [{"details": {"title": "Fast.Release"}}]
@@ -33,16 +47,34 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
 
         executor = SearchExecutor(deadline=time.time() + 0.5)
         executor.add(FakeSource("fa", fast), (None, 0.0, 2000), {})
-        executor.add(FakeSource("sl", slow), (None, 0.0, 2000), {})
+        executor.add(
+            FakeSource("sl", slow), (None, 0.0, 2000), {}, use_cache=True
+        )
 
-        started = time.time()
-        results, bar, _, _ = executor.run_all()
-        elapsed = time.time() - started
+        with (
+            patch("quasarr.search.search_runtime", runtime, create=True),
+            patch("quasarr.search.search_cache", cache),
+        ):
+            started = time.time()
+            results, bar, _, _ = executor.run_all()
+            elapsed = time.time() - started
+
+            self.assertEqual(1, runtime.snapshot()["overdue_source_tasks"])
+
+        release.set()
+        self.assertTrue(overdue_resolved.wait(10))
 
         self.assertLess(elapsed, 10)
         self.assertEqual(["Fast.Release"], [r["details"]["title"] for r in results])
         self.assertIn("FA", bar)
         self.assertIn("SL", bar)
+        snapshot = runtime.snapshot()
+        self.assertEqual(0, snapshot["active_source_tasks"])
+        self.assertEqual(0, snapshot["overdue_source_tasks"])
+        self.assertEqual(1, snapshot["source_completed"])
+        self.assertEqual(1, snapshot["source_dropped"])
+        self.assertEqual(1, len(resolved_tokens))
+        self.assertEqual({}, cache.cache)
 
     def test_every_source_within_the_deadline_is_collected(self):
         def make(title):
@@ -93,12 +125,35 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
 
         executor = SearchExecutor(deadline=time.time() - 1)
         executor.add(FakeSource("sl", never_wanted), (None, 0.0, 2000), {})
+        runtime = SearchRuntime(memory_reader=lambda: {})
 
-        results, bar, _, _ = executor.run_all()
+        with patch("quasarr.search.search_runtime", runtime, create=True):
+            results, bar, _, _ = executor.run_all()
 
         self.assertEqual([], started)
         self.assertEqual([], results)
         self.assertIn("SL", bar)
+        snapshot = runtime.snapshot()
+        self.assertEqual(0, snapshot["source_started"])
+        self.assertEqual(1, snapshot["source_skipped"])
+
+    def test_source_error_is_recorded_after_its_task_scope_closes(self):
+        def fail():
+            raise RuntimeError("synthetic source failure")
+
+        executor = SearchExecutor()
+        executor.add(FakeSource("er", fail), (None, 0.0, 2000), {})
+        runtime = SearchRuntime(memory_reader=lambda: {})
+
+        with patch("quasarr.search.search_runtime", runtime, create=True):
+            results, bar, _, _ = executor.run_all()
+
+        self.assertEqual([], results)
+        self.assertIn("ER", bar)
+        snapshot = runtime.snapshot()
+        self.assertEqual(0, snapshot["active_source_tasks"])
+        self.assertEqual(1, snapshot["source_started"])
+        self.assertEqual(1, snapshot["source_errored"])
 
     def test_every_source_gets_a_worker_regardless_of_cpu_count(self):
         # The default pool is sized from the CPU count, so on a small host the
