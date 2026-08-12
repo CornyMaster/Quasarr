@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
+from typing import cast
 
 from quasarr.providers.log import debug
 from quasarr.search.runtime import read_process_memory
@@ -35,14 +36,14 @@ class _NativeHeapTrimmer:
                 self._malloc_trim = None
             return False
 
-    def _get_malloc_trim(self):
+    def _get_malloc_trim(self) -> Callable[[int], int] | None:
         with self._lock:
             if self._malloc_trim is not _UNPROBED:
-                return self._malloc_trim
+                return cast(Callable[[int], int] | None, self._malloc_trim)
             self._malloc_trim = self._probe()
             return self._malloc_trim
 
-    def _probe(self):
+    def _probe(self) -> Callable[[int], int] | None:
         if not self._platform.startswith("linux"):
             return None
         try:
@@ -57,7 +58,7 @@ class _NativeHeapTrimmer:
             malloc_trim.restype = ctypes.c_int
         except (AttributeError, TypeError):
             return None
-        return malloc_trim
+        return cast(Callable[[int], int], malloc_trim)
 
 
 _native_heap_trimmer = _NativeHeapTrimmer(
