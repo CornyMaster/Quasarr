@@ -12,6 +12,7 @@ from bottle import Bottle, HTTPError
 
 from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
 from quasarr.providers import shared_state as provider_shared_state
+from quasarr.providers.crypter_candidates import enumerate_filecrypt_candidates
 from quasarr.providers.crypter_cooldowns import (
     CrypterCooldownService,
     decode_pending_crypter_events,
@@ -1190,6 +1191,174 @@ class LargeTransitionCountTests(CrypterStatisticsTestCase):
 
         self.assertEqual(row, self.ledger())
         self.assertIsNone(self.state.get_db("crypter_cooldowns").retrieve(CRYPTER))
+
+
+class CohortSweepCounterTests(CrypterStatisticsTestCase):
+    """The version-two writer's accounting, against the real service and SQLite."""
+
+    def setUp(self):
+        super().setUp()
+        self.minted = 0
+        patcher = mock.patch.object(
+            CrypterCooldownService, "_new_identifier", lambda _self: self.mint()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def mint(self):
+        self.minted += 1
+        return f"{self.minted:032d}"
+
+    def cohort_package(self, index):
+        return f"Quasarr_movies_{index:032d}"
+
+    def store_cohort(self, size):
+        for index in range(1, size + 1):
+            self.store_protected(
+                self.cohort_package(index), links=[filecrypt_link(index)]
+            )
+
+    def inventory(self):
+        return enumerate_filecrypt_candidates(
+            self.state.get_db("protected").retrieve_all_titles()
+        )
+
+    def lease(self, mode=None):
+        return self.service.prepare_offer(CRYPTER, self.inventory(), mode=mode)
+
+    def report_blocked(self, offer, package_id):
+        return self.service.record_cohort_blocked(
+            CRYPTER,
+            package_id,
+            offer["link_fingerprint"],
+            offer["sweep_id"],
+            offer["offer_id"],
+            REASON,
+            self.inventory(),
+        )
+
+    def report_access(self, offer, package_id, access):
+        return self.service.record_cohort_access(
+            CRYPTER,
+            package_id,
+            offer["link_fingerprint"],
+            offer["sweep_id"],
+            offer["offer_id"],
+            access,
+            self.inventory(),
+        )
+
+    def package_for(self, offer):
+        return next(
+            candidate.occurrences[0].package_id
+            for candidate in self.inventory().candidates
+            if candidate.fingerprint == offer["link_fingerprint"]
+        )
+
+    def drive_cohort(self, size=5):
+        self.store_cohort(size)
+        decision = None
+        for _ in range(size):
+            offer = self.lease()
+            decision = self.report_blocked(offer, self.package_for(offer))
+        return decision
+
+    def test_each_newly_blocked_member_counts_one_observation_and_one_cooldown(self):
+        decision = self.drive_cohort()
+
+        self.assertEqual("cooldown", decision["instruction"])
+        counters = self.counters()
+        self.assertEqual(5, counters[OBSERVATIONS_KEY])
+        self.assertEqual(1, counters[COOLDOWNS_KEY])
+        self.assertEqual(0, counters[PROBES_KEY])
+
+    def test_a_small_cohort_counts_its_members_but_never_a_cooldown(self):
+        decision = self.drive_cohort(4)
+
+        self.assertEqual("legacy_failure", decision["instruction"])
+        counters = self.counters()
+        self.assertEqual(4, counters[OBSERVATIONS_KEY])
+        self.assertEqual(0, counters[COOLDOWNS_KEY])
+
+    def test_a_duplicate_member_report_counts_nothing(self):
+        self.store_cohort(5)
+        offer = self.lease()
+        self.report_blocked(offer, self.package_for(offer))
+        self.assertEqual(1, self.pending_events()["observations"])
+
+        self.report_blocked(offer, self.package_for(offer))
+
+        self.assertEqual(1, self.pending_events()["observations"])
+        self.assertEqual(1, self.counters()[OBSERVATIONS_KEY])
+
+    def test_a_stale_report_counts_nothing(self):
+        self.store_cohort(5)
+        offer = self.lease()
+
+        self.service.record_cohort_blocked(
+            CRYPTER,
+            self.package_for(offer),
+            offer["link_fingerprint"],
+            "f" * 32,
+            offer["offer_id"],
+            REASON,
+            self.inventory(),
+        )
+
+        self.assertIsNone(self.ledger())
+        self.assertEqual(0, self.counters()[OBSERVATIONS_KEY])
+
+    def test_unknown_and_clear_never_touch_the_transition_counters(self):
+        self.store_cohort(5)
+        unknown_offer = self.lease()
+        self.report_access(unknown_offer, self.package_for(unknown_offer), "unknown")
+        clear_offer = self.lease()
+
+        self.report_access(clear_offer, self.package_for(clear_offer), "clear")
+
+        counters = self.counters()
+        self.assertEqual(0, counters[OBSERVATIONS_KEY])
+        self.assertEqual(0, counters[COOLDOWNS_KEY])
+        self.assertEqual(0, counters[PROBES_KEY])
+
+    def test_a_cohort_probe_offer_is_not_a_consumed_package_probe(self):
+        self.drive_cohort()
+        before = self.counters()[PROBES_KEY]
+
+        probe = self.lease(mode="probe")
+
+        self.assertEqual("probe", probe["mode"])
+        self.assertEqual(before, self.counters()[PROBES_KEY])
+
+    def test_the_deferred_gauge_follows_cohort_holds_and_drops_on_clear(self):
+        self.drive_cohort()
+        self.assertEqual(5, self.counters()[DEFERRED_KEY])
+
+        probe = self.lease(mode="probe")
+        self.report_access(probe, self.package_for(probe), "clear")
+
+        self.assertEqual(0, self.counters()[DEFERRED_KEY])
+
+    def test_a_ledger_ceiling_rolls_back_the_whole_cohort_transition(self):
+        self.store_cohort(5)
+        offer = self.lease()
+        row = json.dumps(
+            {"observations": LEDGER_COUNT_CEILING, "cooldowns": 0, "probes": 0}
+        )
+        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, row)
+        before = self.state.get_db("crypter_cooldowns").retrieve(CRYPTER)
+
+        with self.assertRaises(OverflowError):
+            self.report_blocked(offer, self.package_for(offer))
+
+        self.assertEqual(row, self.ledger())
+        self.assertEqual(
+            before, self.state.get_db("crypter_cooldowns").retrieve(CRYPTER)
+        )
+        self.assertNotIn(
+            "deferred",
+            json.loads(self.state.get_db("protected").retrieve(self.cohort_package(1))),
+        )
 
 
 if __name__ == "__main__":

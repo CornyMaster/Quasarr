@@ -1163,17 +1163,20 @@ class ServiceSnapshotTests(unittest.TestCase):
         broken_member = sweeping_record(
             members=[{k: v for k, v in member(1).items() if k != "result"}, member(2)]
         )
-        rows = (
+        unreadable = (
             deeply_nested,
             '{"schema_version": ' + "9" * 5000 + "}",
             json.dumps(sweeping_record(schema_version=3)),
             json.dumps(broken_member),
-            encode_decision_record(cohort_cooldown_record()),
         )
+        # A structurally valid record whose own window merely ended is a clean
+        # expiry, not a discarded row, so it self-heals without the warning the
+        # legacy reader emits for genuinely unreadable state.
+        expired = encode_decision_record(cohort_cooldown_record())
 
-        for stored in rows:
-            with self.subTest(row=repr(stored)[:40]):
-                service = self.service(stored, now=COOLDOWN_RETRY)
+        for row, expected_warnings in [(row, 1) for row in unreadable] + [(expired, 0)]:
+            with self.subTest(row=repr(row)[:40]):
+                service = self.service(row, now=COOLDOWN_RETRY)
                 with mock.patch.object(cooldown_module, "warn") as warn:
                     self.assertEqual(
                         self.legacy_snapshot(), service.snapshot("filecrypt")
@@ -1181,7 +1184,7 @@ class ServiceSnapshotTests(unittest.TestCase):
 
                 self.assertEqual(1, self.database.mutation_count)
                 self.assertNotIn("filecrypt", self.database.rows)
-                self.assertEqual(1, warn.call_count)
+                self.assertEqual(expected_warnings, warn.call_count)
 
 
 if __name__ == "__main__":

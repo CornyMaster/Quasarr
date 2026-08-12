@@ -4,14 +4,25 @@
 
 import json
 import re
+import secrets
 import time
 from collections import namedtuple
 
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.providers.crypter_sweeps import (
     SWEEP_SCHEMA_VERSION,
+    Offer,
+    bypass_decision,
     decision_snapshot,
     decode_decision_record,
+    encode_decision_record,
+    is_decision_record,
+    lease_next_offer,
+    migrate_legacy_record,
+    prepare_decision,
+    record_access,
+    record_blocked,
+    record_legacy_report,
 )
 from quasarr.providers.log import warn
 
@@ -98,10 +109,14 @@ def validate_link_fingerprint(value):
     return value
 
 
-def _validate_sweep_id(value):
+def _validate_identifier(value, field_name):
     if not isinstance(value, str) or not _SWEEP_ID_PATTERN.fullmatch(value):
-        raise ValueError("Sweep ID must be 32 lowercase hexadecimal characters")
+        raise ValueError(f"{field_name} must be 32 lowercase hexadecimal characters")
     return value
+
+
+def _validate_sweep_id(value):
+    return _validate_identifier(value, "Sweep ID")
 
 
 def _validate_package_id(value):
@@ -450,6 +465,65 @@ def _add_pending_crypter_events(current_value, **deltas):
     return encode_pending_crypter_events(counts)
 
 
+def _write_generation_hold(
+    current_value,
+    now,
+    *,
+    crypter,
+    reason_code,
+    sweep_id,
+    link_fingerprint,
+    retry_after_epoch,
+    observation_holds,
+):
+    """Bind one protected row to the generation that is holding it.
+
+    A generation-bound hold is not the legacy provisional budget: each sweep is
+    its own bounded window and dies with its generation, so a new generation
+    always writes its own hold instead of being refused by an older marker.
+    """
+    package = _decode_package(current_value)
+    if package is None:
+        return current_value
+    try:
+        existing = decode_package_defer(package)
+    except ValueError:
+        existing = None
+    if existing is not None and existing["crypter"] != crypter:
+        existing = None
+    package[PACKAGE_DEFER_KEY] = {
+        "crypter": crypter,
+        "reason_code": reason_code,
+        "since_epoch": existing["since_epoch"] if existing else now,
+        "retry_after_epoch": retry_after_epoch,
+        "probe_requested": existing["probe_requested"] if existing else False,
+        "observation_holds": observation_holds,
+        "schema_version": SWEEP_SCHEMA_VERSION,
+        "sweep_id": sweep_id,
+        "link_fingerprint": link_fingerprint,
+    }
+    return json.dumps(package)
+
+
+def _clear_generation_hold(current_value, _now, *, crypter, sweep_id):
+    """Drop a hold only while it still belongs to this exact generation."""
+    package = _decode_package(current_value)
+    if package is None or PACKAGE_DEFER_KEY not in package:
+        return current_value
+    try:
+        deferred = decode_package_defer(package)
+    except ValueError:
+        return current_value
+    if (
+        deferred is None
+        or deferred["crypter"] != crypter
+        or deferred.get("sweep_id") != sweep_id
+    ):
+        return current_value
+    package.pop(PACKAGE_DEFER_KEY)
+    return json.dumps(package)
+
+
 class CrypterCooldownService:
     def __init__(self, shared_state, clock=time.time):
         self._shared_state = shared_state
@@ -472,6 +546,228 @@ class CrypterCooldownService:
     @staticmethod
     def _warn_invalid_package_defer(package_id):
         warn(f'Ignoring invalid persisted defer metadata for package "{package_id}"')
+
+    def _new_identifier(self):
+        """A fresh sweep, generation, or offer ID; injected in hermetic tests."""
+        return secrets.token_hex(16)
+
+    def _current_decision(self, current_value, now):
+        """The version-two decision one transition starts from.
+
+        A live version-one cooldown is migrated rather than overwritten, so it
+        keeps its exact retry deadline instead of being replaced by a sweep. A
+        version-one `observing` row is not a cohort and migrates to nothing.
+        """
+        decision = decode_decision_record(current_value, now=now)
+        if decision is not None:
+            return decision
+        return migrate_legacy_record(current_value, now=now)
+
+    def _fingerprint_targets(self, package_id, link_fingerprint, inventory):
+        """Every live protected row carrying this exact link.
+
+        Resolved before the transaction opens, so no mutation callback ever
+        enumerates storage. An inventory that cannot prove the occurrence set
+        falls back to the reporting package alone, which is the non-destructive
+        hold an inventory read failure is allowed to produce.
+        """
+        targets = set()
+        for candidate in () if inventory is None else inventory.candidates:
+            if candidate.fingerprint == link_fingerprint:
+                targets.update(
+                    occurrence.package_id for occurrence in candidate.occurrences
+                )
+        return sorted(targets or {package_id})
+
+    def _commit_transition(self, crypter, targets, transition, package_write):
+        """Commit one decision, its package rows, and its ledger deltas together.
+
+        `transition(record, now)` answers the new record and its decision;
+        `package_write(decision)` answers the writer for one protected row, or
+        None when the transition touches no package. Nothing inside the
+        transaction resolves storage or settings, and an oversized record or a
+        ledger overflow raises there, which rolls every row back at once.
+        """
+        now = int(self._clock())
+        keys = (
+            ("crypter_cooldowns", crypter),
+            *(("protected", package_id) for package_id in targets),
+            (CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY),
+        )
+        committed = {}
+
+        def commit(current_values):
+            record, decision = transition(
+                self._current_decision(current_values[0], now), now
+            )
+            committed.update(decision)
+            write = package_write(decision)
+            return (
+                None if record is None else encode_decision_record(record),
+                *(
+                    value if write is None else write(value, now)
+                    for value in current_values[1:-1]
+                ),
+                _add_pending_crypter_events(current_values[-1], **decision["events"]),
+            )
+
+        self._shared_state.get_db("crypter_cooldowns").mutate_values(keys, commit)
+        return committed
+
+    def prepare_offer(self, crypter, inventory, *, mode=None):
+        """Open or advance the decision and lease at most one offer.
+
+        `mode` requests a specific handout - the manual `probe` a cohort
+        cooldown issues - and otherwise the natural mode of the current state.
+        `fail` mode is a pure bypass that neither creates, advances, expires, nor
+        clears cohort state. Returns the offer to hand out, or None when there is
+        no work.
+        """
+        crypter = normalize_crypter_key(crypter)
+        if not crypter_blocks_deferred(self._shared_state):
+            return None
+        now = int(self._clock())
+        leased = {"offer": None}
+
+        def advance(current_value):
+            record = prepare_decision(
+                inventory,
+                self._current_decision(current_value, now),
+                now=now,
+                sweep_id_factory=self._new_identifier,
+            )
+            record, offer = lease_next_offer(
+                record,
+                inventory,
+                now=now,
+                offer_id_factory=self._new_identifier,
+                mode=mode,
+            )
+            leased["offer"] = offer
+            return None if record is None else encode_decision_record(record)
+
+        self._shared_state.get_db("crypter_cooldowns").mutate_value(crypter, advance)
+        offer = leased["offer"]
+        if offer is None:
+            return None
+        return {
+            "mode": offer.mode,
+            "sweep_id": offer.sweep_id,
+            "offer_id": offer.offer_id,
+            "link_fingerprint": offer.fingerprint,
+            "deadline_epoch": offer.deadline_epoch,
+        }
+
+    def record_cohort_blocked(
+        self,
+        crypter,
+        package_id,
+        link_fingerprint,
+        sweep_id,
+        offer_id,
+        reason_code,
+        inventory,
+    ):
+        """Commit one exact cohort BLOCKED report and its holds atomically."""
+        crypter = normalize_crypter_key(crypter)
+        package_id = _validate_package_id(package_id)
+        link_fingerprint = validate_link_fingerprint(link_fingerprint)
+        offer = Offer(
+            "",
+            _validate_sweep_id(sweep_id),
+            _validate_identifier(offer_id, "Offer ID"),
+            link_fingerprint,
+            0,
+        )
+        reason_code = _validate_reason_code(reason_code)
+        if not crypter_blocks_deferred(self._shared_state):
+            return bypass_decision()
+        cooldown_seconds = self._cooldown_seconds()
+
+        def transition(record, now):
+            return record_blocked(
+                record, offer, inventory, now=now, cooldown_seconds=cooldown_seconds
+            )
+
+        def package_write(decision):
+            if decision["instruction"] not in ("hold", "cooldown"):
+                return None
+            return lambda value, now: _write_generation_hold(
+                value,
+                now,
+                crypter=crypter,
+                reason_code=reason_code,
+                sweep_id=decision["sweep_id"],
+                link_fingerprint=link_fingerprint,
+                retry_after_epoch=decision["retry_after_epoch"],
+                observation_holds=0 if decision["instruction"] == "cooldown" else 1,
+            )
+
+        return self._commit_transition(
+            crypter,
+            self._fingerprint_targets(package_id, link_fingerprint, inventory),
+            transition,
+            package_write,
+        )
+
+    def record_cohort_access(
+        self,
+        crypter,
+        package_id,
+        link_fingerprint,
+        sweep_id,
+        offer_id,
+        access,
+        inventory,
+    ):
+        """Commit one exact cohort CLEAR or UNKNOWN report atomically.
+
+        A committed CLEAR then triggers best-effort physical cleanup of the rest
+        of that generation. It runs outside the decision transaction and can only
+        remove metadata the committed `healthy` record already invalidated, so
+        its failure can neither reactivate a hold nor change the response.
+        """
+        crypter = normalize_crypter_key(crypter)
+        package_id = _validate_package_id(package_id)
+        link_fingerprint = validate_link_fingerprint(link_fingerprint)
+        offer = Offer(
+            "",
+            _validate_sweep_id(sweep_id),
+            _validate_identifier(offer_id, "Offer ID"),
+            link_fingerprint,
+            0,
+        )
+        if access not in ("clear", "unknown"):
+            raise ValueError(f'Unsupported linkcrypter access value "{access}"')
+        if not crypter_blocks_deferred(self._shared_state):
+            return bypass_decision()
+
+        def transition(record, now):
+            return record_access(record, offer, access, inventory, now=now)
+
+        def package_write(decision):
+            if not decision["cleared"]:
+                return None
+            return lambda value, now: _clear_generation_hold(
+                value, now, crypter=crypter, sweep_id=offer.sweep_id
+            )
+
+        decision = self._commit_transition(
+            crypter,
+            self._fingerprint_targets(package_id, link_fingerprint, inventory),
+            transition,
+            package_write,
+        )
+        if decision["cleared"]:
+            try:
+                self.clear_crypter_generation_holds(crypter, sweep_id=offer.sweep_id)
+            except Exception:
+                warn(
+                    "Deferred package cleanup after a successful linkcrypter "
+                    f'access report failed for "{crypter}"; those holds are '
+                    "already inactive"
+                )
+        return decision
 
     @staticmethod
     def _prune_record(record, now):
@@ -510,6 +806,12 @@ class CrypterCooldownService:
                 result.update(_legacy_shaped_snapshot(projected))
                 return current_value
             current["decision"] = None
+            if is_decision_record(current_value):
+                # A valid version-two row whose own window merely ended is a
+                # clean expiry, not the malformed row the legacy reader reports.
+                invalid["observed"] = False
+                result.update(_available_snapshot())
+                return None
 
             try:
                 record = _decode_record(current_value)
@@ -537,12 +839,17 @@ class CrypterCooldownService:
         return CrypterProjection(result, current["decision"])
 
     def observe(self, crypter, package_id, link_fingerprint, reason_code):
-        """Record one block observation and report what it changed.
+        """Record one version-one block observation and report what it changed.
 
         `recorded` and `cooldown_started` are decided inside the same
         transaction that writes the record, and that transaction also adds them
         to the durable event ledger, so no crash between the two can lose or
         repeat a transition and no caller has to re-derive one from a later read.
+
+        A version-two row is never legacy-decoded and never overwritten here: it
+        follows the version-one precedence rules instead, which is why the old
+        fixed three-observation path can no longer reach a global cooldown once a
+        cohort decision exists.
         """
         crypter = normalize_crypter_key(crypter)
         package_id = _validate_package_id(package_id)
@@ -554,6 +861,15 @@ class CrypterCooldownService:
         invalid_record = {"found": False}
 
         def update_record(current_value):
+            if is_decision_record(current_value):
+                record, legacy = record_legacy_report(
+                    decode_decision_record(current_value, now=now),
+                    now=now,
+                    generation_id_factory=self._new_identifier,
+                )
+                decision.update(legacy)
+                return None if record is None else encode_decision_record(record)
+
             try:
                 record = _decode_record(current_value)
             except ValueError:
@@ -662,6 +978,8 @@ class CrypterCooldownService:
         if decision is not None:
             projected = decision_snapshot(decision, now=now)
             return CrypterProjection(_legacy_shaped_snapshot(projected), projected)
+        if is_decision_record(current_value):
+            return self._cleanup_projection(database, crypter, now)
         try:
             record = _decode_record(current_value)
         except ValueError:

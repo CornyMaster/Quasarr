@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from quasarr.providers import shared_state
+from quasarr.providers.crypter_candidates import enumerate_filecrypt_candidates
 from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 from quasarr.storage.config import Config
 from quasarr.storage.sqlite_database import SQLITE_BUSY_TIMEOUT_MS, DataBase
@@ -901,6 +902,152 @@ class SQLiteDatabaseTests(unittest.TestCase):
             DataBase("example_table")
 
         self.assertTrue(fake_connection.closed)
+
+
+class CohortSweepTransactionTests(unittest.TestCase):
+    """The version-two sweep writer against the real SQLite transaction boundary."""
+
+    CRYPTER = "filecrypt"
+    REASON = "ip_block_suspected"
+    NOW = 1_700_000_000
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.dbfile = os.path.join(self.tmpdir.name, "Quasarr.db")
+        shared_state.values = {"dbfile": self.dbfile}
+        shared_state.lock = None
+        self.databases = {}
+        self.addCleanup(self.close_databases)
+        self.minted = 0
+        patcher = patch.object(
+            CrypterCooldownService, "_new_identifier", lambda _self: self.mint()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.service = CrypterCooldownService(self.state(), clock=lambda: self.NOW)
+        self.store_cohort(5)
+
+    def close_databases(self):
+        for database in self.databases.values():
+            database._conn.close()
+        self.databases.clear()
+
+    def mint(self):
+        self.minted += 1
+        return f"{self.minted:032d}"
+
+    def state(self):
+        databases = self.databases
+
+        class SharedState:
+            values = {
+                "dbfile": self.dbfile,
+                "crypter_cooldown_hours": 24,
+                "crypter_block_mode": "defer",
+            }
+
+            @staticmethod
+            def get_db(table):
+                if table not in databases:
+                    databases[table] = DataBase(table)
+                return databases[table]
+
+        return SharedState()
+
+    def package(self, index):
+        return f"Quasarr_movies_{index:032d}"
+
+    def store_cohort(self, size):
+        protected = self.databases.setdefault("protected", DataBase("protected"))
+        for index in range(1, size + 1):
+            protected.update_store(
+                self.package(index),
+                json.dumps(
+                    {
+                        "title": "Synthetic.Release",
+                        "password": "",
+                        "links": [
+                            [
+                                f"https://filecrypt.invalid/container/{index}",
+                                self.CRYPTER,
+                            ]
+                        ],
+                    }
+                ),
+            )
+
+    def inventory(self):
+        return enumerate_filecrypt_candidates(
+            self.databases["protected"].retrieve_all_titles()
+        )
+
+    def report_blocked(self, offer):
+        return self.service.record_cohort_blocked(
+            self.CRYPTER,
+            self.package_for(offer),
+            offer["link_fingerprint"],
+            offer["sweep_id"],
+            offer["offer_id"],
+            self.REASON,
+            self.inventory(),
+        )
+
+    def package_for(self, offer):
+        """Real fingerprints are hash-ordered, so never assume a member's owner."""
+        return next(
+            candidate.occurrences[0].package_id
+            for candidate in self.inventory().candidates
+            if candidate.fingerprint == offer["link_fingerprint"]
+        )
+
+    def test_decision_hold_and_ledger_commit_in_one_sqlite_transaction(self):
+        offer = self.service.prepare_offer(self.CRYPTER, self.inventory())
+        connection = self.databases["crypter_cooldowns"]._conn
+        statements = []
+        connection.set_trace_callback(statements.append)
+        try:
+            self.report_blocked(offer)
+        finally:
+            connection.set_trace_callback(None)
+
+        transactional = [
+            statement.split()[0].upper()
+            for statement in statements
+            if statement.upper().startswith(("BEGIN", "COMMIT", "ROLLBACK"))
+        ]
+        self.assertEqual(["BEGIN", "COMMIT"], transactional)
+        self.assertEqual(
+            ["crypter_cooldowns", "protected", "crypter_events"],
+            [
+                statement.split()[2]
+                for statement in statements
+                if statement.upper().startswith("INSERT")
+            ],
+        )
+
+    def test_an_overflowing_ledger_rolls_back_every_row_of_the_transition(self):
+        offer = self.service.prepare_offer(self.CRYPTER, self.inventory())
+        held = self.package_for(offer)
+        ledger_row = json.dumps(
+            {"observations": 10**1000 - 1, "cooldowns": 0, "probes": 0}
+        )
+        self.databases.setdefault("crypter_events", DataBase("crypter_events"))
+        self.databases["crypter_events"].update_store("pending", ledger_row)
+        before = self.databases["crypter_cooldowns"].retrieve(self.CRYPTER)
+
+        with self.assertRaises(OverflowError):
+            self.report_blocked(offer)
+
+        reopened = DataBase("crypter_cooldowns")
+        self.addCleanup(reopened._conn.close)
+        self.assertEqual(before, reopened.retrieve(self.CRYPTER))
+        events = DataBase("crypter_events")
+        self.addCleanup(events._conn.close)
+        self.assertEqual(ledger_row, events.retrieve("pending"))
+        protected = DataBase("protected")
+        self.addCleanup(protected._conn.close)
+        self.assertNotIn("deferred", json.loads(protected.retrieve(held)))
 
 
 if __name__ == "__main__":
