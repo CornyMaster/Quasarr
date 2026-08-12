@@ -16,6 +16,7 @@ PACKAGE_A = "Quasarr_movies_" + "a" * 32
 PACKAGE_B = "Quasarr_movies_" + "b" * 32
 PACKAGE_C = "Quasarr_movies_" + "c" * 32
 PACKAGE_D = "Quasarr_movies_" + "d" * 32
+SELECTOR_HOSTILE_PACKAGE_ID = PACKAGE_A + '"][data-selected="unexpected'
 RETRY_AFTER = 4_000_000_000
 
 
@@ -141,7 +142,7 @@ def route_callback(app, method, rule):
     )
 
 
-def render_packages_page():
+def render_packages_page(packages_content=""):
     app = Bottle()
     packages_api.setup_packages_routes(app)
     page_route = route_callback(app, "GET", "/packages")
@@ -149,7 +150,11 @@ def render_packages_page():
     with (
         mock.patch.dict(packages_api.shared_state.values, {"device": object()}),
         mock.patch.object(packages_api, "request", SimpleNamespace(query={})),
-        mock.patch.object(packages_api, "_render_packages_content", return_value=""),
+        mock.patch.object(
+            packages_api,
+            "_render_packages_content",
+            return_value=packages_content,
+        ),
     ):
         return page_route()
 
@@ -165,6 +170,26 @@ def render_deferred_fragment(package_ids):
             for package_id in package_ids
         ],
         "history": [],
+    }
+
+    with mock.patch.object(packages_api, "get_packages", return_value=downloads):
+        return packages_api._render_packages_content()
+
+
+def render_selector_audit_fragment():
+    downloads = {
+        "queue": [
+            queue_item(
+                SELECTOR_HOSTILE_PACKAGE_ID,
+                "[Waiting for linkcrypter retry] Deferred audit package",
+                deferred_block(),
+            ),
+            queue_item(
+                PACKAGE_B,
+                "[CAPTCHA not solved!] Ordinary audit package",
+            ),
+        ],
+        "history": [history_item(PACKAGE_C, "History audit package")],
     }
 
     with mock.patch.object(packages_api, "get_packages", return_value=downloads):
@@ -445,6 +470,37 @@ RESTORE_MUTATIONS = (
     ),
 )
 
+TARGETED_RESTORE_MUTATIONS = (
+    (
+        "extra parameter",
+        "restoreDeferredSelection(packageIds)",
+        "restoreDeferredSelection(packageIds, stalePackageIds)",
+        r"want exactly one parameter",
+    ),
+    (
+        "false checked assignment",
+        "checkbox.checked = true;",
+        "checkbox.checked = false;",
+        r"restore assigns 'false' instead of true",
+    ),
+    (
+        "set constructed after iteration starts",
+        (
+            "const selected = new Set(packageIds);\n"
+            "                    if (!selected.size) return;\n\n"
+            "                    document.querySelectorAll("
+            "'.deferred-package-select').forEach(checkbox => {"
+        ),
+        (
+            "document.querySelectorAll("
+            "'.deferred-package-select').forEach(checkbox => {\n"
+            "                        const selected = new Set(packageIds);\n"
+            "                        if (!selected.size) return;"
+        ),
+        r"set must be built before the checkboxes are visited",
+    ),
+)
+
 SELECTOR_AUDIT_FIXTURES = (
     ("singular literal", "document.querySelector('.status-message');", True),
     ("plural literal", 'document.querySelectorAll(".deferred-package-select");', True),
@@ -707,6 +763,37 @@ class DeferredSelectionRefreshTests(unittest.TestCase):
         self.assertIn("querySelector", {name for name, _ in calls})
         self.assertIn("querySelectorAll", {name for name, _ in calls})
 
+    def test_selector_audit_includes_value_bearing_packages_content(self):
+        fragment = render_selector_audit_fragment()
+        static_page = render_packages_page()
+        page = render_packages_page(fragment)
+
+        self.assertIn("Deferred audit package", fragment)
+        self.assertIn("Ordinary audit package", fragment)
+        self.assertIn("History audit package", fragment)
+        self.assertIn(
+            f'value="{PACKAGE_A}&quot;][data-selected=&quot;unexpected"',
+            fragment,
+        )
+
+        selector_arguments = []
+        for surface, source in (
+            ("static page", static_page),
+            ("packages fragment", fragment),
+            ("complete page", page),
+        ):
+            with self.subTest(surface=surface):
+                self.assertEqual([], built_selector_arguments(source))
+                selector_arguments.extend(
+                    argument for _, argument in query_selector_calls(source)
+                )
+
+        self.assertTrue(
+            fragment in page,
+            "the selector audit page omits the real packages fragment",
+        )
+        self.assertNotIn("data-selected", "\n".join(selector_arguments))
+
     def test_restore_helper_contract_rejects_weakened_variants(self):
         page = render_packages_page()
         snapshot_property = selection_snapshot_property(page)
@@ -720,6 +807,18 @@ class DeferredSelectionRefreshTests(unittest.TestCase):
                     restore_selection_contract(
                         helper.replace(original, replacement), snapshot_property
                     )
+
+    def test_restore_helper_contract_reports_targeted_rule_failures(self):
+        page = render_packages_page()
+        snapshot_property = selection_snapshot_property(page)
+        helper = javascript_function_source(page, "restoreDeferredSelection")
+
+        for label, original, replacement, error_pattern in TARGETED_RESTORE_MUTATIONS:
+            with self.subTest(mutation=label):
+                self.assertEqual(1, helper.count(original))
+                mutant = helper.replace(original, replacement, 1)
+                with self.assertRaisesRegex(AssertionError, error_pattern):
+                    restore_selection_contract(mutant, snapshot_property)
 
     def test_selector_audit_reads_both_call_forms_and_rejects_built_selectors(self):
         for label, snippet, is_literal in SELECTOR_AUDIT_FIXTURES:
