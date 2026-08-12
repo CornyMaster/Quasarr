@@ -23,6 +23,15 @@ _RECORD_KEYS = {
     "observations",
 }
 _OBSERVATION_KEYS = {"package_id", "link_fingerprint", "seen_at_epoch"}
+PACKAGE_DEFER_KEY = "deferred"
+_PACKAGE_DEFER_KEYS = {
+    "crypter",
+    "reason_code",
+    "since_epoch",
+    "retry_after_epoch",
+    "probe_requested",
+    "observation_holds",
+}
 
 
 def normalize_crypter_key(value):
@@ -113,6 +122,41 @@ def _encode_record(record):
     return json.dumps(record, separators=(",", ":"), sort_keys=True)
 
 
+def _decode_package(value):
+    if value is None:
+        return None
+    try:
+        package = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return package if isinstance(package, dict) else None
+
+
+def decode_package_defer(package_data):
+    """Project the deferred block out of an already-parsed protected package."""
+    if not isinstance(package_data, dict):
+        return None
+    deferred = package_data.get(PACKAGE_DEFER_KEY)
+    if deferred is None:
+        return None
+    if not isinstance(deferred, dict) or not _PACKAGE_DEFER_KEYS.issubset(deferred):
+        raise ValueError("Invalid persisted package defer metadata")
+    if type(deferred["probe_requested"]) is not bool:
+        raise ValueError('Invalid persisted package defer field "probe_requested"')
+    return {
+        "crypter": normalize_crypter_key(deferred["crypter"]),
+        "reason_code": _validate_reason_code(deferred["reason_code"]),
+        "since_epoch": _validate_epoch(deferred["since_epoch"], "since_epoch"),
+        "retry_after_epoch": _validate_epoch(
+            deferred["retry_after_epoch"], "retry_after_epoch"
+        ),
+        "probe_requested": deferred["probe_requested"],
+        "observation_holds": _validate_epoch(
+            deferred["observation_holds"], "observation_holds"
+        ),
+    }
+
+
 def _available_snapshot():
     return {
         "state": "available",
@@ -145,6 +189,10 @@ class CrypterCooldownService:
         warn(f'Discarding invalid persisted cooldown for linkcrypter "{crypter}"')
 
     @staticmethod
+    def _warn_invalid_package_defer(package_id):
+        warn(f'Ignoring invalid persisted defer metadata for package "{package_id}"')
+
+    @staticmethod
     def _prune_record(record, now):
         if record is None:
             return None
@@ -161,8 +209,7 @@ class CrypterCooldownService:
             return None
         if record["observations"]:
             seen_at = [
-                observation["seen_at_epoch"]
-                for observation in record["observations"]
+                observation["seen_at_epoch"] for observation in record["observations"]
             ]
             record["first_seen_epoch"] = min(seen_at)
             record["last_seen_epoch"] = max(seen_at)
@@ -243,8 +290,7 @@ class CrypterCooldownService:
                 )
 
             seen_at = [
-                observation["seen_at_epoch"]
-                for observation in record["observations"]
+                observation["seen_at_epoch"] for observation in record["observations"]
             ]
             record["first_seen_epoch"] = min(seen_at)
             record["last_seen_epoch"] = max(seen_at)
@@ -290,9 +336,7 @@ class CrypterCooldownService:
         try:
             record = _decode_record(current_value)
         except ValueError:
-            return self._cleanup_snapshot(
-                database, crypter, now, invalid_observed=True
-            )
+            return self._cleanup_snapshot(database, crypter, now, invalid_observed=True)
 
         observation_count = len(record["observations"])
         record = self._prune_record(record, now)
@@ -316,3 +360,115 @@ class CrypterCooldownService:
         self._shared_state.get_db("crypter_cooldowns").mutate_value(
             crypter, lambda _current_value: None
         )
+
+    def defer_package(
+        self, package_id, crypter, reason_code, retry_after_epoch, observation_holds
+    ):
+        """Attach deferred metadata to an existing protected package.
+
+        `observation_holds` is the provisional hold budget this call consumes: 1
+        for a provisional hold and 0 for a confirmed crypter cooldown. A package
+        never receives a second provisional hold, so one dead container cannot
+        collect an unlimited sequence of fresh holds. Returns the stored
+        metadata, or None when the protected package is missing or unreadable.
+        """
+        package_id = _validate_package_id(package_id)
+        crypter = normalize_crypter_key(crypter)
+        reason_code = _validate_reason_code(reason_code)
+        retry_after_epoch = _validate_epoch(retry_after_epoch, "retry_after_epoch")
+        observation_holds = _validate_epoch(observation_holds, "observation_holds")
+        now = int(self._clock())
+        stored = {}
+        invalid_defer = {"found": False}
+
+        def update_package(current_value):
+            package = _decode_package(current_value)
+            if package is None:
+                return current_value
+            try:
+                existing = decode_package_defer(package)
+            except ValueError:
+                invalid_defer["found"] = True
+                existing = None
+
+            previous_holds = existing["observation_holds"] if existing else 0
+            previous_retry_after = existing["retry_after_epoch"] if existing else 0
+            if observation_holds and previous_holds >= observation_holds:
+                retry_after = previous_retry_after
+            else:
+                retry_after = max(previous_retry_after, retry_after_epoch)
+
+            stored.update(
+                {
+                    "crypter": crypter,
+                    "reason_code": reason_code,
+                    "since_epoch": existing["since_epoch"] if existing else now,
+                    "retry_after_epoch": retry_after,
+                    "probe_requested": existing["probe_requested"]
+                    if existing
+                    else False,
+                    "observation_holds": max(previous_holds, observation_holds),
+                }
+            )
+            package[PACKAGE_DEFER_KEY] = dict(stored)
+            return json.dumps(package)
+
+        self._shared_state.get_db("protected").mutate_value(package_id, update_package)
+        if invalid_defer["found"]:
+            self._warn_invalid_package_defer(package_id)
+        return dict(stored) if stored else None
+
+    def clear_package_defer(self, package_id):
+        """Remove deferred metadata while preserving every other package field."""
+        package_id = _validate_package_id(package_id)
+        cleared = {"done": False}
+
+        def update_package(current_value):
+            package = _decode_package(current_value)
+            if package is None or PACKAGE_DEFER_KEY not in package:
+                return current_value
+            package.pop(PACKAGE_DEFER_KEY)
+            cleared["done"] = True
+            return json.dumps(package)
+
+        self._shared_state.get_db("protected").mutate_value(package_id, update_package)
+        return cleared["done"]
+
+    def get_package_defer(self, package_id):
+        package_id = _validate_package_id(package_id)
+        package = _decode_package(
+            self._shared_state.get_db("protected").retrieve(package_id)
+        )
+        if package is None:
+            return None
+        try:
+            return decode_package_defer(package)
+        except ValueError:
+            self._warn_invalid_package_defer(package_id)
+            return None
+
+    def project_package_defer(self, deferred, snapshot):
+        """Merge stored package defer metadata with a live crypter snapshot."""
+        now = int(self._clock())
+        crypter_retry_after = (
+            snapshot["retry_after_epoch"] if snapshot["state"] == "cooldown" else 0
+        )
+        retry_after_epoch = max(deferred["retry_after_epoch"], crypter_retry_after)
+        if crypter_retry_after > now:
+            hold_type = "crypter_cooldown"
+        elif retry_after_epoch > now:
+            hold_type = "provisional"
+        else:
+            hold_type = "none"
+
+        projected = dict(deferred)
+        projected.update(
+            {
+                "retry_after_epoch": retry_after_epoch,
+                "state": snapshot["state"],
+                "evidence_count": snapshot["evidence_count"],
+                "hold_type": hold_type,
+                "active": hold_type != "none",
+            }
+        )
+        return projected

@@ -8,7 +8,7 @@ Receives a grab request from the SABnzbd-emulating API, picks the matching sourc
 
 - `__init__.py` - orchestrator: source selection, link classification, package IDs, the `submit_final_download_urls()` funnel, `fail()` bookkeeping
 - `mirror_filters.py` - canonical mirror-token normalization and the final pre-JDownloader whitelist filter
-- `packages/` - SABnzbd-shaped queue/history aggregation, archive/extraction tracking, auto-start, deletion
+- `packages/` - SABnzbd-shaped queue/history aggregation, archive/extraction tracking, auto-start, deletion, deferred-linkcrypter projection
 - `sources/` and `linkcrypters/` - see Child DOX Index
 
 ## Local Contracts
@@ -21,6 +21,8 @@ Receives a grab request from the SABnzbd-emulating API, picks the matching sourc
 - Package IDs are deterministic: `Quasarr_{category}_{32-hex-hash}` validated by `PACKAGE_ID_PATTERN`; `package_id_exists()` checks the protected DB, failed DB, and JDownloader before any download.
 - `submit_final_download_urls()` is the ONLY path that hands direct links to JDownloader (also imported by `api/captcha` and `api/sponsors_helper`). It applies the download-category mirror whitelist; if a whitelist drops everything, the package is persisted as failed.
 - Protected-package JSON owns the tracked notification references for that release; no separate notification table exists. `submit_final_download_urls(..., remove_protected=True)` captures this context before deletion, edits the original notification on solved/failed outcomes, and accepts `notification_details` so manual and SponsorsHelper solutions render accurately.
+- A deferred linkcrypter package stays a protected queue item and is never written to `failed` automatically. `get_packages()` projects `deferred` details per package by merging the stored `deferred` block (owned by `providers/crypter_cooldowns.py`) with the live crypter snapshot, so an expired provisional hold or a superseding crypter cooldown is reflected without rewriting package metadata. Only the rendered `filename` changes: `DEFERRED_STATUS_PREFIX` replaces `PROTECTED_STATUS_PREFIX` while the hold is active; ID, category, and `type="protected"` stay unchanged, and packages without defer metadata never read cooldown state.
+- `delete_database_packages(shared_state, package_ids, expected_type="protected")` is the batch counterpart of `delete_package()` for packages already proven to be database-only: it issues no JDownloader call, validates every ID first (`invalid_package_id`, `duplicate`, `not_found`, `not_deferred`), then deletes from the protected and failed tables and verifies each ID separately (`delete_failed`). It returns `{"deleted": [...], "rejected": [{"package_id", "reason"}]}`.
 - `fail()` deliberately returns `{"success": True, "failed": True}` so the *arr client records the grab and can blocklist it.
 - `packages/` auto-start moves exactly ONE Quasarr package per call from linkgrabber to the download list; archive packages are only "finished" when extraction completed; `nzo_id` is the Quasarr package ID read from the JD `comment` field (JD uuid fallback for foreign packages).
 - Sources call `mark_hostname_issue(initials, "download", msg)` on errors; the orchestrator clears the issue when a source returns usable links.
@@ -42,7 +44,7 @@ Product-wide policy - do not redesign it; per-source specifics live in the Per-S
 
 ## Verification
 
-- Targeted tests: `test_mirror_filters.py`, `test_protected_redirect_resolution.py`, `test_wx_direct_links.py`
+- Targeted tests: `test_mirror_filters.py`, `test_protected_redirect_resolution.py`, `test_wx_direct_links.py`, `test_deferred_protected_packages.py`
 - Full unit suite: `uv run python -X utf8 -m unittest discover -s tests`
 
 ## Child DOX Index

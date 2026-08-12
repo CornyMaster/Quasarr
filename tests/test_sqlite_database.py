@@ -59,6 +59,7 @@ class SQLiteDatabaseTests(unittest.TestCase):
 
         def mutate_first():
             try:
+
                 def mutator(current_value):
                     callback_order.append("first-started")
                     first_callback_started.set()
@@ -110,9 +111,7 @@ class SQLiteDatabaseTests(unittest.TestCase):
                 callback_order,
             )
             stored = json.loads(first.retrieve("filecrypt"))
-            self.assertEqual(
-                {"package-a", "package-b"}, set(stored["observations"])
-            )
+            self.assertEqual({"package-a", "package-b"}, set(stored["observations"]))
         finally:
             first._conn.close()
             second._conn.close()

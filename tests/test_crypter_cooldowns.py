@@ -176,9 +176,7 @@ class CrypterCooldownServiceTests(unittest.TestCase):
         return decision
 
     def test_first_observation_starts_provisional_hold(self):
-        decision = self.service.observe(
-            "filecrypt", PACKAGE_A, "a" * 64, REASON
-        )
+        decision = self.service.observe("filecrypt", PACKAGE_A, "a" * 64, REASON)
 
         self.assertEqual("observing", decision["state"])
         self.assertEqual(1, decision["evidence_count"])
@@ -437,9 +435,7 @@ class CrypterCooldownServiceTests(unittest.TestCase):
 
         self.assertEqual("observing", snapshot["state"])
         self.assertNotIn("future_metadata", snapshot)
-        self.assertNotIn(
-            "future_observation_field", snapshot["observations"][0]
-        )
+        self.assertNotIn("future_observation_field", snapshot["observations"][0])
         self.assertEqual(raw_record, database.rows["filecrypt"])
         self.assertEqual(0, database.mutation_count)
 
@@ -575,9 +571,7 @@ class CrypterCooldownServiceTests(unittest.TestCase):
         raw_record = "malformed-sensitive-marker"
         database.rows["filecrypt"] = raw_record
 
-        with patch(
-            "quasarr.providers.crypter_cooldowns.warn", create=True
-        ) as warning:
+        with patch("quasarr.providers.crypter_cooldowns.warn", create=True) as warning:
             decision = self._observe(PACKAGE_A, "a")
 
         self.assertEqual("observing", decision["state"])

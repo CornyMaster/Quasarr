@@ -14,9 +14,16 @@ from quasarr.constants import (
     NOT_DOWNLOADABLE_MARKERS,
     PACKAGE_ID_PATTERN,
 )
+from quasarr.providers.crypter_cooldowns import (
+    CrypterCooldownService,
+    decode_package_defer,
+)
 from quasarr.providers.jd_cache import JDPackageCache
 from quasarr.providers.log import debug, info, trace
 from quasarr.storage.categories import get_download_category_from_package_id
+
+DEFERRED_STATUS_PREFIX = "[Waiting for linkcrypter retry] "
+PROTECTED_STATUS_PREFIX = "[CAPTCHA not solved!] "
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -54,6 +61,21 @@ def is_quasarr_package(package_id):
     if not package_id:
         return False
     return bool(PACKAGE_ID_PATTERN.match(str(package_id)))
+
+
+def _project_package_defer(service, package_data, snapshots):
+    """Merge stored package defer metadata with the live crypter cooldown."""
+    try:
+        deferred = decode_package_defer(package_data)
+    except ValueError:
+        deferred = None
+    if not deferred:
+        return None
+
+    crypter = deferred["crypter"]
+    if crypter not in snapshots:
+        snapshots[crypter] = service.snapshot(crypter)
+    return service.project_package_defer(deferred, snapshots[crypter])
 
 
 def get_links_comment(package, package_links):
@@ -357,6 +379,8 @@ def get_packages(shared_state, _cache=None, auto_start=True):
     )
 
     if protected_packages:
+        cooldown_service = CrypterCooldownService(shared_state)
+        cooldown_snapshots = {}
         for package in protected_packages:
             package_id = package[0]
             try:
@@ -367,14 +391,18 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                     "size_mb": data.get("size_mb"),
                     "password": data.get("password"),
                 }
-                packages.append(
-                    {
-                        "details": details,
-                        "location": "queue",
-                        "type": "protected",
-                        "package_id": package_id,
-                    }
+                entry = {
+                    "details": details,
+                    "location": "queue",
+                    "type": "protected",
+                    "package_id": package_id,
+                }
+                deferred = _project_package_defer(
+                    cooldown_service, data, cooldown_snapshots
                 )
+                if deferred:
+                    entry["deferred"] = deferred
+                packages.append(entry)
                 trace(f"Protected package: '{data['title']}' ({package_id})")
             except (json.JSONDecodeError, KeyError) as e:
                 debug(f"Failed to parse protected package {package_id}: {e}")
@@ -662,7 +690,13 @@ def get_packages(shared_state, _cache=None, auto_start=True):
 
             else:  # protected
                 details = package["details"]
-                name = f"[CAPTCHA not solved!] {details.get('title', 'unknown')}"
+                deferred = package.get("deferred")
+                prefix = (
+                    DEFERRED_STATUS_PREFIX
+                    if deferred and deferred["active"]
+                    else PROTECTED_STATUS_PREFIX
+                )
+                name = f"{prefix}{details.get('title', 'unknown')}"
                 mb = mb_left = details.get("size_mb") or 0
                 bytes_total = 0  # Protected packages don't have reliable byte data
                 package_id = package.get("package_id")
@@ -679,25 +713,26 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                 except (ZeroDivisionError, ValueError, TypeError):
                     percentage = 0
 
-                downloads["queue"].append(
-                    {
-                        "index": queue_index,
-                        "nzo_id": effective_id,
-                        "priority": "Normal",
-                        "filename": name,
-                        "cat": category,
-                        "mbleft": int(float(mb_left)) if mb_left else 0,
-                        "mb": int(float(mb)) if mb else 0,
-                        "bytes": bytes_total,
-                        "status": "Downloading",
-                        "percentage": percentage,
-                        "timeleft": time_left,
-                        "type": package_type,
-                        "uuid": package_uuid,
-                        "is_archive": package.get("is_archive", False),
-                        "storage": storage,
-                    }
-                )
+                queue_item = {
+                    "index": queue_index,
+                    "nzo_id": effective_id,
+                    "priority": "Normal",
+                    "filename": name,
+                    "cat": category,
+                    "mbleft": int(float(mb_left)) if mb_left else 0,
+                    "mb": int(float(mb)) if mb else 0,
+                    "bytes": bytes_total,
+                    "status": "Downloading",
+                    "percentage": percentage,
+                    "timeleft": time_left,
+                    "type": package_type,
+                    "uuid": package_uuid,
+                    "is_archive": package.get("is_archive", False),
+                    "storage": storage,
+                }
+                if package.get("deferred"):
+                    queue_item["deferred"] = package["deferred"]
+                downloads["queue"].append(queue_item)
                 queue_index += 1
             else:
                 debug(f"Skipping queue package without package_id or uuid: {name}")
@@ -903,7 +938,8 @@ def delete_package(shared_state, package_id, package_title=None, missing_ok=Fals
                             "[Extracting] ",
                             "[Paused] ",
                             "[Linkgrabber] ",
-                            "[CAPTCHA not solved!] ",
+                            PROTECTED_STATUS_PREFIX,
+                            DEFERRED_STATUS_PREFIX,
                         ]:
                             name = name.replace(prefix, "")
 
@@ -1082,3 +1118,58 @@ def delete_package(shared_state, package_id, package_title=None, missing_ok=Fals
         debug(f"delete_package: Exception during deletion: {type(e).__name__}: {e}")
         debug(f"delete_package: Traceback: {traceback.format_exc()}")
         return False
+
+
+def delete_database_packages(shared_state, package_ids, expected_type="protected"):
+    """Delete deferred database-only packages without any JDownloader inventory call.
+
+    Every ID is validated against the database first, then each accepted ID is
+    deleted from the protected and failed tables and verified individually.
+    """
+    if expected_type != "protected":
+        raise ValueError(f'Unsupported package type "{expected_type}"')
+
+    protected_db = shared_state.get_db("protected")
+    failed_db = shared_state.get_db("failed")
+    cooldown_service = CrypterCooldownService(shared_state)
+
+    accepted = []
+    seen = set()
+    deleted = []
+    rejected = []
+
+    for package_id in package_ids or []:
+        if not isinstance(package_id, str) or not is_quasarr_package(package_id):
+            rejected.append({"package_id": package_id, "reason": "invalid_package_id"})
+            continue
+        if package_id in seen:
+            rejected.append({"package_id": package_id, "reason": "duplicate"})
+            continue
+
+        seen.add(package_id)
+        if protected_db.retrieve(package_id) is None:
+            rejected.append({"package_id": package_id, "reason": "not_found"})
+        elif cooldown_service.get_package_defer(package_id) is None:
+            rejected.append({"package_id": package_id, "reason": "not_deferred"})
+        else:
+            accepted.append(package_id)
+
+    for package_id in accepted:
+        try:
+            protected_db.delete(package_id)
+        except Exception as e:
+            debug(f"delete_database_packages: Protected DB delete exception: {e}")
+        try:
+            failed_db.delete(package_id)
+        except Exception as e:
+            debug(f"delete_database_packages: Failed DB delete exception: {e}")
+
+        if protected_db.retrieve(package_id) or failed_db.retrieve(package_id):
+            info(f"Verification failed: Package {package_id} still exists in the DBs")
+            rejected.append({"package_id": package_id, "reason": "delete_failed"})
+            continue
+        deleted.append(package_id)
+
+    if deleted:
+        info(f"Deleted <y>{len(deleted)}</y> deferred package(s) from DBs")
+    return {"deleted": deleted, "rejected": rejected}
