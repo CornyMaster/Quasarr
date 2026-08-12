@@ -64,7 +64,7 @@ def is_quasarr_package(package_id):
     return bool(PACKAGE_ID_PATTERN.match(str(package_id)))
 
 
-def _project_package_defer(service, package_data, snapshots):
+def _project_package_defer(service, package_data, projections):
     """Merge stored package defer metadata with the live crypter cooldown."""
     try:
         deferred = decode_package_defer(package_data)
@@ -74,15 +74,15 @@ def _project_package_defer(service, package_data, snapshots):
         return None
 
     crypter = deferred["crypter"]
-    if crypter not in snapshots:
-        # The generation-bound hold needs the current decision, not just the
-        # legacy-shaped snapshot, so both are read once per crypter.
-        snapshots[crypter] = (
-            service.snapshot(crypter),
-            service.crypter_decision(crypter),
-        )
-    snapshot, decision = snapshots[crypter]
-    return service.project_package_defer(deferred, snapshot, decision)
+    if crypter not in projections:
+        # The generation-bound hold needs the legacy-shaped snapshot and the
+        # current decision of the very same row read, so a transition between
+        # two reads can never be projected half-applied.
+        projections[crypter] = service.crypter_projection(crypter)
+    projection = projections[crypter]
+    return service.project_package_defer(
+        deferred, projection.snapshot, projection.decision
+    )
 
 
 def get_links_comment(package, package_links):
@@ -393,7 +393,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
             if crypter_blocks_deferred(shared_state)
             else None
         )
-        cooldown_snapshots = {}
+        cooldown_projections = {}
         for package in protected_packages:
             package_id = package[0]
             try:
@@ -411,7 +411,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                     "package_id": package_id,
                 }
                 deferred = (
-                    _project_package_defer(cooldown_service, data, cooldown_snapshots)
+                    _project_package_defer(cooldown_service, data, cooldown_projections)
                     if cooldown_service is not None
                     else None
                 )

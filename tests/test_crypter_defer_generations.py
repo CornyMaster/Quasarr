@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -45,6 +46,21 @@ def offer_id(index):
 
 FINGERPRINT_ONE = fingerprint(1)
 FINGERPRINT_TWO = fingerprint(2)
+# Nested far past any recursion limit, built by repetition so the fixture never
+# recurses itself. json.loads answers it with RecursionError, which is neither a
+# TypeError nor a ValueError.
+DEEPLY_NESTED_ROW = "[" * 100_000 + "]" * 100_000
+# More digits than Python converts to int, so json.loads raises a plain
+# ValueError rather than a JSONDecodeError.
+DIGIT_OVERFLOW_ROW = '{"size_mb": ' + "9" * 5000 + "}"
+UNREADABLE_ROWS = (
+    "not-json",
+    "null",
+    '"deferred"',
+    "[1, 2, 3]",
+    DEEPLY_NESTED_ROW,
+    DIGIT_OVERFLOW_ROW,
+)
 
 
 class FakeClock:
@@ -61,10 +77,14 @@ class FakeDatabase:
         self.tables = {} if tables is None else tables
         self.lock = threading.Lock()
         self.mutation_count = 0
+        self.retrieve_count = 0
         self.in_mutation = False
         # One-shot hook simulating a concurrent writer that lands just before
         # the next mutation of this table starts reading.
         self.before_write = None
+        # One-shot hook simulating a concurrent writer that lands immediately
+        # after a read returns, which is exactly the window between two reads.
+        self.after_read = None
 
     def _peer(self, table):
         if table not in self.tables:
@@ -82,7 +102,12 @@ class FakeDatabase:
 
     def retrieve(self, key):
         self._reject_calls_from_callback()
-        return self.rows.get(key)
+        value = self.rows.get(key)
+        self.retrieve_count += 1
+        hook, self.after_read = self.after_read, None
+        if hook is not None:
+            hook(key)
+        return value
 
     def retrieve_all_titles(self):
         self._reject_calls_from_callback()
@@ -290,6 +315,23 @@ def individual_record(
 
 def snapshot_of(record, now=NOW):
     return decision_snapshot(record, now=now)
+
+
+def queue_item(shared_state, clock):
+    """The first queue entry get_packages() renders for these protected rows."""
+
+    def build_service(state):
+        return CrypterCooldownService(state, clock=clock)
+
+    with (
+        patch("quasarr.downloads.packages.JDPackageCache", return_value=FakeCache()),
+        patch(
+            "quasarr.downloads.packages.get_download_category_from_package_id",
+            return_value="movies",
+        ),
+        patch("quasarr.downloads.packages.CrypterCooldownService", build_service),
+    ):
+        return get_packages(shared_state, auto_start=False)["queue"][0]
 
 
 class GenerationDeferSchemaTests(unittest.TestCase):
@@ -622,6 +664,188 @@ class CrypterDecisionReadTests(unittest.TestCase):
         self.assertEqual(legacy_defer(crypter="junkies"), rebound)
 
 
+class CoherentCrypterProjectionTests(unittest.TestCase):
+    """One row read has to answer both halves of the defer projection.
+
+    Two separate reads can straddle a row transition and combine a stale
+    cooldown snapshot with a newer decision, or miss a cooldown that started in
+    between. The `after_read` hook lands exactly in that window.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock(NOW)
+        self.shared_state = FakeSharedState()
+        self.protected = self.shared_state.databases["protected"]
+        self.cooldowns = self.shared_state.databases["crypter_cooldowns"]
+        self.protected.update_store(
+            PACKAGE_A, json.dumps(protected_blob(deferred=generation_defer()))
+        )
+        self.service = CrypterCooldownService(self.shared_state, clock=self.clock)
+
+    def _decide(self, record):
+        self.cooldowns.update_store("filecrypt", encode_decision_record(record))
+
+    def _transition_after_the_first_read(self, record):
+        def install(key):
+            self.cooldowns.rows[key] = encode_decision_record(record)
+
+        self.cooldowns.after_read = install
+
+    def test_the_crypter_row_is_read_exactly_once_per_projection(self):
+        self._decide(sweeping_record())
+
+        projection = self.service.crypter_projection("filecrypt")
+
+        self.assertEqual(1, self.cooldowns.retrieve_count)
+        self.assertEqual(0, self.cooldowns.mutation_count)
+        self.assertEqual("observing", projection.snapshot["state"])
+        self.assertEqual("sweeping", projection.decision["state"])
+        self.assertEqual(SWEEP_A, projection.decision["sweep_id"])
+
+    def test_the_snapshot_and_the_decision_always_describe_the_same_row(self):
+        self._decide(cohort_cooldown_record())
+        self._transition_after_the_first_read(healthy_record())
+
+        projection = self.service.crypter_projection("filecrypt")
+
+        self.assertEqual(1, self.cooldowns.retrieve_count)
+        self.assertEqual("cooldown", projection.snapshot["state"])
+        self.assertEqual(
+            NOW + COOLDOWN_SECONDS, projection.snapshot["retry_after_epoch"]
+        )
+        self.assertEqual("cooldown", projection.decision["state"])
+        self.assertEqual(SWEEP_A, projection.decision["sweep_id"])
+
+    def test_a_cooldown_starting_between_two_reads_is_never_half_applied(self):
+        self._decide(healthy_record())
+        self._transition_after_the_first_read(cohort_cooldown_record())
+
+        projection = self.service.crypter_projection("filecrypt")
+        projected = self.service.project_package_defer(
+            generation_defer(), projection.snapshot, projection.decision
+        )
+
+        self.assertEqual(1, self.cooldowns.retrieve_count)
+        self.assertEqual("available", projection.snapshot["state"])
+        self.assertEqual("healthy", projection.decision["state"])
+        self.assertEqual("none", projected["hold_type"])
+        self.assertFalse(projected["active"])
+
+    def test_the_queue_projection_reads_the_crypter_row_once(self):
+        self._decide(healthy_record())
+        self._transition_after_the_first_read(cohort_cooldown_record())
+
+        item = queue_item(self.shared_state, self.clock)
+
+        self.assertEqual(1, self.cooldowns.retrieve_count)
+        self.assertEqual("none", item["deferred"]["hold_type"])
+        self.assertFalse(item["deferred"]["active"])
+        self.assertEqual(
+            "[CAPTCHA not solved!] Synthetic.Release.Example", item["filename"]
+        )
+
+    def test_the_active_count_reads_the_crypter_row_once(self):
+        self._decide(healthy_record())
+        self._transition_after_the_first_read(cohort_cooldown_record())
+
+        self.assertEqual(0, self.service.count_active_deferred_packages())
+        self.assertEqual(1, self.cooldowns.retrieve_count)
+
+    def test_one_projection_serves_every_package_of_the_same_linkcrypter(self):
+        self._decide(sweeping_record())
+        self.protected.update_store(
+            PACKAGE_B, json.dumps(protected_blob(deferred=generation_defer()))
+        )
+
+        self.assertEqual(2, self.service.count_active_deferred_packages())
+        self.assertEqual(1, self.cooldowns.retrieve_count)
+
+    def test_a_package_without_defer_metadata_reads_no_crypter_state(self):
+        self.protected.update_store(PACKAGE_A, json.dumps(protected_blob()))
+        self._decide(cohort_cooldown_record())
+
+        self.assertEqual(0, self.service.count_active_deferred_packages())
+        self.assertEqual(0, self.cooldowns.retrieve_count)
+
+    def test_a_valid_legacy_row_projects_from_one_read_without_writing(self):
+        self.cooldowns.update_store(
+            "filecrypt",
+            json.dumps(
+                {
+                    "state": "cooldown",
+                    "reason_code": REASON,
+                    "first_seen_epoch": NOW,
+                    "last_seen_epoch": NOW,
+                    "retry_after_epoch": NOW + COOLDOWN_SECONDS,
+                    "observations": [],
+                }
+            ),
+        )
+
+        projection = self.service.crypter_projection("filecrypt")
+
+        self.assertEqual("cooldown", projection.snapshot["state"])
+        self.assertIsNone(projection.decision)
+        self.assertEqual(1, self.cooldowns.retrieve_count)
+        self.assertEqual(0, self.cooldowns.mutation_count)
+
+    def test_an_unreadable_row_is_cleaned_up_into_a_coherent_pair(self):
+        self.cooldowns.update_store("filecrypt", "not-json")
+
+        projection = self.service.crypter_projection("filecrypt")
+
+        self.assertEqual("available", projection.snapshot["state"])
+        self.assertIsNone(projection.decision)
+        self.assertNotIn("filecrypt", self.cooldowns.rows)
+
+    def test_the_snapshot_reads_exactly_what_the_projection_answers(self):
+        for record in (
+            sweeping_record(),
+            cohort_cooldown_record(),
+            healthy_record(),
+            individual_record(),
+        ):
+            with self.subTest(state=record["state"]):
+                self._decide(record)
+
+                self.assertEqual(
+                    self.service.crypter_projection("filecrypt").snapshot,
+                    self.service.snapshot("filecrypt"),
+                )
+
+
+class MalformedProtectedRowTests(unittest.TestCase):
+    """A row no decoder can read is worth nothing and must never raise."""
+
+    def setUp(self):
+        self.clock = FakeClock(NOW)
+        self.shared_state = FakeSharedState()
+        self.protected = self.shared_state.databases["protected"]
+        self.cooldowns = self.shared_state.databases["crypter_cooldowns"]
+        self.service = CrypterCooldownService(self.shared_state, clock=self.clock)
+
+    def test_a_malformed_row_reads_as_no_defer_metadata(self):
+        for row in UNREADABLE_ROWS:
+            with self.subTest(row=row[:40]):
+                self.protected.update_store(PACKAGE_A, row)
+
+                self.assertIsNone(self.service.get_package_defer(PACKAGE_A))
+
+    def test_a_malformed_row_never_breaks_the_active_count(self):
+        self.cooldowns.update_store(
+            "filecrypt", encode_decision_record(sweeping_record())
+        )
+        for row in UNREADABLE_ROWS:
+            with self.subTest(row=row[:40]):
+                self.protected.rows.clear()
+                self.protected.update_store(PACKAGE_A, row)
+                self.protected.update_store(
+                    PACKAGE_B, json.dumps(protected_blob(deferred=generation_defer()))
+                )
+
+                self.assertEqual(1, self.service.count_active_deferred_packages())
+
+
 class CompareAndClearPackageDeferTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock(NOW)
@@ -765,7 +989,7 @@ class ClearCrypterGenerationHoldsTests(unittest.TestCase):
         self.assertEqual({"cleared": [], "rejected": []}, repeated)
         self.assertEqual(protected_blob(), json.loads(self.protected.rows[PACKAGE_A]))
 
-    def test_unreadable_rows_are_skipped_without_touching_them(self):
+    def test_unreadable_rows_are_reported_without_touching_them(self):
         self.protected.update_store(PACKAGE_A, "not-json")
         self.protected.update_store(
             PACKAGE_B, json.dumps(protected_blob(deferred={"crypter": "filecrypt"}))
@@ -776,9 +1000,28 @@ class ClearCrypterGenerationHoldsTests(unittest.TestCase):
             "filecrypt", sweep_id=SWEEP_A
         )
 
-        self.assertEqual({"cleared": [PACKAGE_C], "rejected": []}, result)
+        self.assertEqual(
+            {
+                "cleared": [PACKAGE_C],
+                "rejected": [
+                    {"package_id": PACKAGE_A, "reason": "not_deferred"},
+                    {"package_id": PACKAGE_B, "reason": "not_deferred"},
+                ],
+            },
+            result,
+        )
         self.assertEqual("not-json", self.protected.rows[PACKAGE_A])
         self.assertEqual({"crypter": "filecrypt"}, self._deferred(PACKAGE_B))
+
+    def test_packages_without_defer_metadata_are_never_reported(self):
+        self._store(PACKAGE_A)
+        self._store(PACKAGE_B, generation_defer())
+
+        result = self.service.clear_crypter_generation_holds(
+            "filecrypt", sweep_id=SWEEP_A
+        )
+
+        self.assertEqual({"cleared": [PACKAGE_B], "rejected": []}, result)
 
     def test_rows_outside_the_package_id_contract_are_rejected(self):
         self.protected.update_store(
@@ -887,6 +1130,218 @@ class ClearCrypterGenerationHoldsTests(unittest.TestCase):
         self.assertEqual(generation_defer(), self._deferred(PACKAGE_A))
 
 
+class ClearCrypterGenerationHoldsRobustnessTests(unittest.TestCase):
+    """Cohort cleanup is best-effort: no row and no failure may abort it."""
+
+    def setUp(self):
+        self.clock = FakeClock(NOW)
+        self.shared_state = FakeSharedState()
+        self.protected = self.shared_state.databases["protected"]
+        self.service = CrypterCooldownService(self.shared_state, clock=self.clock)
+
+    def _store(self, package_id, deferred=None):
+        self.protected.update_store(
+            package_id, json.dumps(protected_blob(deferred=deferred))
+        )
+
+    def _deferred(self, package_id):
+        return json.loads(self.protected.rows[package_id]).get("deferred")
+
+    def _failing_on(self, *package_ids, error=None):
+        """Make the protected mutation of these package IDs fail like storage."""
+        original = self.protected.mutate_value
+
+        def mutate_value(key, mutator):
+            if key in package_ids:
+                raise error or sqlite3.OperationalError("database is locked")
+            return original(key, mutator)
+
+        self.protected.mutate_value = mutate_value
+
+    def _clear(self):
+        return self.service.clear_crypter_generation_holds(
+            "filecrypt", sweep_id=SWEEP_A
+        )
+
+    def test_a_deeply_nested_row_is_rejected_instead_of_raising(self):
+        with self.assertRaises(RecursionError):
+            json.loads(DEEPLY_NESTED_ROW)
+        self.protected.update_store(PACKAGE_A, DEEPLY_NESTED_ROW)
+        self._store(PACKAGE_B, generation_defer())
+
+        result = self._clear()
+
+        self.assertEqual(
+            {
+                "cleared": [PACKAGE_B],
+                "rejected": [{"package_id": PACKAGE_A, "reason": "not_deferred"}],
+            },
+            result,
+        )
+        self.assertEqual(DEEPLY_NESTED_ROW, self.protected.rows[PACKAGE_A])
+
+    def test_an_oversized_integer_row_is_rejected_instead_of_raising(self):
+        with self.assertRaises(ValueError):
+            json.loads(DIGIT_OVERFLOW_ROW)
+        self.protected.update_store(PACKAGE_A, DIGIT_OVERFLOW_ROW)
+        self._store(PACKAGE_B, generation_defer())
+
+        result = self._clear()
+
+        self.assertEqual(
+            {
+                "cleared": [PACKAGE_B],
+                "rejected": [{"package_id": PACKAGE_A, "reason": "not_deferred"}],
+            },
+            result,
+        )
+        self.assertEqual(DIGIT_OVERFLOW_ROW, self.protected.rows[PACKAGE_A])
+
+    def test_every_unreadable_shape_is_reported_without_aborting(self):
+        malformed = UNREADABLE_ROWS + (
+            json.dumps(protected_blob(deferred="held")),
+            json.dumps(protected_blob(deferred={"crypter": "filecrypt"})),
+            json.dumps(protected_blob(deferred=generation_defer(sweep_id="A" * 32))),
+            json.dumps(protected_blob(deferred=generation_defer(schema_version=3))),
+        )
+
+        for row in malformed:
+            with self.subTest(row=row[:40]):
+                self.protected.rows.clear()
+                self.protected.update_store(PACKAGE_A, row)
+                self._store(PACKAGE_B, generation_defer())
+
+                result = self._clear()
+
+                self.assertEqual(
+                    {
+                        "cleared": [PACKAGE_B],
+                        "rejected": [
+                            {"package_id": PACKAGE_A, "reason": "not_deferred"}
+                        ],
+                    },
+                    result,
+                )
+                self.assertEqual(row, self.protected.rows[PACKAGE_A])
+
+    def test_an_unreadable_row_outside_the_id_contract_reports_its_shape(self):
+        self.protected.update_store("not-a-package-id", DEEPLY_NESTED_ROW)
+        self._store(PACKAGE_A, generation_defer())
+
+        result = self._clear()
+
+        self.assertEqual(
+            {
+                "cleared": [PACKAGE_A],
+                "rejected": [
+                    {"package_id": "not-a-package-id", "reason": "invalid_package_id"}
+                ],
+            },
+            result,
+        )
+
+    def test_rows_outside_the_enumerated_shape_are_ignored(self):
+        self._store(PACKAGE_A, generation_defer())
+        rows = self.protected.retrieve_all_titles()
+        self.protected.retrieve_all_titles = lambda: [
+            None,
+            "row",
+            5,
+            [PACKAGE_B],
+            [None, json.dumps(protected_blob(deferred=generation_defer()))],
+            *rows,
+        ]
+
+        self.assertEqual({"cleared": [PACKAGE_A], "rejected": []}, self._clear())
+
+    def test_a_failing_first_target_never_stops_the_later_ones(self):
+        for package_id in (PACKAGE_A, PACKAGE_B, PACKAGE_C):
+            self._store(package_id, generation_defer())
+        self._failing_on(PACKAGE_A)
+
+        result = self._clear()
+
+        self.assertEqual(
+            {
+                "cleared": [PACKAGE_B, PACKAGE_C],
+                "rejected": [{"package_id": PACKAGE_A, "reason": "storage_error"}],
+            },
+            result,
+        )
+        self.assertEqual(generation_defer(), self._deferred(PACKAGE_A))
+        self.assertIsNone(self._deferred(PACKAGE_B))
+        self.assertIsNone(self._deferred(PACKAGE_C))
+
+    def test_a_failing_middle_target_preserves_the_clear_committed_before_it(self):
+        for package_id in (PACKAGE_A, PACKAGE_B, PACKAGE_C):
+            self._store(package_id, generation_defer())
+        self._failing_on(PACKAGE_B)
+
+        result = self._clear()
+
+        self.assertEqual(
+            {
+                "cleared": [PACKAGE_A, PACKAGE_C],
+                "rejected": [{"package_id": PACKAGE_B, "reason": "storage_error"}],
+            },
+            result,
+        )
+        self.assertIsNone(self._deferred(PACKAGE_A))
+        self.assertEqual(generation_defer(), self._deferred(PACKAGE_B))
+        self.assertIsNone(self._deferred(PACKAGE_C))
+
+    def test_a_storage_failure_never_leaks_its_message(self):
+        self._store(PACKAGE_A, generation_defer())
+        self._failing_on(
+            PACKAGE_A,
+            error=sqlite3.OperationalError(
+                "database is locked: /config/secret/Quasarr.db"
+            ),
+        )
+
+        result = self._clear()
+
+        self.assertEqual(
+            {
+                "cleared": [],
+                "rejected": [{"package_id": PACKAGE_A, "reason": "storage_error"}],
+            },
+            result,
+        )
+        rendered = json.dumps(result)
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("locked", rendered)
+
+    def test_every_malformed_and_failing_result_stays_sorted(self):
+        self.protected.update_store(PACKAGE_A, DEEPLY_NESTED_ROW)
+        self._store(PACKAGE_B, generation_defer())
+        self._store(PACKAGE_C, generation_defer())
+        self._store(PACKAGE_D, generation_defer(sweep_id=SWEEP_B))
+        self._failing_on(PACKAGE_C)
+
+        result = self._clear()
+
+        self.assertEqual(
+            {
+                "cleared": [PACKAGE_B],
+                "rejected": [
+                    {"package_id": PACKAGE_A, "reason": "not_deferred"},
+                    {"package_id": PACKAGE_C, "reason": "storage_error"},
+                ],
+            },
+            result,
+        )
+
+    def test_a_base_exception_is_never_swallowed(self):
+        self._store(PACKAGE_A, generation_defer())
+        self._failing_on(PACKAGE_A, error=KeyboardInterrupt())
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._clear()
+
+        self.assertEqual(generation_defer(), self._deferred(PACKAGE_A))
+
+
 class GenerationHoldProjectionTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock(NOW)
@@ -902,20 +1357,7 @@ class GenerationHoldProjectionTests(unittest.TestCase):
         self.cooldowns.update_store("filecrypt", encode_decision_record(record))
 
     def _queue_item(self):
-        def build_service(shared_state):
-            return CrypterCooldownService(shared_state, clock=self.clock)
-
-        with (
-            patch(
-                "quasarr.downloads.packages.JDPackageCache", return_value=FakeCache()
-            ),
-            patch(
-                "quasarr.downloads.packages.get_download_category_from_package_id",
-                return_value="movies",
-            ),
-            patch("quasarr.downloads.packages.CrypterCooldownService", build_service),
-        ):
-            return get_packages(self.shared_state, auto_start=False)["queue"][0]
+        return queue_item(self.shared_state, self.clock)
 
     def test_a_hold_of_the_running_sweep_is_projected_as_active(self):
         self._decide(sweeping_record())
@@ -1116,6 +1558,53 @@ class RealDatabaseGenerationRaceTests(unittest.TestCase):
         )
         self.assertIsNone(self._deferred(PACKAGE_A))
         self.assertEqual(replacement, self._deferred(PACKAGE_B))
+
+    def test_a_failing_row_never_rolls_back_the_clears_already_committed(self):
+        for package_id in (PACKAGE_A, PACKAGE_B, PACKAGE_C):
+            self._store(package_id, generation_defer())
+        original = DataBase.mutate_value
+
+        def failing_mutate_value(database, key, mutator):
+            if key == PACKAGE_B:
+                raise sqlite3.OperationalError("database is locked")
+            return original(database, key, mutator)
+
+        with patch.object(DataBase, "mutate_value", failing_mutate_value):
+            result = self.service.clear_crypter_generation_holds(
+                "filecrypt", sweep_id=SWEEP_A
+            )
+
+        self.assertEqual(
+            {
+                "cleared": [PACKAGE_A, PACKAGE_C],
+                "rejected": [{"package_id": PACKAGE_B, "reason": "storage_error"}],
+            },
+            result,
+        )
+        self.assertIsNone(self._deferred(PACKAGE_A))
+        self.assertEqual(generation_defer(), self._deferred(PACKAGE_B))
+        self.assertIsNone(self._deferred(PACKAGE_C))
+
+    def test_a_malformed_stored_row_never_aborts_the_cleanup(self):
+        for row in (DEEPLY_NESTED_ROW, DIGIT_OVERFLOW_ROW):
+            with self.subTest(row=row[:40]):
+                self.databases["protected"].update_store(PACKAGE_A, row)
+                self._store(PACKAGE_B, generation_defer())
+
+                result = self.service.clear_crypter_generation_holds(
+                    "filecrypt", sweep_id=SWEEP_A
+                )
+
+                self.assertEqual(
+                    {
+                        "cleared": [PACKAGE_B],
+                        "rejected": [
+                            {"package_id": PACKAGE_A, "reason": "not_deferred"}
+                        ],
+                    },
+                    result,
+                )
+                self.assertEqual(row, self.databases["protected"].retrieve(PACKAGE_A))
 
 
 if __name__ == "__main__":

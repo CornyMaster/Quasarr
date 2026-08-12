@@ -5,6 +5,7 @@
 import json
 import re
 import time
+from collections import namedtuple
 
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.providers.crypter_sweeps import (
@@ -61,6 +62,11 @@ _GENERATION_DEFER_SHAPE = "generation"
 _DECISION_STATES = frozenset(
     {"available", "sweeping", "cooldown", "healthy", "individual"}
 )
+# One linkcrypter row projected both ways. Deriving the legacy-shaped snapshot
+# and the version-two decision from two separate reads lets a transition in
+# between combine a stale cooldown with a newer decision, or hide a cooldown
+# that has just started.
+CrypterProjection = namedtuple("CrypterProjection", ("snapshot", "decision"))
 
 
 def crypter_blocks_deferred(shared_state):
@@ -190,9 +196,21 @@ def _decode_package(value):
         return None
     try:
         package = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
+    except (TypeError, ValueError, RecursionError):
+        # Not every parse failure is a JSONDecodeError: an integer literal with
+        # more digits than Python converts raises a plain ValueError and a value
+        # nested past the recursion limit a RecursionError. Either one escaping
+        # here would abort the read or sweep that carries the row.
         return None
     return package if isinstance(package, dict) else None
+
+
+def _row_entry(row):
+    """The key and raw value of one enumerated storage row, or None when unusable."""
+    if not isinstance(row, (list, tuple)) or len(row) < 2:
+        return None
+    package_id = row[0]
+    return (package_id, row[1]) if isinstance(package_id, str) else None
 
 
 def decode_package_defer(package_data):
@@ -343,15 +361,16 @@ def _available_snapshot():
     }
 
 
-def _legacy_shaped_snapshot(decision, now):
+def _legacy_shaped_snapshot(projected):
     """Express a version-two decision in the snapshot shape callers read today.
 
-    Task 4 owns the transitions; until then a version-two row only has to answer
-    the existing keys, and only a real cooldown may gate a linkcrypter. A sweep
-    is the closest analogue of the legacy evidence-gathering state, while healthy
-    and individual suppress global blocking and therefore read as available.
+    `projected` is `crypter_sweeps.decision_snapshot()` of that same decision, so
+    both halves of a projection always describe one row. Task 4 owns the
+    transitions; until then a version-two row only has to answer the existing
+    keys, and only a real cooldown may gate a linkcrypter. A sweep is the closest
+    analogue of the legacy evidence-gathering state, while healthy and individual
+    suppress global blocking and therefore read as available.
     """
-    projected = decision_snapshot(decision, now=now)
     if projected["state"] == "cooldown":
         return {
             "state": "cooldown",
@@ -477,16 +496,20 @@ class CrypterCooldownService:
             record["last_seen_epoch"] = max(seen_at)
         return record
 
-    def _cleanup_snapshot(self, database, crypter, now, invalid_observed=False):
+    def _cleanup_projection(self, database, crypter, now, invalid_observed=False):
         result = {}
+        current = {"decision": None}
         invalid = {"observed": invalid_observed}
 
         def cleanup(current_value):
             decision = decode_decision_record(current_value, now=now)
             if decision is not None:
                 invalid["observed"] = False
-                result.update(_legacy_shaped_snapshot(decision, now))
+                projected = decision_snapshot(decision, now=now)
+                current["decision"] = projected
+                result.update(_legacy_shaped_snapshot(projected))
                 return current_value
+            current["decision"] = None
 
             try:
                 record = _decode_record(current_value)
@@ -511,7 +534,7 @@ class CrypterCooldownService:
         database.mutate_value(crypter, cleanup)
         if invalid["observed"]:
             self._warn_invalid_record(crypter)
-        return result
+        return CrypterProjection(result, current["decision"])
 
     def observe(self, crypter, package_id, link_fingerprint, reason_code):
         """Record one block observation and report what it changed.
@@ -619,31 +642,44 @@ class CrypterCooldownService:
             self._warn_invalid_record(crypter)
         return decision
 
-    def snapshot(self, crypter):
+    def crypter_projection(self, crypter):
+        """The legacy-shaped snapshot and the version-two decision of one row read.
+
+        Both halves come from the same raw value and the same `now`, so no row
+        transition can combine a stale cooldown snapshot with a newer decision or
+        hide a cooldown that started between two reads. A valid row is retrieved
+        exactly once and never written; only an unreadable or expired legacy row
+        takes the existing lazy cleanup transaction, which re-derives the pair
+        from the value current inside it.
+        """
         crypter = normalize_crypter_key(crypter)
         now = int(self._clock())
         database = self._shared_state.get_db("crypter_cooldowns")
         current_value = database.retrieve(crypter)
         if current_value is None:
-            return _available_snapshot()
+            return CrypterProjection(_available_snapshot(), None)
         decision = decode_decision_record(current_value, now=now)
         if decision is not None:
-            return _legacy_shaped_snapshot(decision, now)
+            projected = decision_snapshot(decision, now=now)
+            return CrypterProjection(_legacy_shaped_snapshot(projected), projected)
         try:
             record = _decode_record(current_value)
         except ValueError:
-            return self._cleanup_snapshot(database, crypter, now, invalid_observed=True)
+            return self._cleanup_projection(
+                database, crypter, now, invalid_observed=True
+            )
 
         observation_count = len(record["observations"])
         record = self._prune_record(record, now)
-        if record is None:
-            return self._cleanup_snapshot(database, crypter, now)
-        if len(record["observations"]) != observation_count:
-            return self._cleanup_snapshot(database, crypter, now)
+        if record is None or len(record["observations"]) != observation_count:
+            return self._cleanup_projection(database, crypter, now)
 
         result = dict(record)
         result["evidence_count"] = len(record["observations"])
-        return result
+        return CrypterProjection(result, None)
+
+    def snapshot(self, crypter):
+        return self.crypter_projection(crypter).snapshot
 
     def is_cooling(self, crypter):
         return self.snapshot(crypter)["state"] == "cooldown"
@@ -934,30 +970,44 @@ class CrypterCooldownService:
         ever happens inside a mutation callback, and each removal re-compares
         against the row current in its own transaction. The linkcrypter decision
         is never touched: logical invalidation always comes from the decision
-        projection, and this only drops metadata that is already dead. Results
-        are reported per package ID in ascending order.
+        projection, and this only drops metadata that is already dead.
+
+        Best-effort means no single row can end the sweep-wide cleanup. A row
+        this cannot read at all - malformed, deeply nested, or carrying an
+        integer literal Python refuses to convert - is reported as
+        `not_deferred` and left untouched, and a target whose own transaction
+        fails is reported as `storage_error` without its exception text while
+        every later target still runs and every earlier clear stays committed.
+        Results are reported per package ID in ascending order.
         """
         crypter = normalize_crypter_key(crypter)
         sweep_id = _validate_sweep_id(sweep_id)
         rows = self._shared_state.get_db("protected").retrieve_all_titles() or []
-        targets = []
+        targets = set()
+        unreadable = set()
 
         for row in rows:
-            package = _decode_package(row[1])
-            if package is None:
+            entry = _row_entry(row)
+            if entry is None:
                 continue
+            package_id, raw_value = entry
             try:
-                deferred = decode_package_defer(package)
-            except ValueError:
+                package = _decode_package(raw_value)
+                deferred = decode_package_defer(package) if package else None
+            except (TypeError, ValueError, RecursionError):
+                unreadable.add(package_id)
+                continue
+            if package is None:
+                unreadable.add(package_id)
                 continue
             if deferred is None:
                 continue
             if deferred.get("sweep_id") == sweep_id and deferred["crypter"] == crypter:
-                targets.append(row[0])
+                targets.add(package_id)
 
         cleared = []
         rejected = []
-        for package_id in sorted(targets):
+        for package_id in sorted(targets | unreadable):
             try:
                 _validate_package_id(package_id)
             except ValueError:
@@ -965,7 +1015,14 @@ class CrypterCooldownService:
                     {"package_id": package_id, "reason": "invalid_package_id"}
                 )
                 continue
-            status = self._compare_and_clear(package_id, crypter, sweep_id)
+            if package_id in unreadable:
+                rejected.append({"package_id": package_id, "reason": "not_deferred"})
+                continue
+            try:
+                status = self._compare_and_clear(package_id, crypter, sweep_id)
+            except Exception:
+                rejected.append({"package_id": package_id, "reason": "storage_error"})
+                continue
             if status == "cleared":
                 cleared.append(package_id)
             else:
@@ -1014,7 +1071,7 @@ class CrypterCooldownService:
         on, and a derived gauge can never drift or go negative.
         """
         rows = self._shared_state.get_db("protected").retrieve_all_titles() or []
-        states = {}
+        projections = {}
         active = 0
 
         for row in rows:
@@ -1029,13 +1086,12 @@ class CrypterCooldownService:
                 continue
 
             crypter = deferred["crypter"]
-            if crypter not in states:
-                states[crypter] = (
-                    self.snapshot(crypter),
-                    self.crypter_decision(crypter),
-                )
-            snapshot, decision = states[crypter]
-            if self.project_package_defer(deferred, snapshot, decision)["active"]:
+            if crypter not in projections:
+                projections[crypter] = self.crypter_projection(crypter)
+            projection = projections[crypter]
+            if self.project_package_defer(
+                deferred, projection.snapshot, projection.decision
+            )["active"]:
                 active += 1
 
         return active
