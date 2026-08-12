@@ -8,9 +8,15 @@ from functools import wraps
 
 from bottle import HTTPResponse, abort, request
 
-from quasarr.downloads import fail, submit_final_download_urls
+from quasarr.constants import PACKAGE_ID_PATTERN
+from quasarr.downloads import (
+    fail,
+    resolve_protected_crypter_key,
+    submit_final_download_urls,
+)
 from quasarr.providers import shared_state
 from quasarr.providers.auth import require_api_key
+from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 from quasarr.providers.log import info, warn
 from quasarr.providers.notifications import update_release_notification
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
@@ -20,6 +26,9 @@ from quasarr.storage.categories import (
     get_download_category_mirrors,
 )
 from quasarr.storage.config import Config
+
+CRYPTER_DEFER_CAPABILITY = "crypter_defer_v1"
+MAXIMUM_EXCLUDED_PACKAGE_IDS = 100
 
 
 def require_helper_active(func):
@@ -119,10 +128,41 @@ def prioritize_helper_supported_links(
     return supported_links + unsupported_links, supported_links
 
 
+def normalize_excluded_package_ids(package_ids):
+    if not isinstance(package_ids, (list, tuple, set)):
+        return frozenset()
+
+    normalized_ids = []
+    seen_ids = set()
+    for package_id in package_ids:
+        if (
+            not isinstance(package_id, str)
+            or not PACKAGE_ID_PATTERN.fullmatch(package_id)
+            or package_id in seen_ids
+        ):
+            continue
+        normalized_ids.append(package_id)
+        seen_ids.add(package_id)
+        if len(normalized_ids) == MAXIMUM_EXCLUDED_PACKAGE_IDS:
+            break
+    return frozenset(normalized_ids)
+
+
 def select_helper_package(
-    protected_packages, supported_url_patterns, supported_mirrors=None
+    protected_packages,
+    supported_url_patterns,
+    supported_mirrors=None,
+    cooldown_service=None,
+    excluded_package_ids=None,
 ):
+    excluded_package_ids = normalize_excluded_package_ids(excluded_package_ids)
+    cooldown_snapshots = {}
+
     for package in protected_packages:
+        package_id = package[0]
+        if package_id in excluded_package_ids:
+            continue
+
         data = json.loads(package[1])
         if "disabled" in data:
             continue
@@ -169,7 +209,52 @@ def select_helper_package(
         if (supported_url_patterns or supported_mirrors) and not supported_links:
             continue
 
-        return package[0], data, prioritized_links
+        if cooldown_service is None:
+            return package_id, data, prioritized_links
+
+        package_defer = cooldown_service.get_package_defer(package_id)
+        eligible_supported_links = []
+        probe_crypter = None
+
+        for link in supported_links:
+            crypter = resolve_protected_crypter_key(link)
+            if crypter is None:
+                eligible_supported_links.append(link)
+                continue
+
+            if crypter not in cooldown_snapshots:
+                cooldown_snapshots[crypter] = cooldown_service.snapshot(crypter)
+            snapshot = cooldown_snapshots[crypter]
+            matching_defer = (
+                package_defer
+                if package_defer and package_defer["crypter"] == crypter
+                else None
+            )
+            projected_defer = (
+                cooldown_service.project_package_defer(matching_defer, snapshot)
+                if matching_defer
+                else None
+            )
+            probe_requested = bool(matching_defer and matching_defer["probe_requested"])
+            blocked = snapshot["state"] == "cooldown" or bool(
+                projected_defer and projected_defer["active"]
+            )
+
+            if blocked and not probe_requested:
+                continue
+            if probe_requested:
+                probe_crypter = crypter
+            eligible_supported_links.append(link)
+
+        if not eligible_supported_links:
+            continue
+        if probe_crypter and not cooldown_service.consume_probe(
+            package_id, probe_crypter
+        ):
+            continue
+
+        unsupported_links = prioritized_links[len(supported_links) :]
+        return package_id, data, eligible_supported_links + unsupported_links
 
     return None
 
@@ -274,9 +359,22 @@ def setup_sponsors_helper_routes(app):
 
             # Issue #350: only hand SponsorsHelper packages where at least one URL
             # matches the helper's advertised support, and move that URL to the front.
-            selected_package = select_helper_package(
-                protected, supported_url_patterns, supported_mirrors
-            )
+            capabilities = payload.get("capabilities")
+            if (
+                isinstance(capabilities, (list, tuple, set))
+                and CRYPTER_DEFER_CAPABILITY in capabilities
+            ):
+                selected_package = select_helper_package(
+                    protected,
+                    supported_url_patterns,
+                    supported_mirrors,
+                    cooldown_service=CrypterCooldownService(shared_state),
+                    excluded_package_ids=payload.get("excluded_package_ids"),
+                )
+            else:
+                selected_package = select_helper_package(
+                    protected, supported_url_patterns, supported_mirrors
+                )
 
             if not selected_package:
                 return abort(404, "No valid packages found")
