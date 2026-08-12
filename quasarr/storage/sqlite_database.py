@@ -24,6 +24,9 @@ Locking contract:
 - `mutate_values` is the same contract for several keys at once. Every table of
     a Quasarr database lives in one file, so one transaction on one connection
     commits all of them together or none of them.
+- `retrieve_values` is the read-only half of that: one transaction holds its
+    read lock across every select, so a caller never combines rows that never
+    existed together. It creates nothing - a missing table reads as `None`.
 - `delete_exact` holds one SQLite write transaction while deleting at most one
     lowest-rowid row whose key and value both match.
 """
@@ -315,6 +318,50 @@ class DataBase(object):
             raise
 
     @with_lock(lock)
+    def retrieve_values(self, targets):
+        """Read several values of one database file as one consistent snapshot.
+
+        `targets` is a sequence of unique `(table, key)` pairs. One transaction
+        holds its read lock across every select, so no writer can commit in
+        between and a caller can never combine two rows that never existed
+        together. A missing table reads as `None` and is not created, so a
+        snapshot stays a pure read.
+        """
+        resolved = self._resolve_targets(targets, "retrieve_values")
+
+        def operation():
+            try:
+                self._conn.execute("BEGIN")
+                existing = {
+                    row[0]
+                    for row in self._conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table';"
+                    ).fetchall()
+                }
+                values = tuple(
+                    self._select_value(table, key) if table in existing else None
+                    for table, key in resolved
+                )
+                self._conn.commit()
+                return values
+            except Exception:
+                self._rollback()
+                raise
+
+        return self._with_retry(operation)
+
+    def _resolve_targets(self, targets, method):
+        resolved = []
+        for table, key in targets:
+            target = (self._validate_table_name(table), key)
+            if target in resolved:
+                raise ValueError(f"{method} targets must be unique")
+            resolved.append(target)
+        if not resolved:
+            raise ValueError(f"{method} needs at least one target")
+        return resolved
+
+    @with_lock(lock)
     def mutate_values(self, targets, mutator):
         """Atomically replace or delete several values in one transaction.
 
@@ -325,14 +372,7 @@ class DataBase(object):
         """
         if not callable(mutator):
             raise TypeError("mutator must be callable")
-        resolved = []
-        for table, key in targets:
-            target = (self._validate_table_name(table), key)
-            if target in resolved:
-                raise ValueError("mutate_values targets must be unique")
-            resolved.append(target)
-        if not resolved:
-            raise ValueError("mutate_values needs at least one target")
+        resolved = self._resolve_targets(targets, "mutate_values")
 
         for table, _key in resolved:
             self._ensure_table(table)

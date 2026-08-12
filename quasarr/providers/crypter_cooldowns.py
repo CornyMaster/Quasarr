@@ -30,7 +30,11 @@ LEGACY_CRYPTER_BLOCK_MODE = "fail"
 CRYPTER_EVENT_TABLE = "crypter_events"
 CRYPTER_EVENT_KEY = "pending"
 CRYPTER_EVENT_FIELDS = ("observations", "cooldowns", "probes")
-MAXIMUM_PENDING_CRYPTER_EVENTS = 1_000_000
+# A ledger count is a cumulative total, so it is bounded by what one row can
+# hold and round-trip, not by a plausible number of events. The ceiling stays
+# far below the interpreter's integer/string conversion limit.
+MAXIMUM_CRYPTER_EVENT_DIGITS = 1000
+MAXIMUM_CRYPTER_EVENT_COUNT = 10**MAXIMUM_CRYPTER_EVENT_DIGITS - 1
 _PACKAGE_DEFER_KEYS = frozenset(
     {
         "crypter",
@@ -208,7 +212,10 @@ def decode_pending_crypter_events(value):
         return empty, True
     try:
         decoded = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
+    except (TypeError, ValueError):
+        # An integer literal with more digits than Python converts raises a
+        # plain ValueError, so JSONDecodeError alone would let a malformed row
+        # abort the transition that carries it.
         return empty, False
     if not isinstance(decoded, dict) or set(decoded) != set(CRYPTER_EVENT_FIELDS):
         return empty, False
@@ -216,21 +223,25 @@ def decode_pending_crypter_events(value):
     counts = {}
     for field in CRYPTER_EVENT_FIELDS:
         amount = decoded[field]
-        if type(amount) is not int or not 0 <= amount <= MAXIMUM_PENDING_CRYPTER_EVENTS:
+        if type(amount) is not int or not 0 <= amount <= MAXIMUM_CRYPTER_EVENT_COUNT:
             return empty, False
         counts[field] = amount
     return counts, True
 
 
 def encode_pending_crypter_events(counts):
-    """Encode the ledger, or None once nothing is pending so the row is dropped."""
-    bounded = {
-        field: min(max(counts.get(field, 0), 0), MAXIMUM_PENDING_CRYPTER_EVENTS)
-        for field in CRYPTER_EVENT_FIELDS
-    }
-    if not any(bounded.values()):
+    """Encode the ledger, or None once nothing is pending so the row is dropped.
+
+    Counts stay exact at any size a row can hold. A count that no longer fits
+    raises, which rolls back the whole transition rather than committing a
+    silently smaller number the counters could never catch up with.
+    """
+    pending = {field: counts.get(field, 0) for field in CRYPTER_EVENT_FIELDS}
+    if any(amount > MAXIMUM_CRYPTER_EVENT_COUNT for amount in pending.values()):
+        raise OverflowError("Linkcrypter transition count is too large to store")
+    if not any(pending.values()):
         return None
-    return json.dumps(bounded, separators=(",", ":"), sort_keys=True)
+    return json.dumps(pending, separators=(",", ":"), sort_keys=True)
 
 
 def _add_pending_crypter_events(current_value, **deltas):

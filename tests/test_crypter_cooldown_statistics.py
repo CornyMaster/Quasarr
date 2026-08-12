@@ -42,6 +42,28 @@ SOLVER_KEYS = (
     "captcha_decryptions_automatic",
     "captcha_decryptions_manual",
 )
+COUNTER_KEYS = {
+    "observations": OBSERVATIONS_KEY,
+    "cooldowns": COOLDOWNS_KEY,
+    "probes": PROBES_KEY,
+}
+# The largest count one ledger row stores; anything above fails the transition.
+LEDGER_COUNT_CEILING = 10**1000 - 1
+MALFORMED_LEDGERS = (
+    "{not json",
+    "null",
+    "true",
+    "[1, 2, 3]",
+    '"pending"',
+    json.dumps({"observations": 1}),
+    json.dumps({"observations": 1, "cooldowns": 0, "probes": 0, "extra": 0}),
+    json.dumps({"observations": True, "cooldowns": 0, "probes": 0}),
+    json.dumps({"observations": -1, "cooldowns": 0, "probes": 0}),
+    json.dumps({"observations": 1.0, "cooldowns": 0, "probes": 0}),
+    json.dumps({"observations": "1", "cooldowns": 0, "probes": 0}),
+    # More digits than Python converts to int, so json.loads raises ValueError.
+    '{"observations": ' + "9" * 5000 + ', "cooldowns": 0, "probes": 0}',
+)
 
 
 def filecrypt_link(index=1):
@@ -839,6 +861,277 @@ class FlushAtomicityTests(CrypterStatisticsTestCase):
             },
             self.counters(),
         )
+
+
+class CrypterCounterSnapshotTests(CrypterStatisticsTestCase):
+    """The ledger and the three counters must be read as one consistent view."""
+
+    def flush_from_another_connection(self):
+        """Drain the ledger the way a second Quasarr process would."""
+        events = DataBase(EVENT_TABLE)
+        statistics = DataBase("statistics")
+        try:
+            raw = events.retrieve(EVENT_KEY)
+            pending = NO_EVENTS if raw is None else json.loads(raw)
+            for field, key in COUNTER_KEYS.items():
+                stored = int(statistics.retrieve(key) or 0)
+                statistics.update_store(key, str(stored + pending[field]))
+            events.delete(EVENT_KEY)
+        finally:
+            events._conn.close()
+            statistics._conn.close()
+
+    @contextmanager
+    def flushing_from_another_connection_before(self, key):
+        """Commit a competing flush right before one counter row is read."""
+        fired = {"count": 0}
+        original_retrieve = DataBase.retrieve
+
+        def retrieve(database, requested_key):
+            if (
+                database._table == "statistics"
+                and requested_key == key
+                and not fired["count"]
+            ):
+                fired["count"] += 1
+                self.flush_from_another_connection()
+            return original_retrieve(database, requested_key)
+
+        with mock.patch.object(DataBase, "retrieve", retrieve):
+            yield fired
+
+    @contextmanager
+    def flushing_from_another_connection_before_the_snapshot(self):
+        """Commit a competing flush right before the snapshot transaction."""
+        fired = {"count": 0}
+        original_retrieve_values = DataBase.retrieve_values
+
+        def retrieve_values(database, targets):
+            if not fired["count"]:
+                fired["count"] += 1
+                self.flush_from_another_connection()
+            return original_retrieve_values(database, targets)
+
+        with mock.patch.object(DataBase, "retrieve_values", retrieve_values):
+            yield fired
+
+    @contextmanager
+    def recording_single_row_reads(self):
+        reads = []
+        original_retrieve = DataBase.retrieve
+
+        def retrieve(database, key):
+            reads.append((database._table, key))
+            return original_retrieve(database, key)
+
+        with mock.patch.object(DataBase, "retrieve", retrieve):
+            yield reads
+
+    @contextmanager
+    def recording_single_row_writes(self):
+        writes = []
+        originals = {
+            name: getattr(DataBase, name) for name in UnavailableTable.WRITE_METHODS
+        }
+
+        def recorder(name, original):
+            def write(database, *args, **kwargs):
+                writes.append((database._table, name))
+                return original(database, *args, **kwargs)
+
+            return write
+
+        with mock.patch.multiple(
+            DataBase,
+            **{name: recorder(name, original) for name, original in originals.items()},
+        ):
+            yield writes
+
+    def pend_one_observation(self):
+        self.store_protected(PACKAGE_A)
+        with self.state.statistics_unavailable():
+            self.report_block(PACKAGE_A, "a")
+
+    def test_a_flush_by_another_process_can_never_be_counted_twice(self):
+        self.pend_one_observation()
+
+        with (
+            self.state.statistics_unavailable(writes_only=True),
+            self.flushing_from_another_connection_before(OBSERVATIONS_KEY),
+        ):
+            during_outage = self.stats.get_stats()
+
+        self.assertEqual(1, during_outage[OBSERVATIONS_KEY])
+        self.assertEqual(1, self.counters()[OBSERVATIONS_KEY])
+
+    def test_a_flush_committed_just_before_the_snapshot_is_counted_once(self):
+        self.pend_one_observation()
+
+        with self.flushing_from_another_connection_before_the_snapshot() as fired:
+            totals = self.counters()
+
+        self.assertEqual(1, fired["count"])
+        self.assertEqual(1, totals[OBSERVATIONS_KEY])
+        self.assertIsNone(self.ledger())
+
+    def test_the_crypter_totals_are_never_assembled_from_separate_reads(self):
+        self.pend_one_observation()
+
+        with (
+            self.state.statistics_unavailable(writes_only=True),
+            self.recording_single_row_reads() as reads,
+        ):
+            self.stats.get_stats()
+
+        separately_read = {(EVENT_TABLE, EVENT_KEY)} | {
+            ("statistics", key) for key in COUNTER_KEYS.values()
+        }
+        self.assertEqual(set(), separately_read.intersection(reads))
+
+    def test_the_flush_returns_the_totals_it_committed(self):
+        self.pend_one_observation()
+        statistics = self.state.get_db("statistics")
+
+        self.assertEqual(
+            {"observations": 1, "cooldowns": 0, "probes": 0},
+            self.stats.flush_crypter_events(),
+        )
+
+        self.assertIsNone(self.ledger())
+        self.assertEqual("1", statistics.retrieve(OBSERVATIONS_KEY))
+
+    def test_reading_totals_writes_nothing_while_the_ledger_is_empty(self):
+        with self.recording_single_row_writes() as writes:
+            self.assertEqual(0, self.counters()[OBSERVATIONS_KEY])
+
+        self.assertEqual([], writes)
+
+
+class MalformedLedgerCleanupTests(CrypterStatisticsTestCase):
+    @contextmanager
+    def replacing_the_ledger_once(self, value):
+        """Commit a valid ledger row from another connection before a cleanup."""
+        replacement = {"fired": False}
+        original_mutate_value = DataBase.mutate_value
+        original_mutate_values = DataBase.mutate_values
+
+        def replace():
+            if replacement["fired"]:
+                return
+            replacement["fired"] = True
+            writer = DataBase(EVENT_TABLE)
+            try:
+                writer.update_store(EVENT_KEY, value)
+            finally:
+                writer._conn.close()
+
+        def mutate_value(database, key, mutator):
+            if database._table == EVENT_TABLE and key == EVENT_KEY:
+                replace()
+            return original_mutate_value(database, key, mutator)
+
+        def mutate_values(database, targets, mutator):
+            if any(tuple(target) == (EVENT_TABLE, EVENT_KEY) for target in targets):
+                replace()
+            return original_mutate_values(database, targets, mutator)
+
+        with (
+            mock.patch.object(DataBase, "mutate_value", mutate_value),
+            mock.patch.object(DataBase, "mutate_values", mutate_values),
+        ):
+            yield replacement
+
+    def test_a_valid_ledger_written_during_cleanup_is_counted_not_erased(self):
+        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, "{not json")
+
+        with self.replacing_the_ledger_once(
+            json.dumps({"observations": 5, "cooldowns": 2, "probes": 1})
+        ) as replacement:
+            totals = self.counters()
+
+        self.assertTrue(replacement["fired"])
+        self.assertEqual(5, totals[OBSERVATIONS_KEY])
+        self.assertEqual(2, totals[COOLDOWNS_KEY])
+        self.assertEqual(1, totals[PROBES_KEY])
+        self.assertIsNone(self.ledger())
+        self.assertEqual(
+            "5", self.state.get_db("statistics").retrieve(OBSERVATIONS_KEY)
+        )
+
+    def test_every_malformed_ledger_form_self_heals_without_blocking_a_report(self):
+        statistics = self.state.get_db("statistics")
+
+        for malformed in MALFORMED_LEDGERS:
+            with self.subTest(ledger=malformed[:40]):
+                self.state.get_db("crypter_cooldowns").delete(CRYPTER)
+                for key in COUNTER_KEYS.values():
+                    statistics.update_store(key, "0")
+                self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, malformed)
+                self.store_protected(PACKAGE_A)
+
+                response = self.report_block(PACKAGE_A, "a")
+
+                self.assertEqual("observing", response["state"])
+                self.assertEqual(1, self.counters()[OBSERVATIONS_KEY])
+                self.assertIsNone(self.ledger())
+
+    def test_a_malformed_ledger_never_blocks_a_probe_handout(self):
+        self.enter_cooldown()
+        self.assertEqual(
+            {"requested": [PACKAGE_A], "rejected": []},
+            self.service.request_probe([PACKAGE_A]),
+        )
+        self.stats.flush_crypter_events()
+        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, MALFORMED_LEDGERS[-1])
+
+        handout = self.request_handout()
+
+        self.assertEqual(PACKAGE_A, handout["to_decrypt"]["id"])
+        self.assertEqual(1, self.counters()[PROBES_KEY])
+
+
+class LargeTransitionCountTests(CrypterStatisticsTestCase):
+    def seed_ledger(self, **counts):
+        row = json.dumps({field: counts.get(field, 0) for field in COUNTER_KEYS})
+        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, row)
+        return row
+
+    def test_pending_counts_far_above_one_million_stay_exact(self):
+        self.seed_ledger(observations=5_000_000)
+        self.store_protected(PACKAGE_A)
+        self.report_block(PACKAGE_A, "a")
+
+        self.assertEqual(5_000_001, self.counters()[OBSERVATIONS_KEY])
+        self.assertEqual(
+            "5000001", self.state.get_db("statistics").retrieve(OBSERVATIONS_KEY)
+        )
+
+    def test_a_pending_count_at_one_million_still_increments(self):
+        self.seed_ledger(observations=1_000_000)
+        self.store_protected(PACKAGE_A)
+
+        self.report_block(PACKAGE_A, "a")
+
+        self.assertEqual(1_000_001, json.loads(self.ledger())["observations"])
+        self.assertEqual(1_000_001, self.counters()[OBSERVATIONS_KEY])
+
+    def test_stored_counters_keep_accumulating_past_one_million(self):
+        stored = 10**30
+        self.state.get_db("statistics").update_store(COOLDOWNS_KEY, str(stored))
+
+        self.enter_cooldown()
+
+        self.assertEqual(stored + 1, self.counters()[COOLDOWNS_KEY])
+
+    def test_a_count_too_large_to_store_fails_the_whole_transition(self):
+        row = self.seed_ledger(observations=LEDGER_COUNT_CEILING)
+        self.store_protected(PACKAGE_A)
+
+        with self.assertRaises(HTTPError):
+            self.report_block(PACKAGE_A, "a")
+
+        self.assertEqual(row, self.ledger())
+        self.assertIsNone(self.state.get_db("crypter_cooldowns").retrieve(CRYPTER))
 
 
 if __name__ == "__main__":

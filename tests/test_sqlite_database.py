@@ -218,6 +218,110 @@ class SQLiteDatabaseTests(unittest.TestCase):
         finally:
             db._conn.close()
 
+    def test_mutate_values_rolls_back_a_row_in_a_table_it_created_on_demand(self):
+        writer = DataBase("crypter_cooldowns")
+        writer.update_store("filecrypt", "record")
+
+        def explode(_current_values):
+            raise RuntimeError("decision failed")
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "decision failed"):
+                writer.mutate_values(
+                    (("crypter_cooldowns", "filecrypt"), ("crypter_events", "pending")),
+                    explode,
+                )
+
+            self.assertEqual("record", writer.retrieve("filecrypt"))
+            created = DataBase("crypter_events")
+            try:
+                # The table is created before the transaction and survives its
+                # rollback, so the retry reuses it - but holds no row.
+                self.assertEqual(
+                    [],
+                    created._conn.execute("SELECT * FROM crypter_events").fetchall(),
+                )
+            finally:
+                created._conn.close()
+        finally:
+            writer._conn.close()
+
+    def competing_write_error(self):
+        """Write from a connection that refuses to wait for a read lock."""
+        conn = sqlite3.connect(self.dbfile, timeout=0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 0")
+            conn.execute("UPDATE statistics SET value = '999' WHERE key = 'probes'")
+            conn.commit()
+            return None
+        except sqlite3.OperationalError as error:
+            return error
+        finally:
+            conn.close()
+
+    def test_retrieve_values_reads_every_target_in_one_transaction(self):
+        events = DataBase("crypter_events")
+        statistics = DataBase("statistics")
+        events.update_store("pending", "ledger")
+        statistics.update_store("probes", "7")
+        competing = {}
+        original_select = DataBase._select_value
+
+        def select_then_race(database, table, key):
+            value = original_select(database, table, key)
+            if "error" not in competing:
+                competing["error"] = self.competing_write_error()
+            return value
+
+        try:
+            with patch.object(DataBase, "_select_value", select_then_race):
+                values = events.retrieve_values(
+                    (("crypter_events", "pending"), ("statistics", "probes"))
+                )
+
+            self.assertEqual(("ledger", "7"), values)
+            # A writer cannot commit between the two reads of one snapshot.
+            self.assertIn("locked", str(competing["error"]).lower())
+            self.assertEqual("7", statistics.retrieve("probes"))
+        finally:
+            events._conn.close()
+            statistics._conn.close()
+
+    def test_retrieve_values_reports_a_missing_table_without_creating_it(self):
+        statistics = DataBase("statistics")
+        statistics.update_store("probes", "7")
+
+        try:
+            self.assertEqual(
+                (None, "7"),
+                statistics.retrieve_values(
+                    (("crypter_events", "pending"), ("statistics", "probes"))
+                ),
+            )
+
+            tables = {
+                row[0]
+                for row in statistics._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            self.assertNotIn("crypter_events", tables)
+        finally:
+            statistics._conn.close()
+
+    def test_retrieve_values_rejects_unusable_targets(self):
+        db = DataBase("statistics")
+
+        try:
+            with self.assertRaises(ValueError):
+                db.retrieve_values(())
+            with self.assertRaises(ValueError):
+                db.retrieve_values((("statistics", "probes"), ("statistics", "probes")))
+            with self.assertRaises(ValueError):
+                db.retrieve_values((("statistics; DROP TABLE failed", "probes"),))
+        finally:
+            db._conn.close()
+
     def test_delete_exact_removes_only_one_matching_row_and_commits(self):
         writer = DataBase("failed")
         reader = DataBase("failed")
