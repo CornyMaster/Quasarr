@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Hermetic unit tests for Quasarr, built exclusively on the standard-library `unittest` framework. Covers download-link extraction, search-source behavior, search runtime instrumentation, the userscript CAPTCHA routing, mirror filtering, download orchestration, notifications, SponsorsHelper helpers, release matching, and the SQLite layer.
+Hermetic unit tests for Quasarr, built exclusively on the standard-library `unittest` framework. Covers download-link extraction, search-source behavior, search runtime instrumentation and resource-load bounds, the userscript CAPTCHA routing, mirror filtering, download orchestration, notifications, SponsorsHelper helpers, release matching, and the SQLite layer.
 
 ## Ownership
 
@@ -19,6 +19,7 @@ Hermetic unit tests for Quasarr, built exclusively on the standard-library `unit
 - There is no fixtures directory and no shared test-helpers module: each file defines its own `FakeResponse`/`FakeSession`/fake shared_state inline.
 - Run the full suite after touching shared providers, download flow, search behavior, or notification logic. Per root change discipline, tests change only when the intended behavior in the covered area changed or the existing test is incorrect.
 - `test_search_runtime.py` covers `quasarr/search/runtime.py`: it builds `SearchRuntime` with an injected clock and memory reader (never the module singleton's real ones), and asserts the snapshot key set exactly, so a counter carrying a source initial, query, or category ID fails the suite. The `/proc` reader is driven through `patch("quasarr.search.runtime.open", ...)` with in-memory file content, so no test reads a real `/proc` path or any other file.
+- `test_search_resource_load.py` is the offline Task 9 burst gate. Its single `_run_burst(config)` drives the real Newznab category planner, source eligibility, `SearchExecutor`, bounded cache, process-global singleflight shape, worker budget, and overdue callback with synthetic doubles and `.invalid` URLs; events force overlap and timeout, and every wait/join has a five-second failure bound instead of a sleep. Production defaults must yield no `_bound_violations(...)`; the permanent unbounded/no-budget/deadline-ignoring configuration must yield at least one violation and then drain during test cleanup. The test never uses network I/O, real source values, the live deployment, or `IdleMemoryReclaimer`.
 
 ## Work Guidance
 
