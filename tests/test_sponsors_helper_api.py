@@ -614,6 +614,30 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual("Deferred.Package", retained["title"])
         self.assertNotIn("deferred", retained)
 
+    def test_crypter_access_package_clear_failure_keeps_all_state_held(self):
+        state, service = self.deferred_state()
+
+        def fail_package_clear():
+            raise RuntimeError("database unavailable")
+
+        state.databases["protected"].before_mutation = fail_package_clear
+
+        with self.assertRaises(HTTPError) as context:
+            self.call_json_route(
+                "/sponsors_helper/api/crypter-access/",
+                state,
+                {
+                    "package_id": PACKAGE_A,
+                    "crypter": "filecrypt",
+                    "access": "clear",
+                },
+                service,
+            )
+
+        self.assertEqual(500, context.exception.status_code)
+        self.assertEqual("observing", service.snapshot("filecrypt")["state"])
+        self.assertIsNotNone(service.get_package_defer(PACKAGE_A))
+
     def test_crypter_access_rejects_unknown_and_unsupported_access_without_clearing(
         self,
     ):
@@ -721,8 +745,8 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual("available", service.snapshot("filecrypt")["state"])
         self.assertIsNone(service.get_package_defer(PACKAGE_A))
 
-    def test_download_success_accepts_optional_top_level_crypter(self):
-        state = AtomicSharedState({})
+    def test_download_crypter_field_cannot_clear_but_crypter_access_does(self):
+        state, service = self.deferred_state()
         state.values["helper_active"] = True
         app = Bottle()
         setup_sponsors_helper_routes(app)
@@ -731,11 +755,10 @@ class SponsorsHelperApiTests(unittest.TestCase):
             for route in app.routes
             if route.rule == "/sponsors_helper/api/download/"
         )
-        service = mock.Mock()
         statistics = mock.Mock()
         payload = {
             "name": "Successful.Package",
-            "package_id": PACKAGE_A,
+            "package_id": PACKAGE_B,
             "urls": ["https://host.invalid/file"],
             "password": "",
             "notification": {"solvers": []},
@@ -756,10 +779,6 @@ class SponsorsHelperApiTests(unittest.TestCase):
                 },
             ),
             mock.patch(
-                "quasarr.api.sponsors_helper.CrypterCooldownService",
-                return_value=service,
-            ) as cooldown_type,
-            mock.patch(
                 "quasarr.api.sponsors_helper.StatsHelper",
                 return_value=statistics,
             ),
@@ -773,65 +792,26 @@ class SponsorsHelperApiTests(unittest.TestCase):
             result,
         )
         self.assertEqual(result, legacy_result)
-        cooldown_type.assert_called_once_with(state)
-        service.record_success.assert_called_once_with("filecrypt")
+        self.assertEqual("observing", service.snapshot("filecrypt")["state"])
+        self.assertIsNotNone(service.get_package_defer(PACKAGE_A))
 
-    def test_download_success_survives_optional_crypter_clear_error(self):
-        state = AtomicSharedState({})
-        state.values["helper_active"] = True
-        app = Bottle()
-        setup_sponsors_helper_routes(app)
-        route = next(
-            route
-            for route in app.routes
-            if route.rule == "/sponsors_helper/api/download/"
+        access_result = self.call_json_route(
+            "/sponsors_helper/api/crypter-access/",
+            state,
+            {
+                "package_id": PACKAGE_A,
+                "crypter": "filecrypt",
+                "access": "clear",
+            },
+            service,
         )
-        service = mock.Mock()
-        service.record_success.side_effect = RuntimeError("database unavailable")
-
-        with (
-            mock.patch("quasarr.api.sponsors_helper.shared_state", state),
-            mock.patch(
-                "quasarr.api.sponsors_helper.request",
-                mock.Mock(
-                    json={
-                        "name": "Successful.Package",
-                        "package_id": PACKAGE_A,
-                        "urls": ["https://host.invalid/file"],
-                        "password": "",
-                        "notification": {"solvers": []},
-                        "crypter": "filecrypt",
-                    }
-                ),
-            ),
-            mock.patch(
-                "quasarr.api.sponsors_helper.submit_final_download_urls",
-                return_value={
-                    "success": True,
-                    "links": ["https://host.invalid/file"],
-                },
-            ),
-            mock.patch(
-                "quasarr.api.sponsors_helper.CrypterCooldownService",
-                return_value=service,
-            ) as cooldown_type,
-            mock.patch("quasarr.api.sponsors_helper.StatsHelper"),
-            mock.patch("quasarr.api.sponsors_helper.info") as log_info,
-        ):
-            result = route.callback()
 
         self.assertEqual(
-            "Downloaded 1 download links for Successful.Package",
-            result,
+            {"success": True, "state": "available", "cleared": True},
+            access_result,
         )
-        cooldown_type.assert_called_once_with(state)
-        service.record_success.assert_called_once_with("filecrypt")
-        self.assertTrue(
-            any(
-                "linkcrypter success" in str(call.args[0]).lower()
-                for call in log_info.call_args_list
-            )
-        )
+        self.assertEqual("available", service.snapshot("filecrypt")["state"])
+        self.assertIsNone(service.get_package_defer(PACKAGE_A))
 
     def test_to_decrypt_route_preserves_invalid_payload_status(self):
         app = Bottle()

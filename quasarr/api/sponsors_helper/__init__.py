@@ -460,8 +460,8 @@ def setup_sponsors_helper_routes(app):
 
         service = CrypterCooldownService(shared_state)
         try:
-            service.record_success(crypter)
             service.clear_package_defer(package_id)
+            service.record_success(crypter)
         except ValueError as error:
             return abort(400, str(error))
         except Exception as error:
@@ -552,7 +552,6 @@ def setup_sponsors_helper_routes(app):
             download_links = data.get("urls")
             password = data.get("password")
             notification = data.get("notification")
-            reported_crypter = data.get("crypter")
 
             if not isinstance(notification, dict):
                 return abort(400, "Missing or invalid 'notification' object")
@@ -586,13 +585,6 @@ def setup_sponsors_helper_routes(app):
                 )
                 if submit_result["success"]:
                     final_links = submit_result["links"]
-                    if reported_crypter is not None:
-                        try:
-                            CrypterCooldownService(shared_state).record_success(
-                                reported_crypter
-                            )
-                        except Exception as e:
-                            info(f"Error recording linkcrypter success: {e}")
                     StatsHelper(shared_state).increment_package_with_links(final_links)
                     StatsHelper(shared_state).increment_captcha_decryptions_automatic()
 
