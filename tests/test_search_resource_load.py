@@ -46,6 +46,7 @@ _VIOLATING_CONFIG = _BurstConfig(
     use_budget_context=False,
     deadline_ignoring_source=True,
 )
+_CACHE_PRESSURE_WRITES = MAX_CACHE_ENTRIES + 1
 
 
 class _SyntheticSource:
@@ -119,14 +120,10 @@ def _without_budget(_deadline, clock):
 
 def _bound_violations(snapshot, cache_stats) -> list[str]:
     violations = []
-    if cache_stats["max_entries"] != MAX_CACHE_ENTRIES:
-        violations.append("cache max_entries is not bounded by the production limit")
-    if cache_stats["max_releases"] != MAX_CACHE_RELEASES:
-        violations.append("cache max_releases is not bounded by the production limit")
-    if cache_stats["entry_count"] > cache_stats["max_entries"]:
-        violations.append("cache entry count exceeds its configured limit")
-    if cache_stats["release_count"] > cache_stats["max_releases"]:
-        violations.append("cache release count exceeds its configured limit")
+    if cache_stats["entry_count"] > MAX_CACHE_ENTRIES:
+        violations.append("cache entry count exceeds the production limit")
+    if cache_stats["release_count"] > MAX_CACHE_RELEASES:
+        violations.append("cache release count exceeds the production limit")
     if snapshot["budget_context_missing"]:
         violations.append("source work ran without the production budget context")
     if (
@@ -330,6 +327,8 @@ def _run_burst(config):
     setup_arr_routes(app)
     measured_snapshot = None
     overdue_drained_within_grace = False
+    source_dropped_at_drop = None
+    overdue_source_tasks_at_drop = None
     partial_key = None
     overrun_key = None
     partial_results = []
@@ -456,18 +455,21 @@ def _run_burst(config):
             with patch("quasarr.search.as_completed", force_overrun_timeout):
                 overrun_results = overrun_executor.run_all()[0]
 
+            drop_snapshot = runtime.snapshot()
+            source_dropped_at_drop = drop_snapshot["source_dropped"]
+            overdue_source_tasks_at_drop = drop_snapshot["overdue_source_tasks"]
             if config.deadline_ignoring_source:
                 overrun_grace_elapsed.set()
                 if not overrun_ignored_grace.wait(5):
                     raise AssertionError(
                         "deadline-ignoring source did not cross the grace boundary"
                     )
-                measured_snapshot = runtime.snapshot()
             else:
                 overrun_release.set()
-                overdue_drained_within_grace = runtime.overdue_drained.wait(5)
+                runtime.overdue_drained.wait(5)
                 join_new_threads()
-                measured_snapshot = runtime.snapshot()
+            overdue_drained_within_grace = runtime.overdue_drained.is_set()
+            measured_snapshot = runtime.snapshot()
         finally:
             route_release.set()
             overrun_release.set()
@@ -477,20 +479,42 @@ def _run_burst(config):
             join_new_threads()
 
         cleanup_snapshot = runtime.snapshot()
+        cleanup_new_threads = tuple(
+            sorted(
+                thread.name
+                for thread in threading.enumerate()
+                if thread.ident not in baseline_thread_ids
+                and thread is not threading.current_thread()
+            )
+        )
         if measured_snapshot is None:
             measured_snapshot = cleanup_snapshot.copy()
-        if config.deadline_ignoring_source:
-            overdue_drained_within_grace = False
 
-        cache_stats = cache.stats()
+        burst_cache_stats = cache.stats()
+        burst_cache_write_count = len(cache.writes)
+        cache_write_ttls = tuple(ttl for _, ttl in cache.writes)
         uncacheable_entries_retained = sum(
             key in cache.cache for key in (partial_key, overrun_key) if key is not None
+        )
+        pressure_release = object()
+        for index in range(_CACHE_PRESSURE_WRITES):
+            cache.set(("resource-load-pressure", index), [pressure_release], ttl=300)
+        cache_stats = cache.stats()
+        cache_stats.update(
+            {
+                "burst_entry_count": burst_cache_stats["entry_count"],
+                "burst_release_count": burst_cache_stats["release_count"],
+                "pressure_writes": len(cache.writes) - burst_cache_write_count,
+                "eviction_count": runtime.snapshot()["cache_evictions"],
+            }
         )
         measured_snapshot.update(
             {
                 "baseline_threads": baseline_threads,
                 "budget_context_missing": budget_context_missing,
                 "overdue_drained_within_grace": overdue_drained_within_grace,
+                "source_dropped_at_drop": source_dropped_at_drop,
+                "overdue_source_tasks_at_drop": overdue_source_tasks_at_drop,
                 "uncacheable_entries_retained": uncacheable_entries_retained,
                 "idle_reclaimer_enabled": runtime._idle_reclaimer is not None,
                 "planned_pairs": tuple(planned_pairs),
@@ -503,13 +527,14 @@ def _run_burst(config):
                 "overrun_results": tuple(overrun_results),
                 "responses": tuple(responses),
                 "request_failures": tuple(request_failures),
-                "cache_write_ttls": tuple(ttl for _, ttl in cache.writes),
+                "cache_write_ttls": cache_write_ttls,
                 "cleanup_active_requests": cleanup_snapshot["active_requests"],
                 "cleanup_active_source_tasks": cleanup_snapshot["active_source_tasks"],
                 "cleanup_overdue_source_tasks": cleanup_snapshot[
                     "overdue_source_tasks"
                 ],
                 "cleanup_threads": cleanup_snapshot["threads"],
+                "cleanup_new_threads": cleanup_new_threads,
             }
         )
 
@@ -521,6 +546,16 @@ class SearchResourceLoadTests(unittest.TestCase):
         snapshot, cache_stats = _run_burst(_PRODUCTION_CONFIG)
 
         self.assertEqual([], _bound_violations(snapshot, cache_stats))
+        with self.subTest("production timeout entered the drop and overdue path"):
+            self.assertEqual(1, snapshot["source_dropped_at_drop"])
+            self.assertEqual(1, snapshot["overdue_source_tasks_at_drop"])
+            self.assertTrue(snapshot["overdue_drained_within_grace"])
+        with self.subTest("production cache was pressured past its entry bound"):
+            self.assertGreater(cache_stats["pressure_writes"], MAX_CACHE_ENTRIES)
+            self.assertEqual(MAX_CACHE_ENTRIES, cache_stats["entry_count"])
+            self.assertLessEqual(cache_stats["release_count"], MAX_CACHE_RELEASES)
+            self.assertGreater(cache_stats["eviction_count"], 0)
+        self.assertEqual((), snapshot["cleanup_new_threads"])
         expected_pairs = Counter(
             (source, category)
             for _request in range(2)
@@ -546,8 +581,8 @@ class SearchResourceLoadTests(unittest.TestCase):
         self.assertEqual(4, snapshot["categories_planned"])
         self.assertEqual(2, snapshot["families_planned"])
         self.assertEqual((300, 300), snapshot["cache_write_ttls"])
-        self.assertEqual(2, cache_stats["entry_count"])
-        self.assertEqual(4, cache_stats["release_count"])
+        self.assertEqual(2, cache_stats["burst_entry_count"])
+        self.assertEqual(4, cache_stats["burst_release_count"])
         self.assertEqual(1, snapshot["source_budget_exhausted"])
         self.assertEqual(1, snapshot["source_dropped"])
         self.assertEqual((), snapshot["overrun_results"])
@@ -558,8 +593,7 @@ class SearchResourceLoadTests(unittest.TestCase):
         violations = _bound_violations(snapshot, cache_stats)
         self.assertTrue(violations)
         for expected in (
-            "cache max_entries",
-            "cache max_releases",
+            "cache entry count exceeds the production limit",
             "without the production budget context",
             "overdue source gauge",
         ):
@@ -568,6 +602,14 @@ class SearchResourceLoadTests(unittest.TestCase):
                     any(expected in violation for violation in violations),
                     violations,
                 )
+        with self.subTest("unbounded cache retained the pressure writes"):
+            self.assertGreater(cache_stats["pressure_writes"], MAX_CACHE_ENTRIES)
+            self.assertGreater(cache_stats["entry_count"], MAX_CACHE_ENTRIES)
+        with self.subTest("overdue violation came from observed runtime state"):
+            self.assertEqual(1, snapshot["source_dropped_at_drop"])
+            self.assertEqual(1, snapshot["overdue_source_tasks_at_drop"])
+            self.assertFalse(snapshot["overdue_drained_within_grace"])
+            self.assertEqual(1, snapshot["overdue_source_tasks"])
         # The violating snapshot is intentionally taken while the source is
         # held. `_run_burst` must still release it before returning so this
         # proof cannot contaminate another test or the process thread count.
@@ -577,6 +619,7 @@ class SearchResourceLoadTests(unittest.TestCase):
         self.assertLessEqual(
             snapshot["cleanup_threads"], snapshot["baseline_threads"] + 1
         )
+        self.assertEqual((), snapshot["cleanup_new_threads"])
 
 
 if __name__ == "__main__":
