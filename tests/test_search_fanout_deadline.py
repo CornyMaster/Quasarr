@@ -7,6 +7,7 @@ from unittest.mock import patch
 from quasarr.constants import SEARCH_CAT_MOVIES
 from quasarr.search import SearchCache, SearchExecutor, get_search_results
 from quasarr.search.runtime import SearchRuntime
+from quasarr.search.singleflight import SearchSingleFlight
 
 
 class FakeSource:
@@ -106,6 +107,32 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
         self.assertEqual({"A", "B"}, {r["details"]["title"] for r in results})
         self.assertIn("AA", bar)
         self.assertIn("BB", bar)
+
+    def test_distinct_sources_and_cache_categories_keep_full_coverage(self):
+        class CategorizedSource:
+            def __init__(self, initials):
+                self.initials = initials
+
+            def search(self, _state, _start_time, category):
+                return [{"details": {"title": f"{self.initials.upper()}.{category}"}}]
+
+        executor = SearchExecutor()
+        for source in (CategorizedSource("aa"), CategorizedSource("bb")):
+            for category in (2000, 2010):
+                executor.add(
+                    source,
+                    (None, 0.0, category),
+                    {},
+                    cache_category=category,
+                )
+
+        with patch("quasarr.search.search_singleflight", SearchSingleFlight()):
+            results, _, _, _ = executor.run_all()
+
+        self.assertEqual(
+            {"AA.2000", "AA.2010", "BB.2000", "BB.2010"},
+            {release["details"]["title"] for release in results},
+        )
 
     def test_a_shared_deadline_is_not_restarted_by_the_next_run(self):
         # A multi-category request runs cache-sharing categories one after

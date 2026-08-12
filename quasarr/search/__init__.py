@@ -27,6 +27,11 @@ from quasarr.providers.log import (
 from quasarr.search.cache import SearchCache as SearchCache  # explicit re-export
 from quasarr.search.cache import search_cache
 from quasarr.search.runtime import search_runtime
+from quasarr.search.singleflight import (
+    SearchSingleFlight as SearchSingleFlight,  # explicit re-export
+)
+from quasarr.search.singleflight import SharedWork as SharedWork  # explicit re-export
+from quasarr.search.singleflight import search_singleflight
 from quasarr.search.sources import get_sources
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 from quasarr.storage.categories import get_search_category_sources
@@ -338,18 +343,19 @@ def get_search_results(
 
 
 class _Completion:
-    """When a source task finished, recorded before its future is marked done.
+    """A source result and its finish time, shared through the future.
 
     `Future.add_done_callback` cannot carry this: `set_result` notifies the
     `as_completed` waiter *before* it invokes callbacks, so the collecting
     thread can reach the cache write while the timestamp is still missing.
-    Writing it inside the submitted callable's `finally` always wins that race.
+    Returning both values from the submitted callable always wins that race.
     """
 
-    __slots__ = ("at",)
+    __slots__ = ("at", "result")
 
-    def __init__(self):
-        self.at = None
+    def __init__(self, result, at):
+        self.result = result
+        self.at = at
 
 
 def _is_cacheable(future, completion, deadline):
@@ -468,27 +474,27 @@ class SearchExecutor:
                         )
                         continue
 
-                    completion = _Completion()
-
                     def run_source(
                         source_func=func,
                         task_runtime=runtime,
-                        finished=completion,
                         now=self._clock,
                     ):
-                        try:
-                            with task_runtime.source_task():
-                                return source_func()
-                        finally:
-                            finished.at = now()
+                        with task_runtime.source_task():
+                            result = source_func()
+                        return _Completion(result, now())
 
-                    future = executor.submit(run_source)
+                    shared_work = search_singleflight.submit(
+                        key, executor, run_source, deadline
+                    )
+                    future = shared_work.future
+                    if not shared_work.is_leader:
+                        runtime.record_coalesced_waiter()
                     cache_meta = (key, ttl) if use_cache else None
                     future_to_meta[future] = (
                         current_index,
                         cache_meta,
                         source_name,
-                        completion,
+                        shared_work,
                     )
                     pending_futures.append(future)
                     current_index += 1
@@ -499,9 +505,10 @@ class SearchExecutor:
 
                 def collect(future):
                     collected.add(future)
-                    index, cache_meta, source_name, completion = future_to_meta[future]
+                    index, cache_meta, source_name, shared_work = future_to_meta[future]
                     try:
-                        res = future.result()
+                        completion = future.result()
+                        res = completion.result
                         if res and len(res) > 0:
                             badge = f"<bg green><black>{source_name.upper()}</black></bg green>"
                         else:
@@ -512,16 +519,24 @@ class SearchExecutor:
 
                         results_badges[index] = badge
                         results.extend(res)
-                        if cache_meta and _is_cacheable(future, completion, deadline):
+                        if (
+                            cache_meta
+                            and _is_cacheable(future, completion, shared_work.deadline)
+                            and shared_work._claim_cache()
+                        ):
                             cache_key, cache_ttl = cache_meta
                             search_cache.set(cache_key, res, ttl=cache_ttl)
-                        runtime.record_source_outcome("completed")
+                        if shared_work.is_leader:
+                            runtime.record_source_outcome("completed")
                     except Exception as e:
-                        runtime.record_source_outcome("errored")
+                        if shared_work.is_leader:
+                            runtime.record_source_outcome("errored")
                         results_badges[index] = (
                             f"<bg red><white>{source_name.upper()}</white></bg red>"
                         )
                         get_source_logger(source_name).warn(f"Search error: {e}")
+                    finally:
+                        shared_work.waiter_done()
 
                 try:
                     for future in as_completed(
@@ -539,23 +554,28 @@ class SearchExecutor:
                             collect(future)
                             continue
 
-                        index, _, source_name, _ = future_to_meta[future]
-                        results_badges[index] = (
-                            f"<bg yellow><black>{source_name.upper()}</black></bg yellow>"
-                        )
-                        get_source_logger(source_name).warn(
-                            f"Dropped from this response after "
-                            f"{SEARCH_FANOUT_DEADLINE_SECONDS}s"
-                        )
-                        runtime.record_source_outcome("dropped")
-                        overdue_token = runtime.mark_source_overdue()
+                        *meta, shared_work = future_to_meta[future]
+                        try:
+                            index, _, source_name = meta
+                            results_badges[index] = (
+                                f"<bg yellow><black>{source_name.upper()}</black></bg yellow>"
+                            )
+                            get_source_logger(source_name).warn(
+                                f"Dropped from this response after "
+                                f"{SEARCH_FANOUT_DEADLINE_SECONDS}s"
+                            )
+                            if shared_work.is_leader:
+                                runtime.record_source_outcome("dropped")
+                                overdue_token = runtime.mark_source_overdue()
 
-                        def resolve_overdue(
-                            _future, token=overdue_token, token_owner=runtime
-                        ):
-                            token_owner.resolve_source_overdue(token)
+                                def resolve_overdue(
+                                    _, token=overdue_token, token_owner=runtime
+                                ):
+                                    token_owner.resolve_source_overdue(token)
 
-                        future.add_done_callback(resolve_overdue)
+                                future.add_done_callback(resolve_overdue)
+                        finally:
+                            shared_work.waiter_done()
 
             if results_badges or skipped_badges:
                 bar_str = f" [{' '.join(results_badges + skipped_badges)}]"
