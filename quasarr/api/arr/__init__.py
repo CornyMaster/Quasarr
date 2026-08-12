@@ -508,9 +508,7 @@ def setup_arr_routes(app):
                             elif mode in ["book", "music"]:
                                 author = getattr(request.query, "author", "")
                                 title = getattr(request.query, "title", "")
-                                search_phrase = " ".join(
-                                    filter(None, [author, title])
-                                )
+                                search_phrase = " ".join(filter(None, [author, title]))
                                 releases = run_search_for_categories(
                                     lambda category_id, request_offset, request_limit: (
                                         get_search_results(
@@ -566,7 +564,7 @@ def setup_arr_routes(app):
                                 key: runtime_after[key] for key in memory_fields
                             },
                         }
-                        info(f"Search runtime summary: {runtime_summary}")
+                        debug(f"Search runtime summary: {runtime_summary}")
 
                     # XML Generation (releases are already sliced)
                     items = ""

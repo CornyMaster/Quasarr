@@ -67,9 +67,7 @@ def read_process_memory() -> dict[str, int | None]:
     if not sys.platform.startswith("linux"):
         return readings
     readings.update(_read_proc_fields("/proc/self/status", _STATUS_FIELDS))
-    readings.update(
-        _read_proc_fields("/proc/self/smaps_rollup", _SMAPS_ROLLUP_FIELDS)
-    )
+    readings.update(_read_proc_fields("/proc/self/smaps_rollup", _SMAPS_ROLLUP_FIELDS))
     return readings
 
 

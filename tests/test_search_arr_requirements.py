@@ -158,6 +158,7 @@ class SearchArrRequirementTests(unittest.TestCase):
             patch("quasarr.api.arr.shared_state", state),
             patch("quasarr.api.arr.get_search_results", side_effect=run_search),
             patch("quasarr.api.arr.search_runtime", runtime, create=True),
+            patch("quasarr.api.arr.debug") as log_debug,
             patch("quasarr.api.arr.info") as log_info,
             patch("quasarr.search.get_sources", return_value={"aa": source}),
             patch("quasarr.search.get_search_category_sources", return_value=[]),
@@ -191,13 +192,18 @@ class SearchArrRequirementTests(unittest.TestCase):
         self.assertEqual(2, snapshot["categories_planned"])
         self.assertEqual(1, snapshot["families_planned"])
 
-        summary_calls = [
+        debug_summary_calls = [
+            call
+            for call in log_debug.call_args_list
+            if call.args and call.args[0].startswith("Search runtime summary: ")
+        ]
+        info_summary_calls = [
             call
             for call in log_info.call_args_list
             if call.args and call.args[0].startswith("Search runtime summary: ")
         ]
-        self.assertEqual(1, len(summary_calls))
-        summary = summary_calls[0].args[0]
+        self.assertEqual((1, 0), (len(debug_summary_calls), len(info_summary_calls)))
+        summary = debug_summary_calls[0].args[0]
         self.assertNotIn("tt0000012", summary)
         self.assertNotIn("2000", summary)
         self.assertNotIn("2045", summary)

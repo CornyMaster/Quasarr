@@ -47,9 +47,7 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
 
         executor = SearchExecutor(deadline=time.time() + 0.5)
         executor.add(FakeSource("fa", fast), (None, 0.0, 2000), {})
-        executor.add(
-            FakeSource("sl", slow), (None, 0.0, 2000), {}, use_cache=True
-        )
+        executor.add(FakeSource("sl", slow), (None, 0.0, 2000), {}, use_cache=True)
 
         with (
             patch("quasarr.search.search_runtime", runtime, create=True),

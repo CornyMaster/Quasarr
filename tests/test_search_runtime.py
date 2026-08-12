@@ -261,7 +261,9 @@ class SearchRuntimeTests(unittest.TestCase):
         # Only int-or-None may reach the fixed memory fields: a string or float
         # reading would put unbounded, reader-controlled text into the logs, and
         # bool is an int subclass that is never a KiB or thread count.
-        runtime = make_runtime({"rss_kib": "4096 kB", "pss_kib": 2048.5, "threads": True})
+        runtime = make_runtime(
+            {"rss_kib": "4096 kB", "pss_kib": 2048.5, "threads": True}
+        )
 
         snapshot = runtime.snapshot()
 
