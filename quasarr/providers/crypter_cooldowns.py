@@ -7,7 +7,11 @@ import re
 import time
 
 from quasarr.constants import PACKAGE_ID_PATTERN
-from quasarr.providers.crypter_sweeps import decision_snapshot, decode_decision_record
+from quasarr.providers.crypter_sweeps import (
+    SWEEP_SCHEMA_VERSION,
+    decision_snapshot,
+    decode_decision_record,
+)
 from quasarr.providers.log import warn
 
 OBSERVATION_WINDOW_SECONDS = 15 * 60
@@ -15,6 +19,7 @@ MINIMUM_COOLDOWN_HOURS = 24
 EVIDENCE_THRESHOLD = 3
 SUPPORTED_REASON_CODES = frozenset({"ip_block_suspected"})
 _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_SWEEP_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _RECORD_KEYS = {
     "state",
     "reason_code",
@@ -46,6 +51,16 @@ _PACKAGE_DEFER_KEYS = frozenset(
         "observation_holds",
     }
 )
+_PACKAGE_DEFER_V2_KEYS = _PACKAGE_DEFER_KEYS | {
+    "schema_version",
+    "sweep_id",
+    "link_fingerprint",
+}
+_LEGACY_DEFER_SHAPE = "legacy"
+_GENERATION_DEFER_SHAPE = "generation"
+_DECISION_STATES = frozenset(
+    {"available", "sweeping", "cooldown", "healthy", "individual"}
+)
 
 
 def crypter_blocks_deferred(shared_state):
@@ -74,6 +89,12 @@ def normalize_crypter_key(value):
 def validate_link_fingerprint(value):
     if not isinstance(value, str) or not _FINGERPRINT_PATTERN.fullmatch(value):
         raise ValueError("Link fingerprint must be 64 lowercase hexadecimal characters")
+    return value
+
+
+def _validate_sweep_id(value):
+    if not isinstance(value, str) or not _SWEEP_ID_PATTERN.fullmatch(value):
+        raise ValueError("Sweep ID must be 32 lowercase hexadecimal characters")
     return value
 
 
@@ -175,17 +196,26 @@ def _decode_package(value):
 
 
 def decode_package_defer(package_data):
-    """Project the deferred block out of an already-parsed protected package."""
+    """Project the deferred block out of an already-parsed protected package.
+
+    Two shapes are legal: the legacy six-key block and the version-two block,
+    which adds exactly `schema_version`, `sweep_id`, and `link_fingerprint`.
+    Both are exact key sets, so a partial, hybrid, or future shape is malformed
+    rather than silently half-understood, and no shape can carry a raw link.
+    """
     if not isinstance(package_data, dict):
         return None
     deferred = package_data.get(PACKAGE_DEFER_KEY)
     if deferred is None:
         return None
-    if not isinstance(deferred, dict) or set(deferred) != _PACKAGE_DEFER_KEYS:
+    if not isinstance(deferred, dict):
+        raise ValueError("Invalid persisted package defer metadata")
+    keys = set(deferred)
+    if keys not in (_PACKAGE_DEFER_KEYS, _PACKAGE_DEFER_V2_KEYS):
         raise ValueError("Invalid persisted package defer metadata")
     if type(deferred["probe_requested"]) is not bool:
         raise ValueError('Invalid persisted package defer field "probe_requested"')
-    return {
+    decoded = {
         "crypter": normalize_crypter_key(deferred["crypter"]),
         "reason_code": _validate_reason_code(deferred["reason_code"]),
         "since_epoch": _validate_epoch(deferred["since_epoch"], "since_epoch"),
@@ -195,6 +225,110 @@ def decode_package_defer(package_data):
         "probe_requested": deferred["probe_requested"],
         "observation_holds": _validate_observation_holds(deferred["observation_holds"]),
     }
+    if keys == _PACKAGE_DEFER_V2_KEYS:
+        version = deferred["schema_version"]
+        if type(version) is not int or version != SWEEP_SCHEMA_VERSION:
+            raise ValueError('Invalid persisted package defer field "schema_version"')
+        decoded.update(
+            {
+                "schema_version": SWEEP_SCHEMA_VERSION,
+                "sweep_id": _validate_sweep_id(deferred["sweep_id"]),
+                "link_fingerprint": validate_link_fingerprint(
+                    deferred["link_fingerprint"]
+                ),
+            }
+        )
+    return decoded
+
+
+def _defer_shape(deferred):
+    """Classify decoded or projected defer metadata, or None when unusable."""
+    if not isinstance(deferred, dict) or not _PACKAGE_DEFER_KEYS.issubset(deferred):
+        return None
+    if "schema_version" not in deferred:
+        return _LEGACY_DEFER_SHAPE
+    if not _PACKAGE_DEFER_V2_KEYS.issubset(deferred):
+        return None
+    version = deferred["schema_version"]
+    if type(version) is not int or version != SWEEP_SCHEMA_VERSION:
+        return None
+    return _GENERATION_DEFER_SHAPE
+
+
+def _epoch_or_zero(mapping, field_name):
+    value = mapping.get(field_name)
+    return value if type(value) is int and value >= 0 else 0
+
+
+def package_defer_is_active(deferred, decision_snapshot, *, now):
+    """Whether the current linkcrypter decision still authorizes a package hold.
+
+    `decision_snapshot` is `crypter_sweeps.decision_snapshot()` of the row that
+    is current right now, or `None` when the linkcrypter carries no version-two
+    decision at all. A version-two hold belongs to exactly one generation, so a
+    healthy verdict, another sweep, an expired individual decision, or a missing
+    decision invalidates it logically long before any row is physically cleaned
+    up - and a hold whose cleanup never ran can therefore never come back. A
+    legacy hold predates generations: without a version-two decision it keeps
+    its own deadline, a marked legacy cooldown extends it, and no other
+    version-two state may adopt it. Metadata or a decision this cannot read
+    proves nothing and holds nothing.
+    """
+    shape = _defer_shape(deferred)
+    if shape is None:
+        return False
+    if decision_snapshot is None:
+        state = "available"
+    elif (
+        isinstance(decision_snapshot, dict)
+        and decision_snapshot.get("state") in _DECISION_STATES
+    ):
+        state = decision_snapshot["state"]
+    else:
+        return False
+
+    if shape == _GENERATION_DEFER_SHAPE:
+        sweep_id = deferred["sweep_id"]
+        if state == "sweeping":
+            return decision_snapshot.get("sweep_id") == sweep_id
+        if state == "cooldown":
+            return (
+                decision_snapshot.get("legacy_cooldown") is not True
+                and decision_snapshot.get("sweep_id") == sweep_id
+                and now < _epoch_or_zero(decision_snapshot, "retry_after_epoch")
+            )
+        if state == "individual":
+            return (
+                decision_snapshot.get("reason_code") == "legacy_v1_hold"
+                and decision_snapshot.get("generation_id") == sweep_id
+                and now < _epoch_or_zero(decision_snapshot, "until_epoch")
+            )
+        return False
+
+    if state == "available":
+        return now < _epoch_or_zero(deferred, "retry_after_epoch")
+    if state == "cooldown" and decision_snapshot.get("legacy_cooldown") is True:
+        return now < max(
+            _epoch_or_zero(deferred, "retry_after_epoch"),
+            _epoch_or_zero(decision_snapshot, "retry_after_epoch"),
+        )
+    return False
+
+
+def package_defer_covers_fingerprint(deferred, link_fingerprint):
+    """Whether a package hold speaks for this exact link.
+
+    A version-two hold is bound to the one fingerprint that was tested, so every
+    occurrence of that link stays held while a different, never tested link in
+    the same package does not. A legacy hold predates fingerprints and covers
+    the whole package.
+    """
+    shape = _defer_shape(deferred)
+    if shape is None:
+        return False
+    if shape == _LEGACY_DEFER_SHAPE:
+        return True
+    return deferred["link_fingerprint"] == link_fingerprint
 
 
 def _available_snapshot():
@@ -572,6 +706,22 @@ class CrypterCooldownService:
                     "observation_holds": max(previous_holds, observation_holds),
                 }
             )
+            if (
+                existing
+                and existing["crypter"] == crypter
+                and "schema_version" in existing
+            ):
+                # This never mints a generation; it only refuses to strip one a
+                # stored hold already carries, which would leave that hold bound
+                # to nothing and impossible to clear by generation. A hold of a
+                # different linkcrypter never inherits it.
+                stored.update(
+                    {
+                        "schema_version": existing["schema_version"],
+                        "sweep_id": existing["sweep_id"],
+                        "link_fingerprint": existing["link_fingerprint"],
+                    }
+                )
             package[PACKAGE_DEFER_KEY] = dict(stored)
             return json.dumps(package)
 
@@ -608,6 +758,18 @@ class CrypterCooldownService:
         except ValueError:
             self._warn_invalid_package_defer(package_id)
             return None
+
+    def crypter_decision(self, crypter):
+        """The current version-two decision projection, or None for a legacy row.
+
+        Read-only, and expired decisions read as None, so a caller can only ever
+        see the decision that is authoritative right now.
+        """
+        crypter = normalize_crypter_key(crypter)
+        now = int(self._clock())
+        current_value = self._shared_state.get_db("crypter_cooldowns").retrieve(crypter)
+        decision = decode_decision_record(current_value, now=now)
+        return None if decision is None else decision_snapshot(decision, now=now)
 
     def _mutate_deferred_package(self, package_id, decide, count_events=None):
         """Run one atomic protected-row transaction gated on live defer metadata.
@@ -736,8 +898,90 @@ class CrypterCooldownService:
         )
         return "deleted" if status == "deferred" else status
 
-    def project_package_defer(self, deferred, snapshot):
-        """Merge stored package defer metadata with a live crypter snapshot."""
+    def _compare_and_clear(self, package_id, crypter, sweep_id):
+        """Drop a package hold only while it still belongs to this generation.
+
+        The comparison runs inside the clearing transaction against the value
+        that is current there, so a newer generation written meanwhile survives
+        instead of being erased by a decision taken on an earlier read.
+        """
+        cleared = {"done": False}
+
+        def clear_matching_generation(current_value, package, deferred):
+            if deferred.get("sweep_id") != sweep_id:
+                return current_value
+            if crypter is not None and deferred["crypter"] != crypter:
+                return current_value
+            package.pop(PACKAGE_DEFER_KEY)
+            cleared["done"] = True
+            return json.dumps(package)
+
+        status = self._mutate_deferred_package(package_id, clear_matching_generation)
+        if cleared["done"]:
+            return "cleared"
+        return "generation_mismatch" if status == "deferred" else status
+
+    def compare_and_clear_package_defer(self, package_id, *, sweep_id):
+        """Clear one package hold of exactly this sweep generation."""
+        package_id = _validate_package_id(package_id)
+        sweep_id = _validate_sweep_id(sweep_id)
+        return self._compare_and_clear(package_id, None, sweep_id) == "cleared"
+
+    def clear_crypter_generation_holds(self, crypter, *, sweep_id):
+        """Best-effort removal of every package hold of one sweep generation.
+
+        Rows are enumerated and validated before any mutation runs, so no scan
+        ever happens inside a mutation callback, and each removal re-compares
+        against the row current in its own transaction. The linkcrypter decision
+        is never touched: logical invalidation always comes from the decision
+        projection, and this only drops metadata that is already dead. Results
+        are reported per package ID in ascending order.
+        """
+        crypter = normalize_crypter_key(crypter)
+        sweep_id = _validate_sweep_id(sweep_id)
+        rows = self._shared_state.get_db("protected").retrieve_all_titles() or []
+        targets = []
+
+        for row in rows:
+            package = _decode_package(row[1])
+            if package is None:
+                continue
+            try:
+                deferred = decode_package_defer(package)
+            except ValueError:
+                continue
+            if deferred is None:
+                continue
+            if deferred.get("sweep_id") == sweep_id and deferred["crypter"] == crypter:
+                targets.append(row[0])
+
+        cleared = []
+        rejected = []
+        for package_id in sorted(targets):
+            try:
+                _validate_package_id(package_id)
+            except ValueError:
+                rejected.append(
+                    {"package_id": package_id, "reason": "invalid_package_id"}
+                )
+                continue
+            status = self._compare_and_clear(package_id, crypter, sweep_id)
+            if status == "cleared":
+                cleared.append(package_id)
+            else:
+                rejected.append({"package_id": package_id, "reason": status})
+
+        return {"cleared": cleared, "rejected": rejected}
+
+    def project_package_defer(self, deferred, snapshot, decision_snapshot=None):
+        """Merge stored package defer metadata with a live crypter snapshot.
+
+        The global cooldown and the package hold are combined on every read and
+        nothing is written. `decision_snapshot` is the current version-two
+        decision (or None), which is what decides whether the stored hold still
+        belongs to a live generation; the legacy fields, state, and hold type
+        stay exactly what existing callers already read.
+        """
         now = int(self._clock())
         crypter_retry_after = (
             snapshot["retry_after_epoch"] if snapshot["state"] == "cooldown" else 0
@@ -745,7 +989,7 @@ class CrypterCooldownService:
         retry_after_epoch = max(deferred["retry_after_epoch"], crypter_retry_after)
         if crypter_retry_after > now:
             hold_type = "crypter_cooldown"
-        elif retry_after_epoch > now:
+        elif package_defer_is_active(deferred, decision_snapshot, now=now):
             hold_type = "provisional"
         else:
             hold_type = "none"
@@ -770,7 +1014,7 @@ class CrypterCooldownService:
         on, and a derived gauge can never drift or go negative.
         """
         rows = self._shared_state.get_db("protected").retrieve_all_titles() or []
-        snapshots = {}
+        states = {}
         active = 0
 
         for row in rows:
@@ -785,9 +1029,13 @@ class CrypterCooldownService:
                 continue
 
             crypter = deferred["crypter"]
-            if crypter not in snapshots:
-                snapshots[crypter] = self.snapshot(crypter)
-            if self.project_package_defer(deferred, snapshots[crypter])["active"]:
+            if crypter not in states:
+                states[crypter] = (
+                    self.snapshot(crypter),
+                    self.crypter_decision(crypter),
+                )
+            snapshot, decision = states[crypter]
+            if self.project_package_defer(deferred, snapshot, decision)["active"]:
                 active += 1
 
         return active

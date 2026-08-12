@@ -75,8 +75,14 @@ def _project_package_defer(service, package_data, snapshots):
 
     crypter = deferred["crypter"]
     if crypter not in snapshots:
-        snapshots[crypter] = service.snapshot(crypter)
-    return service.project_package_defer(deferred, snapshots[crypter])
+        # The generation-bound hold needs the current decision, not just the
+        # legacy-shaped snapshot, so both are read once per crypter.
+        snapshots[crypter] = (
+            service.snapshot(crypter),
+            service.crypter_decision(crypter),
+        )
+    snapshot, decision = snapshots[crypter]
+    return service.project_package_defer(deferred, snapshot, decision)
 
 
 def get_links_comment(package, package_links):

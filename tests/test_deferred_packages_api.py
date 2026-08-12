@@ -18,6 +18,8 @@ PACKAGE_C = "Quasarr_movies_" + "c" * 32
 PACKAGE_D = "Quasarr_movies_" + "d" * 32
 SELECTOR_HOSTILE_PACKAGE_ID = PACKAGE_A + '"][data-selected="unexpected'
 RETRY_AFTER = 4_000_000_000
+SWEEP_ID = "5e" * 16
+LINK_FINGERPRINT = "7f" * 32
 
 
 def deferred_block(
@@ -29,8 +31,9 @@ def deferred_block(
     crypter="filecrypt",
     reason_code="ip_block_suspected",
     active=True,
+    generation=False,
 ):
-    return {
+    block = {
         "crypter": crypter,
         "reason_code": reason_code,
         "since_epoch": 1_700_000_000,
@@ -42,6 +45,15 @@ def deferred_block(
         "hold_type": hold_type,
         "active": active,
     }
+    if generation:
+        block.update(
+            {
+                "schema_version": 2,
+                "sweep_id": SWEEP_ID,
+                "link_fingerprint": LINK_FINGERPRINT,
+            }
+        )
+    return block
 
 
 def queue_item(package_id, title, deferred=None, storage=""):
@@ -115,7 +127,7 @@ class DeferredApiState:
         self.device_calls += 1
         raise AssertionError("deferred package commands must not access JDownloader")
 
-    def add_package(self, package_id, *, deferred):
+    def add_package(self, package_id, *, deferred, generation=False):
         package = {
             "title": f"Synthetic {package_id[-4:]}",
             "links": [],
@@ -131,6 +143,14 @@ class DeferredApiState:
                 "probe_requested": False,
                 "observation_holds": 1,
             }
+            if generation:
+                package["deferred"].update(
+                    {
+                        "schema_version": 2,
+                        "sweep_id": SWEEP_ID,
+                        "link_fingerprint": LINK_FINGERPRINT,
+                    }
+                )
         self.protected.rows[package_id] = json.dumps(package)
 
 
@@ -588,6 +608,29 @@ class DeferredPackagesRenderingTests(unittest.TestCase):
             rendered.index("⬇️ Downloading"),
         )
 
+    def test_generation_bound_cards_never_expose_the_sweep_or_link_fingerprint(self):
+        downloads = {
+            "queue": [
+                queue_item(
+                    PACKAGE_A,
+                    "[Waiting for linkcrypter retry] Generation package",
+                    deferred_block(generation=True),
+                ),
+            ],
+            "history": [],
+        }
+
+        with mock.patch.object(packages_api, "get_packages", return_value=downloads):
+            rendered = packages_api._render_packages_content()
+
+        self.assertIn("Deferred linkcrypter checks", rendered)
+        self.assertEqual(
+            1, rendered.count('class="package-card deferred-package-card"')
+        )
+        self.assertIn("Generation package", rendered)
+        self.assertNotIn(SWEEP_ID, rendered)
+        self.assertNotIn(LINK_FINGERPRINT, rendered)
+
     def test_inactive_or_unprojected_packages_use_the_normal_queue(self):
         downloads = {
             "queue": [
@@ -1030,6 +1073,55 @@ class DeferredPackagesRouteTests(unittest.TestCase):
         self.assertNotIn(PACKAGE_A, state.protected.rows)
         self.assertIn(PACKAGE_B, state.protected.rows)
         self.assertIn(PACKAGE_D, state.protected.rows)
+        self.assertEqual(0, state.device_calls)
+
+    def test_generation_bound_holds_stay_probeable_and_deletable(self):
+        state = DeferredApiState()
+        state.add_package(PACKAGE_A, deferred=True, generation=True)
+        state.add_package(PACKAGE_B, deferred=True, generation=True)
+        probe_route = route_callback(self.app, "POST", "/api/packages/deferred/probe")
+        delete_route = route_callback(self.app, "DELETE", "/api/packages/deferred")
+
+        with (
+            mock.patch.dict(state.values, {"crypter_block_mode": "defer"}),
+            mock.patch.object(packages_api, "shared_state", state),
+            mock.patch.object(
+                packages_api,
+                "request",
+                SimpleNamespace(json={"package_ids": [PACKAGE_A]}),
+            ),
+        ):
+            probe_result = probe_route()
+
+        self.assertEqual({"requested": [PACKAGE_A], "rejected": []}, probe_result)
+        self.assertEqual(
+            {
+                "crypter": "filecrypt",
+                "reason_code": "ip_block_suspected",
+                "since_epoch": 1_700_000_000,
+                "retry_after_epoch": RETRY_AFTER,
+                "probe_requested": True,
+                "observation_holds": 1,
+                "schema_version": 2,
+                "sweep_id": SWEEP_ID,
+                "link_fingerprint": LINK_FINGERPRINT,
+            },
+            json.loads(state.protected.rows[PACKAGE_A])["deferred"],
+        )
+
+        with (
+            mock.patch.object(packages_api, "shared_state", state),
+            mock.patch.object(
+                packages_api,
+                "request",
+                SimpleNamespace(json={"package_ids": [PACKAGE_B]}),
+            ),
+        ):
+            delete_result = delete_route()
+
+        self.assertEqual({"deleted": [PACKAGE_B], "rejected": []}, delete_result)
+        self.assertNotIn(PACKAGE_B, state.protected.rows)
+        self.assertIn(PACKAGE_A, state.protected.rows)
         self.assertEqual(0, state.device_calls)
 
     def test_fail_block_mode_makes_probe_inert_but_keeps_delete_working(self):

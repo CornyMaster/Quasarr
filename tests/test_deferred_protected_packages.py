@@ -361,6 +361,38 @@ class DeferredPackageMetadataTests(unittest.TestCase):
         self.assertEqual(1, cooldown["observation_holds"])
         self.assertEqual(NOW, cooldown["since_epoch"])
 
+    def test_defer_never_invents_a_generation_binding(self):
+        deferred = self.service.defer_package(
+            PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
+        )
+
+        self.assertEqual(deferred_block(), deferred)
+        self.assertEqual(deferred_block(), self._stored()["deferred"])
+
+    def test_defer_carries_an_existing_generation_binding_forward(self):
+        blob = protected_blob()
+        blob["deferred"] = deferred_block(
+            schema_version=2,
+            sweep_id="a" * 32,
+            link_fingerprint="1" * 64,
+        )
+        self.protected.update_store(PACKAGE_A, json.dumps(blob))
+
+        extended = self.service.defer_package(
+            PACKAGE_A, "filecrypt", REASON, NOW + 24 * 60 * 60, 0
+        )
+
+        self.assertEqual(
+            deferred_block(
+                retry_after_epoch=NOW + 24 * 60 * 60,
+                schema_version=2,
+                sweep_id="a" * 32,
+                link_fingerprint="1" * 64,
+            ),
+            extended,
+        )
+        self.assertEqual(extended, self._stored()["deferred"])
+
 
 class ProbeStateTests(unittest.TestCase):
     def setUp(self):
