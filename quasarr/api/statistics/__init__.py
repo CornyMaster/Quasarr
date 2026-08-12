@@ -73,6 +73,27 @@ def setup_statistics(app, shared_state):
                 </div>
             </div>
 
+            <h3>🔒 Linkcrypter Blocks</h3>
+            <div class="stats-grid compact">
+                <div class="stat-card">
+                    <h3>👁️ Block Observations</h3>
+                    <div class="stat-value">{stats["crypter_block_observations"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>⏳ Cooldowns Started</h3>
+                    <div class="stat-value">{stats["crypter_cooldowns"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>🔁 Probes Spent</h3>
+                    <div class="stat-value">{stats["crypter_probes"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>🕒 Deferred Packages</h3>
+                    <div class="stat-value">{stats["deferred_packages"]:,}</div>
+                    <div class="stat-subtitle">Currently waiting</div>
+                </div>
+            </div>
+
             <h3>🗂️ Cached Metadata</h3>
             <div class="stats-grid compact">
                 <div class="stat-card">

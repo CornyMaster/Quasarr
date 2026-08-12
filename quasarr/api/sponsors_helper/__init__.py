@@ -168,6 +168,7 @@ def select_helper_package(
     cooldown_service=None,
     excluded_package_ids=None,
     enforce_package_contract=False,
+    on_probe_consumed=None,
 ):
     """Pick the next protected package to hand out.
 
@@ -175,6 +176,9 @@ def select_helper_package(
     the cooldown service: a capable helper reports and excludes packages by
     canonical ID, so a non-canonical row it can never name must never be
     selected - in any block mode - or it starves every later package.
+
+    `on_probe_consumed` is called once per queued probe this selection actually
+    spent, so a caller can count that transition without repeating the read.
     """
     excluded_package_ids = normalize_excluded_package_ids(excluded_package_ids)
     cooldown_snapshots = {}
@@ -286,16 +290,18 @@ def select_helper_package(
 
         if not eligible_supported_links:
             continue
-        if probe_crypter and not cooldown_service.consume_probe(
-            package_id, probe_crypter
-        ):
-            eligible_supported_links = [
-                link
-                for link in eligible_supported_links
-                if link not in probe_dependent_links
-            ]
-            if not eligible_supported_links:
-                continue
+        if probe_crypter:
+            if cooldown_service.consume_probe(package_id, probe_crypter):
+                if on_probe_consumed is not None:
+                    on_probe_consumed()
+            else:
+                eligible_supported_links = [
+                    link
+                    for link in eligible_supported_links
+                    if link not in probe_dependent_links
+                ]
+                if not eligible_supported_links:
+                    continue
 
         unsupported_links = prioritized_links[len(supported_links) :]
         return package_id, data, eligible_supported_links + unsupported_links
@@ -417,6 +423,14 @@ def setup_sponsors_helper_routes(app):
                 link_fingerprint,
                 reason_code,
             )
+
+            # The evidence is persisted at this point, so both transitions are
+            # counted here even if the package can no longer be deferred below.
+            stats = StatsHelper(shared_state)
+            if decision["recorded"]:
+                stats.increment_crypter_block_observations()
+            if decision["cooldown_started"]:
+                stats.increment_crypter_cooldowns()
 
             if decision["state"] == "cooldown":
                 instruction = "cooldown"
@@ -540,6 +554,10 @@ def setup_sponsors_helper_routes(app):
                 else None
             )
             if defer_capable:
+
+                def count_spent_probe():
+                    StatsHelper(shared_state).increment_crypter_probes()
+
                 selected_package = select_helper_package(
                     protected,
                     supported_url_patterns,
@@ -547,6 +565,7 @@ def setup_sponsors_helper_routes(app):
                     cooldown_service=cooldown_service,
                     excluded_package_ids=payload.get("excluded_package_ids"),
                     enforce_package_contract=True,
+                    on_probe_consumed=count_spent_probe,
                 )
             else:
                 selected_package = select_helper_package(

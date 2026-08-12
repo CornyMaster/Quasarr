@@ -2,9 +2,15 @@
 # Quasarr
 # Project by https://github.com/rix1337
 
+import time
 from datetime import datetime
 from json import loads
 from typing import Any, Dict
+
+from quasarr.providers.crypter_cooldowns import (
+    CrypterCooldownService,
+    crypter_blocks_deferred,
+)
 
 
 class StatsHelper:
@@ -13,8 +19,9 @@ class StatsHelper:
     Uses shared_state for database access across processes.
     """
 
-    def __init__(self, shared_state):
+    def __init__(self, shared_state, clock=time.time):
         self.shared_state = shared_state
+        self._clock = clock
         self._ensure_stats_exist()
 
     def _get_db(self):
@@ -31,6 +38,9 @@ class StatsHelper:
             "failed_downloads": 0,
             "failed_decryptions_automatic": 0,
             "failed_decryptions_manual": 0,
+            "crypter_block_observations": 0,
+            "crypter_cooldowns": 0,
+            "crypter_probes": 0,
         }
 
         db = self._get_db()
@@ -52,6 +62,35 @@ class StatsHelper:
         db = self._get_db()
         current = self._get_stat(key, 0)
         db.update_store(key, str(current + count))
+
+    def _increment_transition(self, key: str):
+        """Increment one state-transition counter inside a single transaction.
+
+        Transition counters are written from concurrent request handlers, so
+        they read and write in one `mutate_value()` transaction instead of a
+        separate read and write that can lose a committed increment.
+        """
+
+        def add_one(current_value):
+            try:
+                current = int(current_value) if current_value is not None else 0
+            except (ValueError, TypeError):
+                current = 0
+            return str(current + 1)
+
+        self._get_db().mutate_value(key, add_one)
+
+    def increment_crypter_block_observations(self):
+        """Count one newly recorded linkcrypter block observation"""
+        self._increment_transition("crypter_block_observations")
+
+    def increment_crypter_cooldowns(self):
+        """Count one linkcrypter entering cooldown"""
+        self._increment_transition("crypter_cooldowns")
+
+    def increment_crypter_probes(self):
+        """Count one queued availability probe that was actually spent"""
+        self._increment_transition("crypter_probes")
 
     def increment_package_with_links(self, links):
         """Increment package downloaded and links processed for one package, or failed download if no links
@@ -207,6 +246,22 @@ class StatsHelper:
                 "xem_total_valid_cached": 0,
             }
 
+    def get_crypter_defer_stats(self) -> Dict[str, int]:
+        """
+        Get the current number of packages held by a linkcrypter block.
+
+        This is a live gauge over the protected packages, never a counter: in
+        `fail` block mode no package is held at all, and in `defer` mode holds
+        also end silently by expiry.
+        """
+        try:
+            if not crypter_blocks_deferred(self.shared_state):
+                return {"deferred_packages": 0}
+            service = CrypterCooldownService(self.shared_state, clock=self._clock)
+            return {"deferred_packages": service.count_active_deferred_packages()}
+        except Exception:
+            return {"deferred_packages": 0}
+
     def get_stats(self) -> Dict[str, Any]:
         """Get all current statistics"""
         stats = {
@@ -223,6 +278,11 @@ class StatsHelper:
                 "failed_decryptions_automatic", 0
             ),
             "failed_decryptions_manual": self._get_stat("failed_decryptions_manual", 0),
+            "crypter_block_observations": self._get_stat(
+                "crypter_block_observations", 0
+            ),
+            "crypter_cooldowns": self._get_stat("crypter_cooldowns", 0),
+            "crypter_probes": self._get_stat("crypter_probes", 0),
         }
 
         # Calculate totals and rates
@@ -288,6 +348,7 @@ class StatsHelper:
         # Add metadata cache stats
         stats.update(self.get_imdb_cache_stats())
         stats.update(self.get_xem_cache_stats())
+        stats.update(self.get_crypter_defer_stats())
         stats["metadata_total_cached"] = (
             stats["imdb_total_cached"] + stats["xem_total_cached"]
         )

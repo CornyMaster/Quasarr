@@ -130,6 +130,14 @@ class AtomicDatabase:
             items = [[key, value] for key, value in sorted(self.rows.items())]
             return items or None
 
+    def store(self, key, value):
+        with self.lock:
+            self.rows[key] = value
+            return True
+
+    def update_store(self, key, value):
+        return self.store(key, value)
+
     def mutate_value(self, key, mutator):
         with self.lock:
             if self.before_mutation is not None:
@@ -148,11 +156,12 @@ class AtomicDatabase:
 
 class AtomicSharedState:
     def __init__(self, protected_rows):
-        self.values = {}
         self.databases = {
             "protected": AtomicDatabase(protected_rows),
             "crypter_cooldowns": AtomicDatabase(),
+            "statistics": AtomicDatabase(),
         }
+        self.values = {"database": self.get_db}
 
     def get_db(self, table):
         return self.databases[table]
@@ -321,7 +330,10 @@ class SponsorsHelperApiTests(unittest.TestCase):
         deferred = service.get_package_defer(PACKAGE_A)
         self.assertEqual(1, deferred.get("observation_holds") if deferred else None)
         fail.assert_not_called()
-        stats.assert_not_called()
+        self.assertEqual(
+            ["increment_crypter_block_observations"],
+            [call[0] for call in stats.return_value.method_calls],
+        )
         notify.assert_not_called()
 
     def test_defer_third_distinct_observation_returns_exact_cooldown(self):
@@ -550,7 +562,12 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual(404, context.exception.status_code)
         self.assertEqual("observing", service.snapshot("filecrypt")["state"])
         fail.assert_not_called()
-        stats.assert_not_called()
+        # The evidence survives the rejected package, so its observation counts
+        # while no failure statistic is touched.
+        self.assertEqual(
+            ["increment_crypter_block_observations"],
+            [call[0] for call in stats.return_value.method_calls],
+        )
         notify.assert_not_called()
 
     def test_defer_database_error_retains_package_without_failed_side_effects(self):
@@ -567,6 +584,8 @@ class SponsorsHelperApiTests(unittest.TestCase):
             "state": "observing",
             "evidence_count": 1,
             "package_retry_after_epoch": NOW + 900,
+            "recorded": True,
+            "cooldown_started": False,
         }
         service.defer_package.side_effect = RuntimeError("database unavailable")
 
@@ -593,7 +612,10 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual(500, context.exception.status_code)
         self.assertEqual(original, state.databases["protected"].rows[PACKAGE_A])
         fail.assert_not_called()
-        stats.assert_not_called()
+        self.assertEqual(
+            ["increment_crypter_block_observations"],
+            [call[0] for call in stats.return_value.method_calls],
+        )
         notify.assert_not_called()
 
     def test_crypter_access_clear_returns_exact_response_and_clears_all_state(self):

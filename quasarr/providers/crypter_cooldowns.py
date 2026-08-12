@@ -267,6 +267,12 @@ class CrypterCooldownService:
         return result
 
     def observe(self, crypter, package_id, link_fingerprint, reason_code):
+        """Record one block observation and report what it changed.
+
+        `recorded` and `cooldown_started` are decided inside the same
+        transaction that writes the record, so a caller counting semantic
+        transitions never has to re-derive them from a later read.
+        """
         crypter = normalize_crypter_key(crypter)
         package_id = _validate_package_id(package_id)
         link_fingerprint = validate_link_fingerprint(link_fingerprint)
@@ -283,6 +289,7 @@ class CrypterCooldownService:
                 invalid_record["found"] = True
                 record = None
             record = self._prune_record(record, now)
+            previous_state = record["state"] if record is not None else "available"
             if record is None:
                 record = {
                     "state": "observing",
@@ -338,6 +345,9 @@ class CrypterCooldownService:
                     "state": record["state"],
                     "evidence_count": evidence_count,
                     "package_retry_after_epoch": package_retry_after,
+                    "recorded": duplicate is None,
+                    "cooldown_started": previous_state != "cooldown"
+                    and record["state"] == "cooldown",
                 }
             )
             return _encode_record(record)
@@ -594,3 +604,33 @@ class CrypterCooldownService:
             }
         )
         return projected
+
+    def count_active_deferred_packages(self):
+        """Current number of protected packages under an active linkcrypter hold.
+
+        Derived from the protected rows on every read instead of maintained as a
+        counter: holds also end by lazy expiry, which has no event to decrement
+        on, and a derived gauge can never drift or go negative.
+        """
+        rows = self._shared_state.get_db("protected").retrieve_all_titles() or []
+        snapshots = {}
+        active = 0
+
+        for row in rows:
+            package = _decode_package(row[1])
+            if package is None:
+                continue
+            try:
+                deferred = decode_package_defer(package)
+            except ValueError:
+                continue
+            if not deferred:
+                continue
+
+            crypter = deferred["crypter"]
+            if crypter not in snapshots:
+                snapshots[crypter] = self.snapshot(crypter)
+            if self.project_package_defer(deferred, snapshots[crypter])["active"]:
+                active += 1
+
+        return active
