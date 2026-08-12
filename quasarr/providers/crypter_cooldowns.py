@@ -212,10 +212,11 @@ def decode_pending_crypter_events(value):
         return empty, True
     try:
         decoded = json.loads(value)
-    except (TypeError, ValueError):
-        # An integer literal with more digits than Python converts raises a
-        # plain ValueError, so JSONDecodeError alone would let a malformed row
-        # abort the transition that carries it.
+    except (TypeError, ValueError, RecursionError):
+        # Not every parse failure is a JSONDecodeError: an integer literal with
+        # more digits than Python converts raises a plain ValueError, and a
+        # value nested past the recursion limit raises RecursionError. Either
+        # one escaping here would abort the transition that carries the row.
         return empty, False
     if not isinstance(decoded, dict) or set(decoded) != set(CRYPTER_EVENT_FIELDS):
         return empty, False

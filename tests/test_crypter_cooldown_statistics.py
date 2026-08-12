@@ -12,7 +12,10 @@ from bottle import Bottle, HTTPError
 
 from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
 from quasarr.providers import shared_state as provider_shared_state
-from quasarr.providers.crypter_cooldowns import CrypterCooldownService
+from quasarr.providers.crypter_cooldowns import (
+    CrypterCooldownService,
+    decode_pending_crypter_events,
+)
 from quasarr.providers.notifications.helpers.common import build_solved_data
 from quasarr.providers.statistics import StatsHelper
 from quasarr.storage.sqlite_database import DataBase
@@ -49,6 +52,15 @@ COUNTER_KEYS = {
 }
 # The largest count one ledger row stores; anything above fails the transition.
 LEDGER_COUNT_CEILING = 10**1000 - 1
+# More digits than Python converts to int, so json.loads raises ValueError.
+DIGIT_OVERFLOW_LEDGER = (
+    '{"observations": ' + "9" * 5000 + ', "cooldowns": 0, "probes": 0}'
+)
+# Nested far past any recursion limit, built by repetition so the fixture never
+# recurses itself. json.loads raises RecursionError, which is neither a
+# TypeError nor a ValueError.
+NESTING_DEPTH = 100_000
+DEEPLY_NESTED_LEDGER = "[" * NESTING_DEPTH + "]" * NESTING_DEPTH
 MALFORMED_LEDGERS = (
     "{not json",
     "null",
@@ -61,8 +73,8 @@ MALFORMED_LEDGERS = (
     json.dumps({"observations": -1, "cooldowns": 0, "probes": 0}),
     json.dumps({"observations": 1.0, "cooldowns": 0, "probes": 0}),
     json.dumps({"observations": "1", "cooldowns": 0, "probes": 0}),
-    # More digits than Python converts to int, so json.loads raises ValueError.
-    '{"observations": ' + "9" * 5000 + ', "cooldowns": 0, "probes": 0}',
+    DIGIT_OVERFLOW_LEDGER,
+    DEEPLY_NESTED_LEDGER,
 )
 
 
@@ -1082,12 +1094,58 @@ class MalformedLedgerCleanupTests(CrypterStatisticsTestCase):
             self.service.request_probe([PACKAGE_A]),
         )
         self.stats.flush_crypter_events()
-        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, MALFORMED_LEDGERS[-1])
+        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, DIGIT_OVERFLOW_LEDGER)
 
         handout = self.request_handout()
 
         self.assertEqual(PACKAGE_A, handout["to_decrypt"]["id"])
         self.assertEqual(1, self.counters()[PROBES_KEY])
+
+    def test_a_deeply_nested_ledger_row_reads_as_unreadable_instead_of_raising(self):
+        """json.loads answers deep nesting with RecursionError, not ValueError.
+
+        Pinning the fixture itself keeps the case honest: if a future
+        interpreter reported this as a JSONDecodeError, this assertion - not a
+        silently weaker self-heal test - is what would fail.
+        """
+        with self.assertRaises(RecursionError):
+            json.loads(DEEPLY_NESTED_LEDGER)
+
+        self.assertEqual(
+            (NO_EVENTS, False), decode_pending_crypter_events(DEEPLY_NESTED_LEDGER)
+        )
+
+    def test_a_deeply_nested_ledger_never_blocks_a_probe_handout(self):
+        self.enter_cooldown()
+        self.assertEqual(
+            {"requested": [PACKAGE_A], "rejected": []},
+            self.service.request_probe([PACKAGE_A]),
+        )
+        self.stats.flush_crypter_events()
+        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, DEEPLY_NESTED_LEDGER)
+
+        handout = self.request_handout()
+
+        self.assertEqual(PACKAGE_A, handout["to_decrypt"]["id"])
+        self.assertEqual(1, self.counters()[PROBES_KEY])
+        self.assertIsNone(self.ledger())
+
+    def test_a_valid_ledger_written_during_a_nested_cleanup_is_counted_not_erased(self):
+        self.state.get_db(EVENT_TABLE).update_store(EVENT_KEY, DEEPLY_NESTED_LEDGER)
+
+        with self.replacing_the_ledger_once(
+            json.dumps({"observations": 4, "cooldowns": 3, "probes": 2})
+        ) as replacement:
+            totals = self.counters()
+
+        self.assertTrue(replacement["fired"])
+        self.assertEqual(4, totals[OBSERVATIONS_KEY])
+        self.assertEqual(3, totals[COOLDOWNS_KEY])
+        self.assertEqual(2, totals[PROBES_KEY])
+        self.assertIsNone(self.ledger())
+        self.assertEqual(
+            "4", self.state.get_db("statistics").retrieve(OBSERVATIONS_KEY)
+        )
 
 
 class LargeTransitionCountTests(CrypterStatisticsTestCase):
