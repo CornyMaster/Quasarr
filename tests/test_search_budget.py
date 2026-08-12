@@ -118,15 +118,16 @@ class SearchBudgetTests(unittest.TestCase):
         with use_search_budget(102.5, clock=clock):
             self.assertEqual(2.5, clamp_timeout(15))
 
-    def test_clamp_timeout_never_drops_below_the_minimum(self):
-        # A timeout of zero means "wait forever" to requests, so a spent
-        # budget still hands out the floor rather than an unbounded call.
-        clock = FakeClock(160.0)
+    def test_clamp_timeout_keeps_a_floor_the_request_can_still_afford(self):
+        # A timeout of zero would fail the call outright, so a call site that
+        # asks for less than the floor is raised to it - but only out of time
+        # the request actually still owns.
+        clock = FakeClock(100.0)
 
         with use_search_budget(160.0, clock=clock) as budget:
-            self.assertEqual(0.1, clamp_timeout(15))
-            self.assertEqual(0.5, clamp_timeout(15, minimum_seconds=0.5))
-            self.assertTrue(budget.exhausted)
+            self.assertEqual(0.1, clamp_timeout(0.05))
+            self.assertEqual(0.5, clamp_timeout(0.05, minimum_seconds=0.5))
+            self.assertFalse(budget.exhausted)
 
     def test_clamp_timeout_without_a_budget_returns_the_call_site_value(self):
         # Slow mode rebinds the timeout constants at runtime, so the helper
@@ -151,6 +152,93 @@ class SearchBudgetTests(unittest.TestCase):
             with self.assertRaises(SearchBudgetExhausted):
                 checkpoint()
             self.assertTrue(budget.exhausted)
+
+
+def budget_with(seconds_left):
+    """A budget with an exact amount of time left.
+
+    The clock reads zero, so `deadline - now` is the deadline itself: a 50 ms
+    boundary stays 50 ms instead of drifting to 0.050000000000011 in binary
+    floating point, and the assertions below can be exact.
+    """
+    return use_search_budget(seconds_left, clock=lambda: 0.0)
+
+
+class ClampedTimeoutBoundaryTests(unittest.TestCase):
+    """A clamped timeout can never outlive the deadline it is clamped to.
+
+    `requests` has no timeout meaning "do not start", so once the deadline is
+    gone the only honest answer is the `SearchBudgetExhausted` a checkpoint
+    already raises. That makes the request-boundary pair Tasks 6 and 7 write -
+    `checkpoint(); timeout = clamp_timeout(...)` - fail the same way whichever
+    half notices first.
+    """
+
+    def test_a_call_that_still_fits_keeps_its_own_timeout(self):
+        with budget_with(30.0):
+            self.assertEqual(15, clamp_timeout(15))
+
+    def test_a_call_longer_than_the_rest_of_the_request_is_shortened(self):
+        with budget_with(2.5):
+            self.assertEqual(2.5, clamp_timeout(15))
+
+    def test_exactly_the_floor_is_handed_out_whole(self):
+        with budget_with(0.1) as budget:
+            self.assertEqual(0.1, clamp_timeout(15))
+            self.assertFalse(budget.exhausted)
+
+    def test_less_than_the_floor_hands_out_only_what_is_left(self):
+        # 50 ms left used to be rounded up to the 100 ms floor, buying the
+        # call another 50 ms this request no longer owned.
+        with budget_with(0.05) as budget:
+            self.assertEqual(0.05, clamp_timeout(15))
+            self.assertFalse(budget.exhausted)
+
+    def test_a_raised_floor_cannot_borrow_time_either(self):
+        with budget_with(0.05):
+            self.assertEqual(0.05, clamp_timeout(15, minimum_seconds=0.5))
+
+    def test_no_time_left_refuses_the_call_instead_of_flooring_it(self):
+        with budget_with(0.0) as budget:
+            with self.assertRaises(SearchBudgetExhausted):
+                clamp_timeout(15)
+
+            self.assertTrue(budget.exhausted)
+
+    def test_a_passed_deadline_refuses_the_call(self):
+        with use_search_budget(160.0, clock=lambda: 200.0) as budget:
+            with self.assertRaises(SearchBudgetExhausted):
+                clamp_timeout(15)
+
+            self.assertTrue(budget.exhausted)
+
+    def test_the_request_boundary_pattern_stops_between_its_two_halves(self):
+        # The deadline can pass between the checkpoint and the clamp, so the
+        # clamp has to refuse as well - otherwise the checkpoint's guarantee
+        # ends on the line after it.
+        clock = FakeClock(159.9)
+        timeouts = []
+
+        with use_search_budget(160.0, clock=clock):
+            checkpoint()
+            clock.now = 160.0
+            with self.assertRaises(SearchBudgetExhausted):
+                timeouts.append(clamp_timeout(15))
+
+        self.assertEqual([], timeouts)
+
+    def test_a_source_that_runs_out_mid_call_is_answered_with_but_uncached(self):
+        # The executor already turns this exception into a partial outcome, so
+        # a source may let the clamp raise instead of catching it.
+        clock = FakeClock(100.0)
+
+        with use_search_budget(160.0, clock=clock) as budget:
+            self.assertEqual(15, clamp_timeout(15))
+            clock.now = 160.0
+            with self.assertRaises(SearchBudgetExhausted):
+                clamp_timeout(15)
+
+        self.assertTrue(budget.exhausted)
 
 
 class SearchBudgetContextTests(unittest.TestCase):

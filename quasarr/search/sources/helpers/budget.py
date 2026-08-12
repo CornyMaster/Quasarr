@@ -50,7 +50,21 @@ class SearchBudget:
         return remaining
 
     def clamp(self, default_seconds: float, minimum_seconds: float = 0.1) -> float:
-        return max(minimum_seconds, min(default_seconds, self.remaining()))
+        """The call site's own timeout, capped by the time actually left.
+
+        `requests` has no timeout that means "do not start", so a spent budget
+        cannot be answered with a number: the floor would buy the call time
+        this request no longer owns, and the response is already due. Refusing
+        the same way `checkpoint()` does is the only answer that keeps the
+        deadline absolute.
+        """
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise SearchBudgetExhausted("Search budget spent")
+        if remaining < minimum_seconds:
+            # Still a useful timeout, just never a longer one than is left.
+            return remaining
+        return max(minimum_seconds, min(default_seconds, remaining))
 
     def checkpoint(self) -> None:
         if self.remaining() <= 0:
@@ -96,6 +110,11 @@ def clamp_timeout(default_seconds: float, minimum_seconds: float = 0.1) -> float
     timeout constants at runtime, so a value captured at import time would keep
     serving the standard timeout after a user turned slow mode on. With no
     active budget the call site's value is returned unchanged.
+
+    The returned timeout never exceeds the time that is left, and no time left
+    raises `SearchBudgetExhausted` instead of returning the floor - so the
+    `checkpoint(); timeout = clamp_timeout(...)` pair a source writes before a
+    request fails identically whichever half notices the deadline first.
     """
     budget = _active_budget.get()
     if budget is None:
