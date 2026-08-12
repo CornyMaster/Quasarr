@@ -49,7 +49,7 @@ def _validate_package_id(value):
 
 
 def _validate_reason_code(value):
-    if value not in SUPPORTED_REASON_CODES:
+    if not isinstance(value, str) or value not in SUPPORTED_REASON_CODES:
         raise ValueError(f'Unsupported linkcrypter reason code "{value}"')
     return value
 
@@ -69,7 +69,10 @@ def _decode_record(value):
         raise ValueError("Invalid persisted linkcrypter JSON") from error
     if not isinstance(record, dict) or not _RECORD_KEYS.issubset(record):
         raise ValueError("Invalid persisted linkcrypter record")
-    if record["state"] not in {"observing", "cooldown"}:
+    if not isinstance(record["state"], str) or record["state"] not in {
+        "observing",
+        "cooldown",
+    }:
         raise ValueError("Invalid persisted linkcrypter state")
     _validate_reason_code(record["reason_code"])
     for field_name in (
@@ -257,7 +260,10 @@ class CrypterCooldownService:
             else:
                 record["state"] = "observing"
                 record["retry_after_epoch"] = 0
-                package_retry_after = now + OBSERVATION_WINDOW_SECONDS
+                observed_at = (
+                    duplicate["seen_at_epoch"] if duplicate is not None else now
+                )
+                package_retry_after = observed_at + OBSERVATION_WINDOW_SECONDS
 
             decision.update(
                 {

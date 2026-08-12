@@ -236,6 +236,36 @@ class CrypterCooldownServiceTests(unittest.TestCase):
             ),
         )
 
+    def test_duplicate_keeps_original_provisional_retry_deadline(self):
+        first = self._observe(PACKAGE_A, "a")
+        first_seen = self.clock.now
+        self.clock.now += 899
+
+        duplicate = self._observe(PACKAGE_A, "b")
+        distinct = self._observe(PACKAGE_B, "b")
+
+        self.assertEqual(
+            first["package_retry_after_epoch"],
+            duplicate["package_retry_after_epoch"],
+        )
+        self.assertEqual(
+            self.clock.now + 15 * 60,
+            distinct["package_retry_after_epoch"],
+        )
+        stored = json.loads(
+            self.shared_state.databases["crypter_cooldowns"].rows["filecrypt"]
+        )
+        self.assertEqual(
+            {
+                PACKAGE_A: first_seen,
+                PACKAGE_B: self.clock.now,
+            },
+            {
+                item["package_id"]: item["seen_at_epoch"]
+                for item in stored["observations"]
+            },
+        )
+
     def test_duplicate_cannot_extend_evidence_beyond_fixed_window(self):
         self._observe(PACKAGE_A, "a")
         self.clock.now += 899
@@ -447,6 +477,98 @@ class CrypterCooldownServiceTests(unittest.TestCase):
                 warning_text = str(warning.call_args)
                 self.assertIn("filecrypt", warning_text)
                 self.assertNotIn(raw_record, warning_text)
+
+    def test_malformed_required_field_types_self_heal_for_all_service_apis(self):
+        database = self.shared_state.databases["crypter_cooldowns"]
+        valid_record = {
+            "state": "observing",
+            "reason_code": REASON,
+            "first_seen_epoch": self.clock.now,
+            "last_seen_epoch": self.clock.now,
+            "retry_after_epoch": 0,
+            "observations": [
+                {
+                    "package_id": PACKAGE_A,
+                    "link_fingerprint": "a" * 64,
+                    "seen_at_epoch": self.clock.now,
+                }
+            ],
+            "future_metadata": "sensitive-marker",
+        }
+        malformed_rows = []
+        for field_name, invalid_value in (
+            ("state", []),
+            ("reason_code", []),
+            ("first_seen_epoch", "not-an-integer"),
+            ("last_seen_epoch", "not-an-integer"),
+            ("retry_after_epoch", "not-an-integer"),
+            ("observations", {}),
+        ):
+            record = json.loads(json.dumps(valid_record))
+            record[field_name] = invalid_value
+            malformed_rows.append((field_name, json.dumps(record)))
+        for field_name, invalid_value in (
+            ("package_id", []),
+            ("link_fingerprint", {}),
+            ("seen_at_epoch", "not-an-integer"),
+        ):
+            record = json.loads(json.dumps(valid_record))
+            record["observations"][0][field_name] = invalid_value
+            malformed_rows.append((f"observation.{field_name}", json.dumps(record)))
+
+        service_calls = (
+            (
+                "snapshot",
+                lambda: self.service.snapshot("filecrypt")["state"],
+                "available",
+                False,
+            ),
+            (
+                "is_cooling",
+                lambda: self.service.is_cooling("filecrypt"),
+                False,
+                False,
+            ),
+            (
+                "retry_after",
+                lambda: self.service.retry_after("filecrypt"),
+                0,
+                False,
+            ),
+            (
+                "observe",
+                lambda: self._observe(PACKAGE_B, "b")["state"],
+                "observing",
+                True,
+            ),
+        )
+
+        for field_name, raw_record in malformed_rows:
+            for api_name, call, expected, row_survives in service_calls:
+                with self.subTest(field=field_name, api=api_name):
+                    database.rows["filecrypt"] = raw_record
+                    database.mutation_count = 0
+
+                    with patch(
+                        "quasarr.providers.crypter_cooldowns.warn", create=True
+                    ) as warning:
+                        result = call()
+
+                    self.assertEqual(expected, result)
+                    self.assertEqual(row_survives, "filecrypt" in database.rows)
+                    self.assertEqual(1, database.mutation_count)
+                    warning.assert_called_once()
+                    warning_text = str(warning.call_args)
+                    self.assertIn("filecrypt", warning_text)
+                    self.assertNotIn(raw_record, warning_text)
+                    self.assertNotIn("sensitive-marker", warning_text)
+
+                    if not row_survives:
+                        recovered = self._observe(PACKAGE_B, "b")
+                        self.assertEqual("observing", recovered["state"])
+                    snapshot = self.service.snapshot("filecrypt")
+                    self.assertEqual("observing", snapshot["state"])
+                    self.assertEqual(1, snapshot["evidence_count"])
 
     def test_observation_replaces_invalid_row_and_logs_sanitized_warning(self):
         database = self.shared_state.databases["crypter_cooldowns"]
