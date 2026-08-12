@@ -12,11 +12,13 @@ from quasarr.downloads.packages import get_packages
 from quasarr.providers import shared_state as provider_shared_state
 from quasarr.providers.crypter_cooldowns import (
     CrypterCooldownService,
+    _write_generation_hold,
     decode_package_defer,
     package_defer_covers_fingerprint,
     package_defer_is_active,
 )
 from quasarr.providers.crypter_sweeps import (
+    MAXIMUM_COHORT_SIZE,
     SWEEP_WINDOW_SECONDS,
     decision_snapshot,
     encode_decision_record,
@@ -220,7 +222,7 @@ def generation_defer(**overrides):
         {
             "schema_version": 2,
             "sweep_id": SWEEP_A,
-            "link_fingerprint": FINGERPRINT_ONE,
+            "link_fingerprints": [FINGERPRINT_ONE],
         }
     )
     block.update(overrides)
@@ -249,6 +251,26 @@ def blocked_member(index, instruction="hold"):
     }
 
 
+def accepted_offer(index, instruction="hold", **overrides):
+    entry = {
+        "offer_id": offer_id(index),
+        "link_fingerprint": fingerprint(index),
+        "mode": "sweep",
+        "state": "sweeping",
+        "instruction": instruction,
+        "accepted": "",
+        "cleared": False,
+        "hold_type": "provisional",
+        "evidence_count": index,
+        "retry_after_epoch": NOW + SWEEP_WINDOW_SECONDS,
+        "sweep_tested": index,
+        "sweep_total": 5,
+        "sweep_deadline_epoch": NOW + SWEEP_WINDOW_SECONDS,
+    }
+    entry.update(overrides)
+    return entry
+
+
 def sweeping_record(sweep_id=SWEEP_A, opened_epoch=NOW):
     return {
         "schema_version": 2,
@@ -258,21 +280,39 @@ def sweeping_record(sweep_id=SWEEP_A, opened_epoch=NOW):
         "opened_epoch": opened_epoch,
         "deadline_epoch": opened_epoch + SWEEP_WINDOW_SECONDS,
         "members": [pending_member(1), pending_member(2)],
+        "accepted_offers": [],
+        "used_offer_ids": [],
     }
 
 
 def cohort_cooldown_record(sweep_id=SWEEP_A, retry_after_epoch=NOW + COOLDOWN_SECONDS):
+    opened_epoch = NOW - 200
     members = [blocked_member(index) for index in range(1, 5)]
     members.append(blocked_member(5, instruction="cooldown"))
+    accepted = [accepted_offer(index) for index in range(1, 5)]
+    accepted.append(
+        accepted_offer(
+            5,
+            instruction="cooldown",
+            state="cooldown",
+            hold_type="crypter_cooldown",
+            evidence_count=5,
+            retry_after_epoch=retry_after_epoch,
+        )
+    )
     return {
         "schema_version": 2,
         "state": "cooldown",
         "reason_code": REASON,
         "sweep_id": sweep_id,
+        "opened_epoch": opened_epoch,
+        "deadline_epoch": opened_epoch + SWEEP_WINDOW_SECONDS,
         "members": members,
         "cohort_size": len(members),
         "retry_after_epoch": retry_after_epoch,
         "live_offer": None,
+        "accepted_offers": accepted,
+        "used_offer_ids": sorted(offer_id(index) for index in range(1, 6)),
     }
 
 
@@ -295,6 +335,8 @@ def healthy_record(sweep_id=SWEEP_A, until_epoch=NOW + SWEEP_WINDOW_SECONDS):
         "until_epoch": until_epoch,
         "retest_members": [],
         "live_offer": None,
+        "accepted_offers": [],
+        "used_offer_ids": [],
     }
 
 
@@ -302,6 +344,7 @@ def individual_record(
     reason="legacy_v1_hold",
     generation_id=SWEEP_A,
     until_epoch=NOW + PROVISIONAL_WINDOW,
+    hold_fingerprints=(),
 ):
     return {
         "schema_version": 2,
@@ -310,6 +353,9 @@ def individual_record(
         "generation_id": generation_id,
         "until_epoch": until_epoch,
         "live_offer": None,
+        "hold_fingerprints": list(hold_fingerprints),
+        "accepted_offers": [],
+        "used_offer_ids": [],
     }
 
 
@@ -348,7 +394,7 @@ class GenerationDeferSchemaTests(unittest.TestCase):
                 "observation_holds": 1,
                 "schema_version": 2,
                 "sweep_id": SWEEP_A,
-                "link_fingerprint": FINGERPRINT_ONE,
+                "link_fingerprints": [FINGERPRINT_ONE],
             },
             decoded,
         )
@@ -382,6 +428,17 @@ class GenerationDeferSchemaTests(unittest.TestCase):
                         {"deferred": generation_defer(schema_version=version)}
                     )
 
+    def test_the_transient_singular_v2_shape_fails_closed(self):
+        singular = generation_defer()
+        singular["link_fingerprint"] = singular.pop("link_fingerprints")[0]
+
+        with self.assertRaises(ValueError):
+            decode_package_defer({"deferred": singular})
+        self.assertFalse(
+            package_defer_is_active(singular, snapshot_of(sweeping_record()), now=NOW)
+        )
+        self.assertFalse(package_defer_covers_fingerprint(singular, FINGERPRINT_ONE))
+
     def test_sweep_id_must_be_exactly_thirty_two_lowercase_hex_characters(self):
         for sweep_id in (
             "A" * 32,
@@ -399,19 +456,76 @@ class GenerationDeferSchemaTests(unittest.TestCase):
                         {"deferred": generation_defer(sweep_id=sweep_id)}
                     )
 
-    def test_link_fingerprint_must_be_exactly_sixty_four_lowercase_hex_characters(self):
-        for value in ("A" * 64, "0" * 63, "0" * 65, "z" * 64, "", None, 1):
-            with self.subTest(link_fingerprint=value):
+    def test_link_fingerprints_are_an_exact_sorted_unique_collection(self):
+        rejected = (
+            FINGERPRINT_ONE,
+            [],
+            ["A" * 64],
+            ["0" * 63],
+            ["0" * 65],
+            ["z" * 64],
+            [""],
+            [None],
+            [1],
+            [FINGERPRINT_ONE, FINGERPRINT_ONE],
+            [FINGERPRINT_TWO, FINGERPRINT_ONE],
+            [fingerprint(index) for index in range(1, MAXIMUM_COHORT_SIZE + 2)],
+        )
+        for value in rejected:
+            with self.subTest(link_fingerprints=repr(value)[:40]):
                 with self.assertRaises(ValueError):
                     decode_package_defer(
-                        {"deferred": generation_defer(link_fingerprint=value)}
+                        {"deferred": generation_defer(link_fingerprints=value)}
                     )
+
+        accepted = decode_package_defer(
+            {
+                "deferred": generation_defer(
+                    link_fingerprints=[FINGERPRINT_ONE, FINGERPRINT_TWO]
+                )
+            }
+        )
+        self.assertEqual(
+            [FINGERPRINT_ONE, FINGERPRINT_TWO], accepted["link_fingerprints"]
+        )
+        self.assertIsNotNone(
+            decode_package_defer(
+                {
+                    "deferred": generation_defer(
+                        link_fingerprints=[
+                            fingerprint(index)
+                            for index in range(1, MAXIMUM_COHORT_SIZE + 1)
+                        ]
+                    )
+                }
+            )
+        )
 
     def test_a_hold_never_stores_a_raw_link(self):
         encoded = json.dumps(generation_defer())
 
         self.assertNotIn("http", encoded)
         self.assertNotIn("://", encoded)
+
+    def test_the_writer_fails_closed_before_adding_a_101st_fingerprint(self):
+        deferred = generation_defer(
+            link_fingerprints=[
+                fingerprint(index) for index in range(1, MAXIMUM_COHORT_SIZE + 1)
+            ]
+        )
+        current = json.dumps(protected_blob(deferred=deferred))
+
+        with self.assertRaises(OverflowError):
+            _write_generation_hold(
+                current,
+                NOW,
+                crypter="filecrypt",
+                reason_code=REASON,
+                sweep_id=SWEEP_A,
+                link_fingerprint=fingerprint(MAXIMUM_COHORT_SIZE + 1),
+                retry_after_epoch=NOW + PROVISIONAL_WINDOW,
+                observation_holds=1,
+            )
 
 
 class PackageDeferActivationTests(unittest.TestCase):
@@ -561,11 +675,20 @@ class PackageDeferActivationTests(unittest.TestCase):
 
 
 class PackageDeferFingerprintTests(unittest.TestCase):
-    def test_a_generation_hold_speaks_only_for_its_own_fingerprint(self):
+    def test_a_generation_hold_speaks_only_for_its_own_fingerprints(self):
         deferred = generation_defer()
 
         self.assertTrue(package_defer_covers_fingerprint(deferred, FINGERPRINT_ONE))
         self.assertFalse(package_defer_covers_fingerprint(deferred, FINGERPRINT_TWO))
+
+    def test_a_hold_covers_every_blocked_fingerprint_it_collected(self):
+        deferred = generation_defer(
+            link_fingerprints=[FINGERPRINT_ONE, FINGERPRINT_TWO]
+        )
+
+        self.assertTrue(package_defer_covers_fingerprint(deferred, FINGERPRINT_ONE))
+        self.assertTrue(package_defer_covers_fingerprint(deferred, FINGERPRINT_TWO))
+        self.assertFalse(package_defer_covers_fingerprint(deferred, fingerprint(3)))
 
     def test_every_occurrence_of_the_held_fingerprint_stays_covered(self):
         deferred = generation_defer()
@@ -932,6 +1055,41 @@ class CompareAndClearPackageDeferTests(unittest.TestCase):
             self.service.compare_and_clear_package_defer(PACKAGE_A, sweep_id=SWEEP_A)
         )
         self.assertEqual(replacement, self._stored()["deferred"])
+
+    def test_releasing_one_fingerprint_leaves_the_other_hold_standing(self):
+        both = generation_defer(link_fingerprints=[FINGERPRINT_ONE, FINGERPRINT_TWO])
+        self.protected.update_store(
+            PACKAGE_A, json.dumps(protected_blob(deferred=both))
+        )
+
+        self.assertTrue(
+            self.service.compare_and_clear_package_defer(
+                PACKAGE_A, sweep_id=SWEEP_A, link_fingerprint=FINGERPRINT_ONE
+            )
+        )
+
+        self.assertEqual(
+            generation_defer(link_fingerprints=[FINGERPRINT_TWO]),
+            self._stored()["deferred"],
+        )
+
+    def test_releasing_the_last_fingerprint_removes_the_whole_block(self):
+        self.assertTrue(
+            self.service.compare_and_clear_package_defer(
+                PACKAGE_A, sweep_id=SWEEP_A, link_fingerprint=FINGERPRINT_ONE
+            )
+        )
+
+        self.assertEqual(protected_blob(), self._stored())
+
+    def test_releasing_an_unheld_fingerprint_changes_nothing(self):
+        self.assertFalse(
+            self.service.compare_and_clear_package_defer(
+                PACKAGE_A, sweep_id=SWEEP_A, link_fingerprint=FINGERPRINT_TWO
+            )
+        )
+
+        self.assertEqual(generation_defer(), self._stored()["deferred"])
 
 
 class ClearCrypterGenerationHoldsTests(unittest.TestCase):

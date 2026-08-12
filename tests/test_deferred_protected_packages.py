@@ -374,7 +374,7 @@ class DeferredPackageMetadataTests(unittest.TestCase):
         blob["deferred"] = deferred_block(
             schema_version=2,
             sweep_id="a" * 32,
-            link_fingerprint="1" * 64,
+            link_fingerprints=["1" * 64],
         )
         self.protected.update_store(PACKAGE_A, json.dumps(blob))
 
@@ -387,7 +387,7 @@ class DeferredPackageMetadataTests(unittest.TestCase):
                 retry_after_epoch=NOW + 24 * 60 * 60,
                 schema_version=2,
                 sweep_id="a" * 32,
-                link_fingerprint="1" * 64,
+                link_fingerprints=["1" * 64],
             ),
             extended,
         )

@@ -18,11 +18,14 @@ from quasarr.providers.crypter_cooldowns import (
     CRYPTER_EVENT_TABLE,
     CrypterCooldownService,
     decode_package_defer,
+    package_defer_covers_fingerprint,
     package_defer_is_active,
 )
 from quasarr.providers.crypter_sweeps import (
     HEALTHY_SUPPRESSION_SECONDS,
     MAXIMUM_COHORT_SIZE,
+    MAXIMUM_GENERATION_OFFER_IDS,
+    MAXIMUM_OFFER_ID_ATTEMPTS,
     MINIMUM_CONCLUSIVE_COHORT_SIZE,
     OFFER_LEASE_SECONDS,
     SWEEP_WINDOW_SECONDS,
@@ -107,13 +110,17 @@ def cohort_inventory(size, *, start=1, oversized=False):
     )
 
 
-def member(index, result="pending", *, tested=0, offer=None, instruction=""):
+def member(
+    index, result="pending", *, tested=0, offer=None, instruction="", expires=None
+):
     return {
         "link_fingerprint": fingerprint(index),
         "result": result,
         "tested_epoch": tested,
         "offer_id": "" if offer is None else offer,
-        "offer_expires_epoch": 0 if offer is None else tested or NOW,
+        "offer_expires_epoch": 0
+        if offer is None
+        else ((tested or NOW) + OFFER_LEASE_SECONDS if expires is None else expires),
         "response_instruction": instruction,
     }
 
@@ -128,40 +135,110 @@ def blocked_member(index, *, tested=NOW, offer=None, instruction="hold"):
     )
 
 
-def sweeping_record(size=5, *, sweep_id=SWEEP_ID, opened=NOW, members=None):
-    return {
+def accepted_offer(index, **overrides):
+    entry = {
+        "offer_id": offer_id(index),
+        "link_fingerprint": fingerprint(index),
+        "mode": "sweep",
+        "state": "sweeping",
+        "instruction": "hold",
+        "accepted": "",
+        "cleared": False,
+        "hold_type": "provisional",
+        "evidence_count": index,
+        "retry_after_epoch": DEADLINE,
+        "sweep_tested": index,
+        "sweep_total": 5,
+        "sweep_deadline_epoch": DEADLINE,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def generation_ids(members=(), accepted=(), live_offer=None, extra=()):
+    """Every offer ID one generation minted, ascending and unique."""
+    identifiers = {entry["offer_id"] for entry in members if entry["offer_id"]}
+    identifiers.update(entry["offer_id"] for entry in accepted)
+    identifiers.update(extra)
+    if live_offer is not None:
+        identifiers.add(live_offer["offer_id"])
+    return sorted(identifiers)
+
+
+def accepted_for(members):
+    """The replay history a fully reported cohort leaves behind."""
+    return [
+        accepted_offer(
+            index + 1,
+            instruction=entry["response_instruction"],
+            sweep_tested=index + 1,
+            sweep_total=len(members),
+            **(
+                {
+                    "state": "cooldown",
+                    "hold_type": "crypter_cooldown",
+                    "evidence_count": len(members),
+                    "retry_after_epoch": NOW + COOLDOWN_SECONDS,
+                }
+                if entry["response_instruction"] == "cooldown"
+                else {}
+            ),
+        )
+        for index, entry in enumerate(members)
+        if entry["result"] == "blocked"
+    ]
+
+
+def sweeping_record(size=5, *, sweep_id=SWEEP_ID, opened=NOW, members=None, **extra):
+    members = (
+        [member(index) for index in range(1, size + 1)] if members is None else members
+    )
+    accepted = extra.pop("accepted_offers", [])
+    record = {
         "schema_version": 2,
         "state": "sweeping",
         "reason_code": REASON,
         "sweep_id": sweep_id,
         "opened_epoch": opened,
         "deadline_epoch": opened + SWEEP_WINDOW_SECONDS,
-        "members": [member(index) for index in range(1, size + 1)]
-        if members is None
-        else members,
+        "members": members,
+        "accepted_offers": accepted,
+        "used_offer_ids": generation_ids(members, accepted),
     }
+    record.update(extra)
+    return record
 
 
-def cohort_cooldown_record(size=5, *, sweep_id=SWEEP_ID, retry_after=None):
+def cohort_cooldown_record(
+    size=5, *, sweep_id=SWEEP_ID, retry_after=None, opened=NOW, live_offer=None
+):
     members = [
         blocked_member(index, instruction="cooldown" if index == size else "hold")
         for index in range(1, size + 1)
     ]
+    accepted = accepted_for(members)
     return {
         "schema_version": 2,
         "state": "cooldown",
         "reason_code": REASON,
         "sweep_id": sweep_id,
+        "opened_epoch": opened,
+        "deadline_epoch": opened + SWEEP_WINDOW_SECONDS,
         "members": members,
         "cohort_size": size,
         "retry_after_epoch": NOW + COOLDOWN_SECONDS
         if retry_after is None
         else retry_after,
-        "live_offer": None,
+        "live_offer": live_offer,
+        "accepted_offers": accepted,
+        "used_offer_ids": generation_ids(members, accepted, live_offer),
     }
 
 
-def healthy_record(*, sweep_id=SWEEP_ID, until=None, retest=(), live_offer=None):
+def healthy_record(
+    *, sweep_id=SWEEP_ID, until=None, retest=(), live_offer=None, accepted=()
+):
+    accepted = list(accepted)
     return {
         "schema_version": 2,
         "state": "healthy",
@@ -169,12 +246,21 @@ def healthy_record(*, sweep_id=SWEEP_ID, until=None, retest=(), live_offer=None)
         "until_epoch": NOW + HEALTHY_SUPPRESSION_SECONDS if until is None else until,
         "retest_members": list(retest),
         "live_offer": live_offer,
+        "accepted_offers": accepted,
+        "used_offer_ids": generation_ids((), accepted, live_offer),
     }
 
 
 def individual_record(
-    reason="sweep_inconclusive", *, generation=SWEEP_ID, until=None, live_offer=None
+    reason="sweep_inconclusive",
+    *,
+    generation=SWEEP_ID,
+    until=None,
+    live_offer=None,
+    holds=(),
+    accepted=(),
 ):
+    accepted = list(accepted)
     return {
         "schema_version": 2,
         "state": "individual",
@@ -182,6 +268,9 @@ def individual_record(
         "generation_id": generation,
         "until_epoch": NOW + SWEEP_WINDOW_SECONDS if until is None else until,
         "live_offer": live_offer,
+        "hold_fingerprints": list(holds),
+        "accepted_offers": accepted,
+        "used_offer_ids": generation_ids((), accepted, live_offer),
     }
 
 
@@ -435,13 +524,15 @@ class LeaseOfferTests(unittest.TestCase):
 
     def test_offer_ids_must_stay_unique_inside_one_generation(self):
         record = sweeping_record(3)
-        record, _first = self.lease(record)
+        record, first = self.lease(record)
         colliding = SequentialIds(start=900)
 
-        with self.assertRaisesRegex(ValueError, "unique"):
-            lease_next_offer(
-                record, None, now=NOW, offer_id_factory=colliding, mode="sweep"
-            )
+        record, second = lease_next_offer(
+            record, None, now=NOW, offer_id_factory=colliding, mode="sweep"
+        )
+
+        self.assertNotEqual(first.offer_id, second.offer_id)
+        self.assertEqual([first.offer_id, second.offer_id], record["used_offer_ids"])
 
     def test_healthy_leases_retest_members_in_order(self):
         record = healthy_record(retest=[fingerprint(2), fingerprint(7)])
@@ -522,20 +613,28 @@ class RecordBlockedTests(unittest.TestCase):
             record, offer, inventory, now=now, cooldown_seconds=COOLDOWN_SECONDS
         )
 
-    def offered_cohort(self, size, *, blocked_upto=0, now=NOW):
+    def offered_cohort(self, size, *, blocked_upto=0, now=NOW, leased_at=None):
         """A sweep whose first `blocked_upto` members already reported blocked."""
+        leased_at = now if leased_at is None else leased_at
         members = []
         for index in range(1, size + 1):
             if index <= blocked_upto:
                 members.append(blocked_member(index, tested=now))
             elif index == blocked_upto + 1:
                 members.append(
-                    member(index, "offered", tested=0, offer=offer_id(index))
+                    member(
+                        index,
+                        "offered",
+                        tested=0,
+                        offer=offer_id(index),
+                        expires=leased_at + OFFER_LEASE_SECONDS,
+                    )
                 )
-                members[-1]["offer_expires_epoch"] = now + OFFER_LEASE_SECONDS
             else:
                 members.append(member(index))
-        return sweeping_record(size, members=members)
+        return sweeping_record(
+            size, members=members, accepted_offers=accepted_for(members)
+        )
 
     def test_a_pending_cohort_answers_hold_and_counts_one_observation(self):
         record = self.offered_cohort(5)
@@ -578,6 +677,16 @@ class RecordBlockedTests(unittest.TestCase):
         self.assertEqual(
             updated, decode_decision_record(encode_decision_record(updated), now=NOW)
         )
+
+    def test_evidence_outside_the_generation_window_cannot_start_cooldown(self):
+        record = self.offered_cohort(5, blocked_upto=4, now=NOW - 1)
+
+        updated, decision = self.blocked(record, report(5), cohort_inventory(5))
+
+        self.assertEqual("individual", updated["state"])
+        self.assertEqual("sweep_inconclusive", updated["reason"])
+        self.assertEqual("legacy_failure", decision["instruction"])
+        self.assertEqual(0, decision["events"]["cooldowns"])
 
     def test_cohort_sizes_below_the_conclusive_minimum_never_cool_down(self):
         for size in (2, 3, 4):
@@ -645,10 +754,12 @@ class RecordBlockedTests(unittest.TestCase):
         for offset, instruction, state in (
             (-1, "cooldown", "cooldown"),
             (0, "cooldown", "cooldown"),
-            (1, "legacy_failure", "individual"),
+            (1, "stale", "individual"),
         ):
             with self.subTest(offset=offset):
-                record = self.offered_cohort(5, blocked_upto=4)
+                record = self.offered_cohort(
+                    5, blocked_upto=4, leased_at=DEADLINE + offset
+                )
 
                 updated, decision = self.blocked(
                     record, report(5), cohort_inventory(5), now=DEADLINE + offset
@@ -686,16 +797,16 @@ class RecordBlockedTests(unittest.TestCase):
         self.assertEqual(first["retry_after_epoch"], second["retry_after_epoch"])
         self.assertEqual(NO_EVENTS, second["events"])
 
-    def test_a_duplicate_hold_report_during_cooldown_answers_the_cooldown(self):
+    def test_a_duplicate_hold_report_during_cooldown_replays_the_accepted_hold(self):
         record = cohort_cooldown_record()
 
         replayed, decision = self.blocked(record, report(1), cohort_inventory(5))
 
         self.assertEqual(record, replayed)
         self.assertEqual("hold", decision["instruction"])
-        self.assertEqual("cooldown", decision["state"])
-        self.assertEqual("crypter_cooldown", decision["hold_type"])
-        self.assertEqual(NOW + COOLDOWN_SECONDS, decision["retry_after_epoch"])
+        self.assertEqual("sweeping", decision["state"])
+        self.assertEqual("provisional", decision["hold_type"])
+        self.assertEqual(DEADLINE, decision["retry_after_epoch"])
         self.assertEqual(NO_EVENTS, decision["events"])
 
     def test_stale_generations_and_superseded_offers_never_mutate(self):
@@ -756,8 +867,13 @@ class RecordBlockedTests(unittest.TestCase):
                 self.assertEqual("none", decision["hold_type"])
                 self.assertEqual(0, decision["retry_after_epoch"])
                 self.assertEqual(NO_EVENTS, decision["events"])
+                self.assertIsNone(
+                    updated["live_offer"],
+                    "an accepted lease is released, not left occupying the slot",
+                )
                 self.assertEqual(
-                    "legacy_failure", updated["live_offer"]["response_instruction"]
+                    [offer_id(1)],
+                    [entry["offer_id"] for entry in updated["accepted_offers"]],
                 )
 
     def test_a_retest_block_drops_that_fingerprint_from_the_queue(self):
@@ -771,9 +887,9 @@ class RecordBlockedTests(unittest.TestCase):
         self.assertEqual([fingerprint(4)], updated["retest_members"])
         self.assertEqual("legacy_failure", decision["instruction"])
 
-    def test_a_late_member_report_after_conclusion_is_legacy_failure_not_stale(self):
-        # The concluded sweep keeps its generation ID, so the helper's delayed
-        # report is recognised rather than rejected as another generation.
+    def test_an_unaccepted_member_report_after_conclusion_is_stale(self):
+        # The concluded sweep keeps its generation ID for accepted replays, but
+        # an offer that was never accepted is no longer a live lease.
         concluded = individual_record(
             "sweep_expired", until=DEADLINE + SWEEP_WINDOW_SECONDS
         )
@@ -783,7 +899,7 @@ class RecordBlockedTests(unittest.TestCase):
         )
 
         self.assertEqual(concluded, unchanged)
-        self.assertEqual("legacy_failure", decision["instruction"])
+        self.assertEqual("stale", decision["instruction"])
         self.assertEqual(NO_EVENTS, decision["events"])
 
     def test_an_untested_member_that_left_the_inventory_ends_the_sweep(self):
@@ -827,17 +943,8 @@ class RecordBlockedTests(unittest.TestCase):
         updated, decision = self.blocked(record, report(5), None)
 
         self.assertEqual("individual", updated["state"])
-        self.assertEqual("sweep_inconclusive", updated["reason"])
+        self.assertEqual("inventory_unavailable", updated["reason"])
         self.assertEqual(5, decision["sweep_total"])
-        self.assertEqual(0, decision["events"]["cooldowns"])
-
-    def test_an_inventory_read_failure_still_holds_the_reporting_package(self):
-        record = self.offered_cohort(5)
-
-        updated, decision = self.blocked(record, report(1), None)
-
-        self.assertEqual("hold", decision["instruction"])
-        self.assertEqual("sweeping", updated["state"])
         self.assertEqual(0, decision["events"]["cooldowns"])
 
     def test_an_oversized_inventory_does_not_disturb_a_frozen_cohort(self):
@@ -848,6 +955,114 @@ class RecordBlockedTests(unittest.TestCase):
         )
 
         self.assertEqual("cooldown", updated["state"])
+
+
+class InventoryOutageTests(unittest.TestCase):
+    """An inventory read failure taints its generation permanently."""
+
+    def blocked(self, record, offer, inventory=None, *, now=NOW):
+        return record_blocked(
+            record, offer, inventory, now=now, cooldown_seconds=COOLDOWN_SECONDS
+        )
+
+    def cohort(self, blocked_upto):
+        members = []
+        for index in range(1, 6):
+            if index <= blocked_upto:
+                members.append(blocked_member(index))
+            elif index == blocked_upto + 1:
+                members.append(member(index, "offered", offer=offer_id(index)))
+            else:
+                members.append(member(index))
+        return sweeping_record(
+            5, members=members, accepted_offers=accepted_for(members)
+        )
+
+    def test_an_outage_at_any_position_ends_the_generation_fail_closed(self):
+        for position in (0, 2, 4):
+            with self.subTest(position=position):
+                record = self.cohort(position)
+
+                updated, decision = self.blocked(record, report(position + 1), None)
+
+                self.assertEqual("individual", updated["state"])
+                self.assertEqual("inventory_unavailable", updated["reason"])
+                self.assertEqual(SWEEP_ID, updated["generation_id"])
+                self.assertEqual(
+                    [fingerprint(position + 1)],
+                    updated["hold_fingerprints"],
+                    "only the reporting fingerprint keeps a hold",
+                )
+                self.assertEqual(NOW + SWEEP_WINDOW_SECONDS, updated["until_epoch"])
+                self.assertEqual("hold", decision["instruction"])
+                self.assertEqual("individual", decision["state"])
+                self.assertEqual("provisional", decision["hold_type"])
+                self.assertEqual(
+                    NOW + SWEEP_WINDOW_SECONDS, decision["retry_after_epoch"]
+                )
+                self.assertEqual(5, decision["sweep_total"])
+                self.assertEqual(0, decision["events"]["cooldowns"])
+                self.assertEqual(1, decision["events"]["observations"])
+
+    def test_a_recovered_inventory_can_never_resume_or_cool_the_generation(self):
+        record = self.cohort(4)
+        tainted, _first = self.blocked(record, report(5), None)
+
+        for index in (1, 5):
+            with self.subTest(retry=index):
+                unchanged, decision = self.blocked(
+                    tainted, report(index), cohort_inventory(5), now=NOW + 60
+                )
+
+                self.assertEqual("individual", unchanged["state"])
+                self.assertEqual("inventory_unavailable", unchanged["reason"])
+                self.assertNotEqual("cooldown", decision["instruction"])
+                self.assertEqual(0, decision["events"]["cooldowns"])
+
+    def test_the_tainted_hold_is_replayable_for_the_reporting_fingerprint(self):
+        tainted, first = self.blocked(self.cohort(2), report(3), None)
+
+        replayed, second = self.blocked(
+            tainted, report(3), cohort_inventory(5), now=NOW + 30
+        )
+
+        self.assertEqual(tainted, replayed)
+        self.assertEqual(first["instruction"], second["instruction"])
+        self.assertEqual(first["retry_after_epoch"], second["retry_after_epoch"])
+        self.assertEqual(NO_EVENTS, second["events"])
+
+    def test_only_the_fail_closed_reason_keeps_a_generation_hold_active(self):
+        tainted, _decision = self.blocked(self.cohort(2), report(3), None)
+        held = {
+            "crypter": CRYPTER,
+            "reason_code": REASON,
+            "since_epoch": NOW,
+            "retry_after_epoch": NOW + SWEEP_WINDOW_SECONDS,
+            "probe_requested": False,
+            "observation_holds": 1,
+            "schema_version": 2,
+            "sweep_id": SWEEP_ID,
+            "link_fingerprints": [fingerprint(3)],
+        }
+        stale_hold = {**held, "link_fingerprints": [fingerprint(1)]}
+        snapshot = decision_snapshot(tainted, now=NOW)
+
+        self.assertTrue(package_defer_is_active(held, snapshot, now=NOW))
+        self.assertFalse(
+            package_defer_is_active(stale_hold, snapshot, now=NOW),
+            "an earlier member of the tainted generation is logically released",
+        )
+        for reason in (
+            "cohort_too_small",
+            "cohort_oversized",
+            "sweep_expired",
+            "sweep_inconclusive",
+        ):
+            with self.subTest(reason=reason):
+                other = decision_snapshot(
+                    individual_record(reason, generation=SWEEP_ID), now=NOW
+                )
+                self.assertFalse(package_defer_is_active(held, other, now=NOW))
 
 
 class RecordAccessTests(unittest.TestCase):
@@ -861,11 +1076,19 @@ class RecordAccessTests(unittest.TestCase):
             if index <= blocked_upto:
                 members.append(blocked_member(index))
             elif index == offered:
-                members.append(member(index, "offered", offer=offer_id(index)))
-                members[-1]["offer_expires_epoch"] = NOW + OFFER_LEASE_SECONDS
+                members.append(
+                    member(
+                        index,
+                        "offered",
+                        offer=offer_id(index),
+                        expires=NOW + OFFER_LEASE_SECONDS,
+                    )
+                )
             else:
                 members.append(member(index))
-        return sweeping_record(size, members=members)
+        return sweeping_record(
+            size, members=members, accepted_offers=accepted_for(members)
+        )
 
     def test_clear_at_every_sweep_position_enters_healthy_with_ordered_retests(self):
         for blocked_upto in range(0, 4):
@@ -944,7 +1167,7 @@ class RecordAccessTests(unittest.TestCase):
             "observation_holds": 1,
             "schema_version": 2,
             "sweep_id": SWEEP_ID,
-            "link_fingerprint": fingerprint(1),
+            "link_fingerprints": [fingerprint(1)],
         }
         self.assertTrue(
             package_defer_is_active(
@@ -1000,8 +1223,9 @@ class RecordAccessTests(unittest.TestCase):
         self.assertEqual(NOW + COOLDOWN_SECONDS, updated["retry_after_epoch"])
         self.assertEqual(leased["members"], updated["members"])
         self.assertEqual(5, updated["cohort_size"])
-        self.assertEqual(
-            "legacy_failure", updated["live_offer"]["response_instruction"]
+        self.assertIsNone(updated["live_offer"])
+        self.assertIn(
+            probe.offer_id, [e["offer_id"] for e in updated["accepted_offers"]]
         )
         self.assertEqual("unknown", decision["accepted"])
         self.assertEqual("cooldown", decision["state"])
@@ -1044,6 +1268,340 @@ class RecordAccessTests(unittest.TestCase):
     def test_an_unsupported_access_value_is_a_programmer_error(self):
         with self.assertRaises(ValueError):
             self.access(self.sweep_with_blocks(2), report(3), "blocked")
+
+
+class AcceptedOfferReplayTests(unittest.TestCase):
+    """An accepted result is separate state from the lease that produced it."""
+
+    def blocked(self, record, offer, inventory=None, *, now=NOW):
+        return record_blocked(
+            record, offer, inventory, now=now, cooldown_seconds=COOLDOWN_SECONDS
+        )
+
+    def access(self, record, offer, value, inventory=None, *, now=NOW):
+        return record_access(record, offer, value, inventory, now=now)
+
+    def offered(self, index, *, size=5, blocked_upto=0):
+        members = []
+        for position in range(1, size + 1):
+            if position <= blocked_upto:
+                members.append(blocked_member(position))
+            elif position == index:
+                members.append(member(position, "offered", offer=offer_id(position)))
+            else:
+                members.append(member(position))
+        return sweeping_record(
+            size, members=members, accepted_offers=accepted_for(members)
+        )
+
+    def test_an_accepted_result_survives_the_terminal_transition_it_caused(self):
+        cooled, first = self.blocked(
+            self.offered(5, blocked_upto=4), report(5), cohort_inventory(5)
+        )
+        self.assertEqual("cooldown", cooled["state"])
+
+        for index in range(1, 6):
+            with self.subTest(member=index):
+                replayed, decision = self.blocked(
+                    cooled, report(index), cohort_inventory(5), now=NOW + 90
+                )
+
+                self.assertEqual(cooled, replayed)
+                self.assertEqual(NO_EVENTS, decision["events"])
+                self.assertEqual(
+                    "cooldown" if index == 5 else "hold", decision["instruction"]
+                )
+                self.assertEqual(
+                    "crypter_cooldown" if index == 5 else "provisional",
+                    decision["hold_type"],
+                )
+                self.assertEqual(
+                    "cooldown" if index == 5 else "sweeping", decision["state"]
+                )
+        self.assertEqual("cooldown", first["instruction"])
+
+    def test_prior_accepted_results_survive_every_terminal_transition(self):
+        small = self.offered(2, size=2, blocked_upto=1)
+        active = self.offered(2, size=5, blocked_upto=1)
+        cases = (
+            (
+                "small all blocked",
+                small,
+                lambda record: self.blocked(record, report(2), cohort_inventory(2)),
+                NOW + 30,
+            ),
+            (
+                "terminal unknown",
+                small,
+                lambda record: self.access(record, report(2), "unknown"),
+                NOW + 30,
+            ),
+            (
+                "inventory unavailable",
+                active,
+                lambda record: self.blocked(record, report(2), None),
+                NOW + 30,
+            ),
+            (
+                "clear",
+                active,
+                lambda record: self.access(record, report(2), "clear"),
+                NOW + 30,
+            ),
+            (
+                "expiry",
+                active,
+                lambda record: (expire_decision(record, now=DEADLINE + 1), None),
+                DEADLINE + 1,
+            ),
+        )
+        replay_fields = (
+            "state",
+            "instruction",
+            "accepted",
+            "cleared",
+            "hold_type",
+            "evidence_count",
+            "retry_after_epoch",
+            "sweep_tested",
+            "sweep_total",
+            "sweep_deadline_epoch",
+        )
+
+        for label, record, transition, replayed_at in cases:
+            with self.subTest(transition=label):
+                accepted = record["accepted_offers"][0]
+                updated, _decision = transition(record)
+
+                self.assertIn(accepted, updated["accepted_offers"])
+                expected_ids = (
+                    [offer_id(1)] if label == "expiry" else [offer_id(1), offer_id(2)]
+                )
+                self.assertEqual(
+                    expected_ids,
+                    [entry["offer_id"] for entry in updated["accepted_offers"]],
+                )
+                unchanged, replay = self.blocked(
+                    updated,
+                    report(1),
+                    cohort_inventory(5),
+                    now=replayed_at,
+                )
+                self.assertEqual(updated, unchanged)
+                self.assertEqual(
+                    {field: accepted[field] for field in replay_fields},
+                    {field: replay[field] for field in replay_fields},
+                )
+                self.assertEqual(NO_EVENTS, replay["events"])
+
+    def test_an_expired_unaccepted_lease_is_stale_and_never_mutates(self):
+        record = self.offered(1)
+
+        unchanged, decision = self.blocked(
+            record, report(1), cohort_inventory(5), now=NOW + OFFER_LEASE_SECONDS
+        )
+
+        self.assertEqual(record, unchanged)
+        self.assertEqual("stale", decision["instruction"])
+        self.assertEqual(NO_EVENTS, decision["events"])
+
+    def test_an_accepted_offer_replays_even_after_its_lease_expired(self):
+        held, first = self.blocked(self.offered(1), report(1), cohort_inventory(5))
+
+        replayed, second = self.blocked(
+            held,
+            report(1),
+            cohort_inventory(5),
+            now=NOW + OFFER_LEASE_SECONDS + 60,
+        )
+
+        self.assertEqual(held, replayed)
+        self.assertEqual(first["instruction"], second["instruction"])
+        self.assertEqual(NO_EVENTS, second["events"])
+
+    def test_a_replayed_report_answers_the_stored_response_and_counters(self):
+        held, first = self.blocked(self.offered(1), report(1), cohort_inventory(5))
+        self.assertEqual(1, first["sweep_tested"])
+
+        advanced, _second = self.blocked(
+            {
+                **held,
+                "members": [
+                    held["members"][0],
+                    member(2, "offered", offer=offer_id(2)),
+                    *held["members"][2:],
+                ],
+                "used_offer_ids": sorted(held["used_offer_ids"] + [offer_id(2)]),
+            },
+            report(2),
+            cohort_inventory(5),
+            now=NOW + 10,
+        )
+
+        _replayed, decision = self.blocked(
+            advanced, report(1), cohort_inventory(5), now=NOW + 20
+        )
+
+        self.assertEqual(1, decision["sweep_tested"], "stored counters replay exactly")
+        self.assertEqual(5, decision["sweep_total"])
+        self.assertEqual("sweeping", decision["state"])
+        self.assertEqual(DEADLINE, decision["retry_after_epoch"])
+
+    def test_an_oversized_sentinel_and_sweep_identity_survive_a_replay(self):
+        record = individual_record(
+            "cohort_oversized",
+            live_offer=live_offer_block(offer_id(1), 1, mode="individual"),
+        )
+
+        answered, first = self.blocked(record, report(1), None)
+        self.assertEqual(MAXIMUM_COHORT_SIZE + 1, first["sweep_total"])
+        self.assertEqual(SWEEP_ID, first["sweep_id"])
+
+        _replayed, second = self.blocked(answered, report(1), None, now=NOW + 30)
+
+        self.assertEqual(MAXIMUM_COHORT_SIZE + 1, second["sweep_total"])
+        self.assertEqual(SWEEP_ID, second["sweep_id"])
+
+    def test_an_accepted_retest_frees_the_slot_for_the_next_retest(self):
+        record = healthy_record(
+            retest=[fingerprint(1), fingerprint(4)],
+            live_offer=live_offer_block(offer_id(1), 1, mode="retest"),
+        )
+
+        updated, _decision = self.blocked(record, report(1, mode="retest"), None)
+
+        self.assertIsNone(updated["live_offer"])
+        self.assertEqual([fingerprint(4)], updated["retest_members"])
+
+        leased, offer = lease_next_offer(
+            updated, None, now=NOW, offer_id_factory=SequentialIds(), mode="retest"
+        )
+        self.assertIsNotNone(offer)
+        self.assertEqual(fingerprint(4), offer.fingerprint)
+        self.assertEqual(
+            leased, decode_decision_record(encode_decision_record(leased), now=NOW)
+        )
+
+    def test_a_fresh_retest_clear_refreshes_health_but_its_retry_never_does(self):
+        record = healthy_record(
+            until=NOW + 100,
+            retest=[fingerprint(1), fingerprint(4)],
+            live_offer=live_offer_block(offer_id(1), 1, mode="retest"),
+        )
+
+        refreshed, first = self.access(record, report(1, mode="retest"), "clear")
+
+        self.assertEqual(
+            NOW + HEALTHY_SUPPRESSION_SECONDS,
+            refreshed["until_epoch"],
+            "a proven container refreshes the full health window",
+        )
+        self.assertEqual([fingerprint(4)], refreshed["retest_members"])
+        self.assertTrue(first["cleared"])
+
+        replayed, second = self.access(
+            refreshed, report(1, mode="retest"), "clear", now=NOW + 60
+        )
+
+        self.assertEqual(refreshed, replayed)
+        self.assertEqual(
+            NOW + HEALTHY_SUPPRESSION_SECONDS,
+            replayed["until_epoch"],
+            "an acknowledged clear retry can never extend suppression",
+        )
+        self.assertTrue(second["cleared"])
+
+    def test_a_clear_for_an_unknown_offer_during_health_is_stale(self):
+        record = healthy_record(retest=[fingerprint(1)])
+
+        unchanged, decision = self.access(record, report(1, mode="retest"), "clear")
+
+        self.assertEqual(record, unchanged)
+        self.assertEqual("stale", decision["instruction"])
+
+
+class OfferIdentityHistoryTests(unittest.TestCase):
+    """Offer identity is generation-wide history, not one mutable slot."""
+
+    def test_every_minted_identifier_is_retained_for_its_generation(self):
+        ids = SequentialIds()
+        record = sweeping_record(3)
+
+        for _ in range(3):
+            record, offer = lease_next_offer(
+                record, None, now=NOW, offer_id_factory=ids
+            )
+            self.assertIsNotNone(offer)
+
+        self.assertEqual(sorted(ids.minted), record["used_offer_ids"])
+
+    def test_a_relet_member_can_never_reuse_an_earlier_identifier(self):
+        record = sweeping_record(2)
+        record, first = lease_next_offer(
+            record, None, now=NOW, offer_id_factory=lambda: offer_id(901)
+        )
+        record, second = lease_next_offer(
+            record, None, now=NOW, offer_id_factory=lambda: offer_id(902)
+        )
+
+        # The first member's lease ran out, so member A is offered again while a
+        # careless factory replays both identifiers this generation already used.
+        minted = iter((offer_id(901), offer_id(902), offer_id(903)))
+        record, third = lease_next_offer(
+            record,
+            None,
+            now=NOW + OFFER_LEASE_SECONDS,
+            offer_id_factory=lambda: next(minted),
+        )
+
+        self.assertEqual(offer_id(901), first.offer_id)
+        self.assertEqual(offer_id(902), second.offer_id)
+        self.assertEqual(fingerprint(1), third.fingerprint)
+        self.assertEqual(offer_id(903), third.offer_id)
+        self.assertEqual(
+            [offer_id(901), offer_id(902), offer_id(903)], record["used_offer_ids"]
+        )
+
+    def test_a_permanently_colliding_factory_fails_after_a_bounded_retry(self):
+        record = sweeping_record(2)
+        attempts = []
+
+        def always_collide():
+            attempts.append(offer_id(901))
+            return offer_id(901)
+
+        record, _first = lease_next_offer(
+            record, None, now=NOW, offer_id_factory=lambda: offer_id(901)
+        )
+
+        with self.assertRaises(ValueError):
+            lease_next_offer(record, None, now=NOW, offer_id_factory=always_collide)
+
+        self.assertEqual(MAXIMUM_OFFER_ID_ATTEMPTS, len(attempts))
+
+    def test_the_generation_history_is_bounded_and_fails_closed(self):
+        record = sweeping_record(
+            2,
+            used_offer_ids=[
+                offer_id(index) for index in range(MAXIMUM_GENERATION_OFFER_IDS)
+            ],
+        )
+
+        with self.assertRaises(OverflowError):
+            lease_next_offer(
+                record, None, now=NOW, offer_id_factory=lambda: offer_id(999_999)
+            )
+
+    def test_a_concluded_generation_keeps_the_identifiers_it_minted(self):
+        record = sweeping_record(2)
+        record, first = lease_next_offer(
+            record, None, now=NOW, offer_id_factory=lambda: offer_id(901)
+        )
+
+        concluded = expire_decision(record, now=DEADLINE + 1)
+
+        self.assertEqual("individual", concluded["state"])
+        self.assertIn(first.offer_id, concluded["used_offer_ids"])
 
 
 class LegacyReportPrecedenceTests(unittest.TestCase):
@@ -1443,7 +2001,7 @@ class CohortBlockedServiceTests(SweepServiceTestCase):
 
         for package_id in (package(1), package(2)):
             deferred = self.stored_defer(package_id)
-            self.assertEqual(fingerprint(1), deferred["link_fingerprint"])
+            self.assertEqual([fingerprint(1)], deferred["link_fingerprints"])
             self.assertEqual(offer["sweep_id"], deferred["sweep_id"])
             self.assertEqual(DEADLINE, deferred["retry_after_epoch"])
             self.assertEqual(1, deferred["observation_holds"])
@@ -1464,15 +2022,94 @@ class CohortBlockedServiceTests(SweepServiceTestCase):
         offer = self.service.prepare_offer(CRYPTER, inventory)
         self.assertEqual(fingerprint(1), offer["link_fingerprint"])
         self.report_blocked(offer, package(1))
-
         record = self.stored_decision()
         self.assertEqual(3, len(record["members"]))
         self.assertEqual(
-            fingerprint(1), self.stored_defer(package(1))["link_fingerprint"]
+            [fingerprint(1)], self.stored_defer(package(1))["link_fingerprints"]
         )
 
         second = self.service.prepare_offer(CRYPTER, inventory)
         self.assertEqual(fingerprint(2), second["link_fingerprint"])
+
+    def test_a_second_blocked_link_joins_the_hold_instead_of_replacing_it(self):
+        self.store_package(package(1), [1, 2])
+        self.store_package(package(2), [3])
+        self.inventory = build_inventory(
+            {
+                fingerprint(1): (package(1),),
+                fingerprint(2): (package(1),),
+                fingerprint(3): (package(2),),
+            }
+        )
+
+        first = self.service.prepare_offer(CRYPTER, self.inventory)
+        self.report_blocked(first, package(1))
+        second = self.service.prepare_offer(CRYPTER, self.inventory)
+        self.report_blocked(second, package(1))
+
+        deferred = self.stored_defer(package(1))
+        self.assertEqual(
+            [fingerprint(1), fingerprint(2)],
+            deferred["link_fingerprints"],
+            "both tested links of one package stay held",
+        )
+        self.assertTrue(
+            package_defer_covers_fingerprint(deferred, fingerprint(1))
+            and package_defer_covers_fingerprint(deferred, fingerprint(2))
+        )
+        self.assertFalse(package_defer_covers_fingerprint(deferred, fingerprint(3)))
+
+    def test_a_duplicate_occurrence_of_one_link_shares_a_single_member(self):
+        self.store_package(package(1), [1, 1])
+        self.store_package(package(2), [2])
+        self.inventory = build_inventory(
+            {
+                fingerprint(1): (package(1), package(1)),
+                fingerprint(2): (package(2),),
+            }
+        )
+
+        offer = self.service.prepare_offer(CRYPTER, self.inventory)
+        self.report_blocked(offer, package(1))
+        self.report_blocked(offer, package(1))
+
+        self.assertEqual(
+            2, len(self.stored_decision()["members"]), "one link is one member"
+        )
+        self.assertEqual(
+            [fingerprint(1)], self.stored_defer(package(1))["link_fingerprints"]
+        )
+
+    def test_an_inventory_outage_holds_only_the_reporting_package(self):
+        offer = self.open_sweep()
+        self.report_blocked(offer, package(1))
+        second = self.service.prepare_offer(CRYPTER, self.inventory)
+
+        decision = self.service.record_cohort_blocked(
+            CRYPTER,
+            package(2),
+            second["link_fingerprint"],
+            second["sweep_id"],
+            second["offer_id"],
+            REASON,
+            None,
+        )
+
+        self.assertEqual("hold", decision["instruction"])
+        self.assertEqual("individual", decision["state"])
+        record = self.stored_decision()
+        self.assertEqual("inventory_unavailable", record["reason"])
+        current = decision_snapshot(record, now=NOW)
+        self.assertTrue(
+            package_defer_is_active(self.stored_defer(package(2)), current, now=NOW)
+        )
+        self.assertFalse(
+            package_defer_is_active(self.stored_defer(package(1)), current, now=NOW),
+            "the earlier member of the tainted generation is released",
+        )
+        follow_up = self.service.prepare_offer(CRYPTER, self.inventory)
+        self.assertEqual("individual", follow_up["mode"])
+        self.assertEqual("individual", self.stored_decision()["state"])
 
     def test_the_conclusive_cohort_counts_one_cooldown_and_holds_every_member(self):
         offer = self.open_sweep()
@@ -1593,6 +2230,51 @@ class CohortBlockedServiceTests(SweepServiceTestCase):
         self.assertIsNone(self.stored_defer(package(1)))
         self.assertIsNone(self.ledger())
 
+    def test_a_package_fingerprint_overflow_rolls_the_transition_back(self):
+        offer = self.open_sweep()
+        full_defer = {
+            "crypter": CRYPTER,
+            "reason_code": REASON,
+            "since_epoch": NOW,
+            "retry_after_epoch": DEADLINE,
+            "probe_requested": False,
+            "observation_holds": 1,
+            "schema_version": 2,
+            "sweep_id": offer["sweep_id"],
+            "link_fingerprints": [
+                fingerprint(index) for index in range(101, 101 + MAXIMUM_COHORT_SIZE)
+            ],
+        }
+        self.store_package(package(1), [1], deferred=full_defer)
+        decision_before = self.state.databases["crypter_cooldowns"].rows[CRYPTER]
+        package_before = self.state.databases["protected"].rows[package(1)]
+
+        with self.assertRaises(OverflowError):
+            self.report_blocked(offer, package(1))
+
+        self.assertEqual(
+            decision_before, self.state.databases["crypter_cooldowns"].rows[CRYPTER]
+        )
+        self.assertEqual(
+            package_before, self.state.databases["protected"].rows[package(1)]
+        )
+        self.assertIsNone(self.ledger())
+
+    def test_expiry_during_an_accepted_replay_cannot_recreate_a_hold(self):
+        offer = self.open_sweep()
+        first = self.report_blocked(offer, package(1))
+        self.assertEqual("hold", first["instruction"])
+        self.state.databases["protected"].update_store(
+            package(1), protected_blob([["https://filecrypt.invalid/1", CRYPTER]])
+        )
+        self.clock.now = DEADLINE + 1
+
+        replay = self.report_blocked(offer, package(1))
+
+        self.assertEqual("hold", replay["instruction"])
+        self.assertEqual("individual", self.stored_decision()["state"])
+        self.assertIsNone(self.stored_defer(package(1)))
+
 
 class CohortAccessServiceTests(SweepServiceTestCase):
     def setUp(self):
@@ -1632,6 +2314,37 @@ class CohortAccessServiceTests(SweepServiceTestCase):
         self.assertEqual([fingerprint(1)], self.stored_decision()["retest_members"])
         self.assertIsNone(self.stored_defer(package(1)))
         self.assertIsNone(self.stored_defer(package(2)))
+
+    def test_an_accepted_block_replay_after_clear_cannot_recreate_a_hold(self):
+        first = self.service.prepare_offer(CRYPTER, self.inventory)
+        self.service.record_cohort_blocked(
+            CRYPTER,
+            package(1),
+            first["link_fingerprint"],
+            first["sweep_id"],
+            first["offer_id"],
+            REASON,
+            self.inventory,
+        )
+        second = self.service.prepare_offer(CRYPTER, self.inventory)
+        self.report_access(second, package(2), "clear")
+        healthy = self.state.databases["crypter_cooldowns"].rows[CRYPTER]
+
+        replay = self.service.record_cohort_blocked(
+            CRYPTER,
+            package(1),
+            first["link_fingerprint"],
+            first["sweep_id"],
+            first["offer_id"],
+            REASON,
+            self.inventory,
+        )
+
+        self.assertEqual("hold", replay["instruction"])
+        self.assertEqual(
+            healthy, self.state.databases["crypter_cooldowns"].rows[CRYPTER]
+        )
+        self.assertIsNone(self.stored_defer(package(1)))
 
     def test_a_failed_physical_cleanup_never_changes_the_clear_response(self):
         first = self.service.prepare_offer(CRYPTER, self.inventory)
@@ -1740,7 +2453,7 @@ class CohortAccessServiceTests(SweepServiceTestCase):
             self.inventory,
         )
 
-        self.assertEqual("legacy_failure", decision["instruction"])
+        self.assertEqual("stale", decision["instruction"])
         self.assertEqual("healthy", self.stored_decision()["state"])
         self.assertEqual(0, json.loads(self.ledger() or "{}").get("cooldowns", 0))
 
@@ -1940,8 +2653,9 @@ class RealDatabaseSweepTests(unittest.TestCase):
                 json.loads(protected.retrieve(package(index)))
             )
             self.assertEqual(record["sweep_id"], deferred["sweep_id"])
+            self.assertEqual(1, len(deferred["link_fingerprints"]))
             self.assertIn(
-                deferred["link_fingerprint"],
+                deferred["link_fingerprints"][0],
                 [entry["link_fingerprint"] for entry in record["members"]],
             )
             # Every member stays held by the cohort cooldown itself, whatever
@@ -2024,7 +2738,7 @@ class RealDatabaseSweepTests(unittest.TestCase):
             )
 
         self.assertTrue(interleaved["done"])
-        self.assertEqual("legacy_failure", decision["instruction"])
+        self.assertEqual("stale", decision["instruction"])
         reopened = DataBase("crypter_cooldowns")
         self.addCleanup(reopened._conn.close)
         self.assertEqual(
@@ -2122,6 +2836,74 @@ class RealDatabaseSweepTests(unittest.TestCase):
         self.assertEqual(
             2, json.loads(events.retrieve(CRYPTER_EVENT_KEY))["observations"]
         )
+
+    def test_concurrent_leases_never_share_an_offer_identity(self):
+        self.store_packages(5)
+        inventory = cohort_inventory(5)
+        started = threading.Event()
+        offers = []
+        errors = []
+
+        def lease():
+            try:
+                started.wait(5)
+                offers.append(self.service.prepare_offer(CRYPTER, inventory))
+            except Exception as error:  # pragma: no cover - surfaced by the test
+                errors.append(error)
+
+        threads = [threading.Thread(target=lease) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        started.set()
+        for thread in threads:
+            thread.join(10)
+
+        self.assertEqual([], errors)
+        identifiers = [offer["offer_id"] for offer in offers]
+        self.assertEqual(4, len(identifiers))
+        self.assertEqual(len(set(identifiers)), len(identifiers))
+        reopened = DataBase("crypter_cooldowns")
+        self.addCleanup(reopened._conn.close)
+        record = decode_decision_record(reopened.retrieve(CRYPTER), now=NOW)
+        self.assertTrue(set(identifiers).issubset(record["used_offer_ids"]))
+
+    def test_a_committed_cooldown_survives_a_restart_of_every_reader(self):
+        inventory, decision = self.drive_full_cohort()
+        self.assertEqual("cooldown", decision["instruction"])
+
+        for database in self.databases.values():
+            database._conn.close()
+        self.databases.clear()
+
+        record = decode_decision_record(
+            self.state.get_db("crypter_cooldowns").retrieve(CRYPTER), now=NOW
+        )
+        self.assertIsNotNone(record, "a coherent cooldown must reload after a restart")
+        self.assertEqual(NOW, record["opened_epoch"])
+        self.assertEqual(DEADLINE, record["deadline_epoch"])
+        for entry in record["members"]:
+            self.assertLessEqual(record["opened_epoch"], entry["tested_epoch"])
+            self.assertLessEqual(entry["tested_epoch"], record["deadline_epoch"])
+            self.assertIn(entry["offer_id"], record["used_offer_ids"])
+        self.assertEqual(
+            len(record["used_offer_ids"]), len(set(record["used_offer_ids"]))
+        )
+
+        replay = self.service.record_cohort_blocked(
+            CRYPTER,
+            self.package_for(
+                {"link_fingerprint": record["members"][0]["link_fingerprint"]},
+                inventory,
+            ),
+            record["members"][0]["link_fingerprint"],
+            record["sweep_id"],
+            record["members"][0]["offer_id"],
+            REASON,
+            inventory,
+        )
+        self.assertEqual("hold", replay["instruction"])
+        self.assertEqual("sweeping", replay["state"])
+        self.assertEqual("provisional", replay["hold_type"])
 
 
 if __name__ == "__main__":

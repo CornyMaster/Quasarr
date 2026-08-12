@@ -50,7 +50,7 @@ def deferred_block(
             {
                 "schema_version": 2,
                 "sweep_id": SWEEP_ID,
-                "link_fingerprint": LINK_FINGERPRINT,
+                "link_fingerprints": [LINK_FINGERPRINT],
             }
         )
     return block
@@ -148,7 +148,7 @@ class DeferredApiState:
                     {
                         "schema_version": 2,
                         "sweep_id": SWEEP_ID,
-                        "link_fingerprint": LINK_FINGERPRINT,
+                        "link_fingerprints": [LINK_FINGERPRINT],
                     }
                 )
         self.protected.rows[package_id] = json.dumps(package)
@@ -1104,7 +1104,7 @@ class DeferredPackagesRouteTests(unittest.TestCase):
                 "observation_holds": 1,
                 "schema_version": 2,
                 "sweep_id": SWEEP_ID,
-                "link_fingerprint": LINK_FINGERPRINT,
+                "link_fingerprints": [LINK_FINGERPRINT],
             },
             json.loads(state.protected.rows[PACKAGE_A])["deferred"],
         )

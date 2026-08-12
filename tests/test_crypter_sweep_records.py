@@ -10,11 +10,15 @@ import quasarr.providers.crypter_sweeps as sweep_module
 from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 from quasarr.providers.crypter_sweeps import (
     HEALTHY_SUPPRESSION_SECONDS,
+    MAXIMUM_ACCEPTED_OFFERS,
     MAXIMUM_COHORT_OCCURRENCES,
     MAXIMUM_COHORT_RECORD_BYTES,
     MAXIMUM_COHORT_SIZE,
+    MAXIMUM_GENERATION_OFFER_IDS,
+    MAXIMUM_OFFER_ID_ATTEMPTS,
     MINIMUM_CONCLUSIVE_COHORT_SIZE,
     OFFER_LEASE_SECONDS,
+    OVERSIZED_COHORT_SENTINEL,
     SWEEP_SCHEMA_VERSION,
     SWEEP_WINDOW_SECONDS,
     decision_snapshot,
@@ -45,6 +49,21 @@ OFFER_KEYS = (
     "offer_expires_epoch",
     "mode",
     "response_instruction",
+)
+ACCEPTED_OFFER_KEYS = (
+    "offer_id",
+    "link_fingerprint",
+    "mode",
+    "state",
+    "instruction",
+    "accepted",
+    "cleared",
+    "hold_type",
+    "evidence_count",
+    "retry_after_epoch",
+    "sweep_tested",
+    "sweep_total",
+    "sweep_deadline_epoch",
 )
 
 
@@ -79,6 +98,34 @@ def blocked_members(count=MINIMUM_CONCLUSIVE_COHORT_SIZE):
     ]
 
 
+def accepted_offer(index, **overrides):
+    entry = {
+        "offer_id": f"{index:032x}",
+        "link_fingerprint": fingerprint(index),
+        "mode": "sweep",
+        "state": "sweeping",
+        "instruction": "hold",
+        "accepted": "",
+        "cleared": False,
+        "hold_type": "provisional",
+        "evidence_count": index,
+        "retry_after_epoch": NOW + SWEEP_WINDOW_SECONDS,
+        "sweep_tested": index,
+        "sweep_total": MINIMUM_CONCLUSIVE_COHORT_SIZE,
+        "sweep_deadline_epoch": NOW + SWEEP_WINDOW_SECONDS,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def used_ids(*groups):
+    """Every offer ID one generation ever minted, ascending and unique."""
+    identifiers = set()
+    for group in groups:
+        identifiers.update(group)
+    return sorted(identifiers)
+
+
 def live_offer(**overrides):
     offer = {
         "offer_id": OFFER_ID,
@@ -100,6 +147,8 @@ def sweeping_record(**overrides):
         "opened_epoch": NOW,
         "deadline_epoch": NOW + SWEEP_WINDOW_SECONDS,
         "members": [member(1), member(2)],
+        "accepted_offers": [],
+        "used_offer_ids": [],
     }
     record.update(overrides)
     return record
@@ -107,15 +156,43 @@ def sweeping_record(**overrides):
 
 def cohort_cooldown_record(**overrides):
     members = overrides.pop("members", blocked_members())
+    accepted = overrides.pop(
+        "accepted_offers",
+        [
+            accepted_offer(
+                index,
+                instruction="cooldown" if index == len(members) else "hold",
+                **(
+                    {
+                        "state": "cooldown",
+                        "hold_type": "crypter_cooldown",
+                        "evidence_count": len(members),
+                        "retry_after_epoch": COOLDOWN_RETRY,
+                    }
+                    if index == len(members)
+                    else {}
+                ),
+            )
+            for index in range(1, len(members) + 1)
+        ],
+    )
     record = {
         "schema_version": SWEEP_SCHEMA_VERSION,
         "state": "cooldown",
         "reason_code": REASON,
         "sweep_id": SWEEP_ID,
+        "opened_epoch": NOW,
+        "deadline_epoch": NOW + SWEEP_WINDOW_SECONDS,
         "members": members,
         "cohort_size": len(members),
         "retry_after_epoch": COOLDOWN_RETRY,
         "live_offer": live_offer(mode="probe"),
+        "accepted_offers": accepted,
+        "used_offer_ids": used_ids(
+            (entry["offer_id"] for entry in members if entry["offer_id"]),
+            (entry["offer_id"] for entry in accepted),
+            (OFFER_ID,),
+        ),
     }
     record.update(overrides)
     return record
@@ -142,6 +219,8 @@ def healthy_record(**overrides):
         "until_epoch": UNTIL,
         "retest_members": [fingerprint(1), fingerprint(2)],
         "live_offer": live_offer(mode="retest", response_instruction=""),
+        "accepted_offers": [],
+        "used_offer_ids": [OFFER_ID],
     }
     record.update(overrides)
     return record
@@ -157,6 +236,9 @@ def individual_record(**overrides):
         "live_offer": live_offer(
             mode="individual", response_instruction="legacy_failure"
         ),
+        "hold_fingerprints": [],
+        "accepted_offers": [],
+        "used_offer_ids": [OFFER_ID],
     }
     record.update(overrides)
     return record
@@ -182,6 +264,10 @@ class DecisionRecordCodecTests(unittest.TestCase):
         self.assertEqual(15 * 60, HEALTHY_SUPPRESSION_SECONDS)
         self.assertEqual(2 * 60, OFFER_LEASE_SECONDS)
         self.assertEqual(256 * 1024, MAXIMUM_COHORT_RECORD_BYTES)
+        self.assertEqual(101, OVERSIZED_COHORT_SENTINEL)
+        self.assertEqual(MAXIMUM_COHORT_SIZE, MAXIMUM_ACCEPTED_OFFERS)
+        self.assertEqual(1000, MAXIMUM_GENERATION_OFFER_IDS)
+        self.assertEqual(8, MAXIMUM_OFFER_ID_ATTEMPTS)
 
     def test_round_trips_every_state_deterministically_and_url_free(self):
         for name, record in every_record():
@@ -209,16 +295,22 @@ class DecisionRecordCodecTests(unittest.TestCase):
                 "opened_epoch",
                 "deadline_epoch",
                 "members",
+                "accepted_offers",
+                "used_offer_ids",
             },
             "cooldown": {
                 "schema_version",
                 "state",
                 "reason_code",
                 "sweep_id",
+                "opened_epoch",
+                "deadline_epoch",
                 "members",
                 "cohort_size",
                 "retry_after_epoch",
                 "live_offer",
+                "accepted_offers",
+                "used_offer_ids",
             },
             "legacy_cooldown": {
                 "schema_version",
@@ -235,6 +327,8 @@ class DecisionRecordCodecTests(unittest.TestCase):
                 "until_epoch",
                 "retest_members",
                 "live_offer",
+                "accepted_offers",
+                "used_offer_ids",
             },
             "individual": {
                 "schema_version",
@@ -243,6 +337,9 @@ class DecisionRecordCodecTests(unittest.TestCase):
                 "generation_id",
                 "until_epoch",
                 "live_offer",
+                "hold_fingerprints",
+                "accepted_offers",
+                "used_offer_ids",
             },
         }
 
@@ -677,6 +774,414 @@ class DecisionRecordCodecTests(unittest.TestCase):
                 self.assertIsNone(decode_decision_record(encoded, now=UNTIL + 1))
 
 
+class AcceptedOfferCodecTests(unittest.TestCase):
+    """The replay history is separate persisted state, so it is validated too."""
+
+    def cohort_states(self):
+        return (
+            ("sweeping", sweeping_record),
+            ("cooldown", cohort_cooldown_record),
+            ("healthy", healthy_record),
+            ("individual", individual_record),
+        )
+
+    def test_every_cohort_state_round_trips_an_accepted_offer(self):
+        entry = accepted_offer(1)
+        for name, build in self.cohort_states():
+            with self.subTest(state=name):
+                record = build(accepted_offers=[entry])
+                record["used_offer_ids"] = used_ids(
+                    record["used_offer_ids"], (entry["offer_id"],)
+                )
+                encoded = encode_decision_record(record)
+
+                self.assertEqual(record, decode_decision_record(encoded, now=NOW))
+                self.assertNotIn("://", encoded)
+
+    def test_an_accepted_offer_retains_the_complete_accepted_response(self):
+        entry = accepted_offer(
+            1,
+            state="sweeping",
+            hold_type="provisional",
+            evidence_count=1,
+            retry_after_epoch=NOW + SWEEP_WINDOW_SECONDS,
+        )
+        record = sweeping_record(
+            accepted_offers=[entry], used_offer_ids=[entry["offer_id"]]
+        )
+
+        encoded = encode_decision_record(record)
+
+        self.assertEqual(record, decode_decision_record(encoded, now=NOW))
+
+    def test_an_accepted_offer_pins_its_exact_key_set(self):
+        for key in ACCEPTED_OFFER_KEYS:
+            with self.subTest(accepted_key=key):
+                broken = {k: v for k, v in accepted_offer(1).items() if k != key}
+                record = sweeping_record(
+                    accepted_offers=[broken], used_offer_ids=[f"{1:032x}"]
+                )
+
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+        extra = sweeping_record(
+            accepted_offers=[dict(accepted_offer(1), url="https://x.invalid")],
+            used_offer_ids=[f"{1:032x}"],
+        )
+        self.assertIsNone(decode_decision_record(json.dumps(extra), now=NOW))
+        with self.assertRaises(ValueError):
+            encode_decision_record(extra)
+
+    def test_accepted_offers_are_unique_and_ascending_by_fingerprint(self):
+        rejected = (
+            [accepted_offer(1), accepted_offer(1, offer_id=f"{9:032x}")],
+            [accepted_offer(2), accepted_offer(1)],
+            [accepted_offer(1), accepted_offer(3), accepted_offer(2)],
+        )
+
+        for entries in rejected:
+            with self.subTest(order=[e["link_fingerprint"][-2:] for e in entries]):
+                record = sweeping_record(
+                    accepted_offers=entries,
+                    used_offer_ids=used_ids(e["offer_id"] for e in entries),
+                )
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+    def test_one_offer_identity_can_never_be_both_accepted_and_still_leased(self):
+        accepted = accepted_offer(1, offer_id=OFFER_ID)
+        records = (
+            healthy_record(accepted_offers=[accepted], used_offer_ids=[OFFER_ID]),
+            sweeping_record(
+                members=[
+                    member(
+                        1,
+                        result="offered",
+                        offer_id=OFFER_ID,
+                        offer_expires_epoch=NOW + OFFER_LEASE_SECONDS,
+                    ),
+                    member(2),
+                ],
+                accepted_offers=[accepted],
+                used_offer_ids=[OFFER_ID],
+            ),
+        )
+
+        for record in records:
+            with self.subTest(state=record["state"]):
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+    def test_one_offer_identity_cannot_be_rebound_to_another_fingerprint(self):
+        accepted = accepted_offer(1, offer_id=OFFER_ID)
+        record = sweeping_record(
+            members=[
+                member(1),
+                member(
+                    2,
+                    result="offered",
+                    offer_id=OFFER_ID,
+                    offer_expires_epoch=NOW + OFFER_LEASE_SECONDS,
+                ),
+            ],
+            accepted_offers=[accepted],
+            used_offer_ids=[OFFER_ID],
+        )
+
+        self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+        with self.assertRaises(ValueError):
+            encode_decision_record(record)
+
+    def test_a_member_shared_identity_must_be_its_accepted_sweep_result(self):
+        invalid = (
+            (
+                "probe identity reused by a member",
+                member(
+                    1,
+                    result="blocked",
+                    tested_epoch=NOW,
+                    offer_id=OFFER_ID,
+                    offer_expires_epoch=NOW + OFFER_LEASE_SECONDS,
+                    response_instruction="hold",
+                ),
+                accepted_offer(1, offer_id=OFFER_ID, mode="probe"),
+            ),
+            (
+                "accepted identity retained by a pending member",
+                member(1, offer_id=OFFER_ID),
+                accepted_offer(1, offer_id=OFFER_ID),
+            ),
+        )
+
+        for label, first, accepted in invalid:
+            with self.subTest(case=label):
+                record = sweeping_record(
+                    members=[first, member(2)],
+                    accepted_offers=[accepted],
+                    used_offer_ids=[OFFER_ID],
+                )
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+    def test_a_record_level_live_offer_cannot_reuse_a_member_identity(self):
+        members = blocked_members()
+        accepted = [accepted_offer(index) for index in range(2, len(members) + 1)]
+        record = cohort_cooldown_record(
+            members=members,
+            accepted_offers=accepted,
+            live_offer=live_offer(offer_id=members[0]["offer_id"], mode="probe"),
+        )
+
+        self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+        with self.assertRaises(ValueError):
+            encode_decision_record(record)
+
+    def test_accepted_offer_enums_and_epochs_are_closed(self):
+        rejected = {
+            "mode": ("cohort", "", None),
+            "state": ("available", "observing", "", None),
+            "instruction": ("stale", "fail", None),
+            "accepted": ("clear", "blocked", None),
+            "cleared": ("true", 1, None),
+            "hold_type": ("hold", "cooldown", "", None),
+            "evidence_count": (-1, 1.0, True, "1", None),
+            "retry_after_epoch": (-1, 1.0, True, "1", None),
+            "sweep_tested": (-1, 1.0, True, "1", None),
+            "sweep_total": (-1, 1.0, True, None),
+            "sweep_deadline_epoch": (-1, 1.0, True, None),
+        }
+
+        for field, values in rejected.items():
+            for value in values:
+                with self.subTest(field=field, value=repr(value)):
+                    record = sweeping_record(
+                        accepted_offers=[accepted_offer(1, **{field: value})],
+                        used_offer_ids=[f"{1:032x}"],
+                    )
+                    self.assertIsNone(
+                        decode_decision_record(json.dumps(record), now=NOW)
+                    )
+
+    def test_accepted_response_fields_must_describe_one_coherent_outcome(self):
+        rejected = (
+            accepted_offer(1, cleared=True),
+            accepted_offer(1, accepted="unknown", instruction="hold"),
+            accepted_offer(1, instruction="hold", hold_type="none"),
+            accepted_offer(1, instruction="hold", retry_after_epoch=0),
+            accepted_offer(
+                1,
+                state="sweeping",
+                instruction="cooldown",
+                hold_type="crypter_cooldown",
+            ),
+            accepted_offer(1, instruction="legacy_failure", hold_type="provisional"),
+            accepted_offer(1, instruction="legacy_failure", retry_after_epoch=NOW),
+        )
+
+        for entry in rejected:
+            with self.subTest(entry=entry):
+                record = sweeping_record(
+                    accepted_offers=[entry], used_offer_ids=[entry["offer_id"]]
+                )
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+    def test_accepted_offers_are_bounded_by_the_cohort_maximum(self):
+        entries = [
+            accepted_offer(index) for index in range(1, MAXIMUM_ACCEPTED_OFFERS + 2)
+        ]
+        identifiers = used_ids(entry["offer_id"] for entry in entries)
+
+        self.assertIsNotNone(
+            decode_decision_record(
+                json.dumps(
+                    sweeping_record(
+                        accepted_offers=entries[:MAXIMUM_ACCEPTED_OFFERS],
+                        used_offer_ids=identifiers[:MAXIMUM_ACCEPTED_OFFERS],
+                    )
+                ),
+                now=NOW,
+            )
+        )
+        self.assertIsNone(
+            decode_decision_record(
+                json.dumps(
+                    sweeping_record(accepted_offers=entries, used_offer_ids=identifiers)
+                ),
+                now=NOW,
+            )
+        )
+
+    def test_used_offer_ids_are_unique_ascending_and_bounded(self):
+        rejected = (
+            [f"{2:032x}", f"{1:032x}"],
+            [f"{1:032x}", f"{1:032x}"],
+            ["A" * 32],
+            ["a" * 31],
+            [None],
+            "not-a-list",
+        )
+
+        for identifiers in rejected:
+            with self.subTest(used=repr(identifiers)[:40]):
+                record = sweeping_record(used_offer_ids=identifiers)
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+        full = [f"{index:032x}" for index in range(1, MAXIMUM_GENERATION_OFFER_IDS + 2)]
+        self.assertIsNotNone(
+            decode_decision_record(
+                json.dumps(
+                    sweeping_record(used_offer_ids=full[:MAXIMUM_GENERATION_OFFER_IDS])
+                ),
+                now=NOW,
+            )
+        )
+        self.assertIsNone(
+            decode_decision_record(
+                json.dumps(sweeping_record(used_offer_ids=full)), now=NOW
+            )
+        )
+
+    def test_a_cohort_cooldown_retains_the_sweep_window_it_was_won_in(self):
+        for opened, deadline in (
+            (NOW, NOW + SWEEP_WINDOW_SECONDS - 1),
+            (NOW, NOW + SWEEP_WINDOW_SECONDS + 1),
+            (NOW, NOW),
+        ):
+            with self.subTest(deadline=deadline):
+                record = cohort_cooldown_record(
+                    opened_epoch=opened, deadline_epoch=deadline
+                )
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+    def test_a_cohort_cooldown_rejects_members_tested_outside_its_window(self):
+        week = 7 * 24 * 60 * 60
+        outside = {
+            "weeks apart": [
+                dict(entry, tested_epoch=NOW + index * week)
+                for index, entry in enumerate(blocked_members())
+            ],
+            "tested before the sweep opened": [
+                dict(blocked_members()[0], tested_epoch=NOW - 1),
+                *blocked_members()[1:],
+            ],
+            "tested after the deadline": [
+                dict(
+                    blocked_members()[0],
+                    tested_epoch=NOW + SWEEP_WINDOW_SECONDS + 1,
+                    offer_expires_epoch=NOW + SWEEP_WINDOW_SECONDS + 1,
+                ),
+                *blocked_members()[1:],
+            ],
+        }
+
+        for name, members in outside.items():
+            with self.subTest(case=name):
+                record = cohort_cooldown_record(members=members)
+                self.assertIsNone(
+                    decode_decision_record(json.dumps(record), now=NOW),
+                    "a late or ancient member result can never cool a linkcrypter",
+                )
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+        self.assertIsNotNone(
+            decode_decision_record(
+                json.dumps(
+                    cohort_cooldown_record(
+                        members=[
+                            dict(
+                                entry,
+                                tested_epoch=NOW + SWEEP_WINDOW_SECONDS,
+                                offer_expires_epoch=NOW + SWEEP_WINDOW_SECONDS,
+                            )
+                            for entry in blocked_members()
+                        ]
+                    )
+                ),
+                now=NOW,
+            ),
+            "a member tested exactly at the deadline is still coherent evidence",
+        )
+
+    def test_a_cohort_cooldown_requires_unique_offer_ids_across_its_history(self):
+        record = cohort_cooldown_record()
+        record["used_offer_ids"] = [
+            entry
+            for entry in record["used_offer_ids"]
+            if entry != record["members"][0]["offer_id"]
+        ]
+        self.assertIsNone(
+            decode_decision_record(json.dumps(record), now=NOW),
+            "a member result with no leased identity in the history is incoherent",
+        )
+        with self.assertRaises(ValueError):
+            encode_decision_record(record)
+
+        reused = cohort_cooldown_record(
+            members=[
+                dict(entry, offer_id=f"{1:032x}") for entry in blocked_members()[:1]
+            ]
+            + [dict(entry, offer_id=f"{1:032x}") for entry in blocked_members()[1:2]]
+            + blocked_members()[2:]
+        )
+        self.assertIsNone(
+            decode_decision_record(json.dumps(reused), now=NOW),
+            "two members can never share one offer identity",
+        )
+
+    def test_hold_fingerprints_are_only_retained_by_the_fail_closed_reason(self):
+        allowed = individual_record(
+            reason="inventory_unavailable", hold_fingerprints=[fingerprint(1)]
+        )
+        self.assertEqual(
+            allowed, decode_decision_record(encode_decision_record(allowed), now=NOW)
+        )
+
+        for reason in (
+            "cohort_too_small",
+            "cohort_oversized",
+            "sweep_expired",
+            "sweep_inconclusive",
+            "legacy_v1_hold",
+        ):
+            with self.subTest(reason=reason):
+                record = individual_record(
+                    reason=reason, hold_fingerprints=[fingerprint(1)]
+                )
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+    def test_hold_fingerprints_are_unique_ascending_and_bounded(self):
+        rejected = (
+            [fingerprint(2), fingerprint(1)],
+            [fingerprint(1), fingerprint(1)],
+            ["a" * 63],
+            "not-a-list",
+            [fingerprint(index) for index in range(1, MAXIMUM_COHORT_SIZE + 2)],
+        )
+
+        for value in rejected:
+            with self.subTest(hold=repr(value)[:40]):
+                record = individual_record(
+                    reason="inventory_unavailable", hold_fingerprints=value
+                )
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
+
 class DecisionSnapshotTests(unittest.TestCase):
     def base_snapshot(self, **overrides):
         snapshot = {
@@ -694,6 +1199,7 @@ class DecisionSnapshotTests(unittest.TestCase):
             "evidence_count": 0,
             "expired": False,
             "retest_members": (),
+            "hold_fingerprints": (),
             "live_offer": None,
         }
         snapshot.update(overrides)

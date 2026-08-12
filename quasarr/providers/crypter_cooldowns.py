@@ -10,6 +10,8 @@ from collections import namedtuple
 
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.providers.crypter_sweeps import (
+    FAIL_CLOSED_INDIVIDUAL_REASON,
+    MAXIMUM_COHORT_SIZE,
     SWEEP_SCHEMA_VERSION,
     Offer,
     bypass_decision,
@@ -66,7 +68,7 @@ _PACKAGE_DEFER_KEYS = frozenset(
 _PACKAGE_DEFER_V2_KEYS = _PACKAGE_DEFER_KEYS | {
     "schema_version",
     "sweep_id",
-    "link_fingerprint",
+    "link_fingerprints",
 }
 _LEGACY_DEFER_SHAPE = "legacy"
 _GENERATION_DEFER_SHAPE = "generation"
@@ -107,6 +109,24 @@ def validate_link_fingerprint(value):
     if not isinstance(value, str) or not _FINGERPRINT_PATTERN.fullmatch(value):
         raise ValueError("Link fingerprint must be 64 lowercase hexadecimal characters")
     return value
+
+
+def _validate_link_fingerprints(value):
+    """The exact set of links one package hold speaks for.
+
+    A package can carry several Filecrypt containers, so a hold has to be able
+    to name more than one of them. Ascending order is the deterministic form and
+    doubles as the uniqueness proof, and the cohort maximum bounds it.
+    """
+    if not isinstance(value, list) or not 1 <= len(value) <= MAXIMUM_COHORT_SIZE:
+        raise ValueError("Package defer must hold at least one link fingerprint")
+    fingerprints = []
+    for entry in value:
+        fingerprint = validate_link_fingerprint(entry)
+        if fingerprints and fingerprint <= fingerprints[-1]:
+            raise ValueError("Held link fingerprints must be unique and ordered")
+        fingerprints.append(fingerprint)
+    return fingerprints
 
 
 def _validate_identifier(value, field_name):
@@ -266,8 +286,8 @@ def decode_package_defer(package_data):
             {
                 "schema_version": SWEEP_SCHEMA_VERSION,
                 "sweep_id": _validate_sweep_id(deferred["sweep_id"]),
-                "link_fingerprint": validate_link_fingerprint(
-                    deferred["link_fingerprint"]
+                "link_fingerprints": _validate_link_fingerprints(
+                    deferred["link_fingerprints"]
                 ),
             }
         )
@@ -331,10 +351,21 @@ def package_defer_is_active(deferred, decision_snapshot, *, now):
                 and now < _epoch_or_zero(decision_snapshot, "retry_after_epoch")
             )
         if state == "individual":
-            return (
-                decision_snapshot.get("reason_code") == "legacy_v1_hold"
-                and decision_snapshot.get("generation_id") == sweep_id
-                and now < _epoch_or_zero(decision_snapshot, "until_epoch")
+            reason = decision_snapshot.get("reason_code")
+            if reason not in ("legacy_v1_hold", FAIL_CLOSED_INDIVIDUAL_REASON):
+                return False
+            if decision_snapshot.get("generation_id") != sweep_id:
+                return False
+            if now >= _epoch_or_zero(decision_snapshot, "until_epoch"):
+                return False
+            if reason == "legacy_v1_hold":
+                return True
+            # The fail-closed reason retains exactly the fingerprints its own
+            # report proved, so every earlier hold of that generation is
+            # logically released even though its row still names the sweep.
+            retained = decision_snapshot.get("hold_fingerprints") or ()
+            return any(
+                fingerprint in retained for fingerprint in deferred["link_fingerprints"]
             )
         return False
 
@@ -351,17 +382,17 @@ def package_defer_is_active(deferred, decision_snapshot, *, now):
 def package_defer_covers_fingerprint(deferred, link_fingerprint):
     """Whether a package hold speaks for this exact link.
 
-    A version-two hold is bound to the one fingerprint that was tested, so every
-    occurrence of that link stays held while a different, never tested link in
-    the same package does not. A legacy hold predates fingerprints and covers
-    the whole package.
+    A version-two hold names every link of that package a report already tested,
+    so each of those stays held wherever it occurs while a different, never
+    tested link in the same package does not. A legacy hold predates
+    fingerprints and covers the whole package.
     """
     shape = _defer_shape(deferred)
     if shape is None:
         return False
     if shape == _LEGACY_DEFER_SHAPE:
         return True
-    return deferred["link_fingerprint"] == link_fingerprint
+    return link_fingerprint in deferred["link_fingerprints"]
 
 
 def _available_snapshot():
@@ -475,12 +506,17 @@ def _write_generation_hold(
     link_fingerprint,
     retry_after_epoch,
     observation_holds,
+    retain_existing=True,
 ):
     """Bind one protected row to the generation that is holding it.
 
     A generation-bound hold is not the legacy provisional budget: each sweep is
     its own bounded window and dies with its generation, so a new generation
     always writes its own hold instead of being refused by an older marker.
+    A package can carry several blocked containers, so a hold of the same
+    generation collects them instead of dropping the link it held before.
+    `retain_existing=False` is the fail-closed write, which keeps exactly the
+    fingerprint this report proved.
     """
     package = _decode_package(current_value)
     if package is None:
@@ -491,6 +527,15 @@ def _write_generation_hold(
         existing = None
     if existing is not None and existing["crypter"] != crypter:
         existing = None
+    held = {link_fingerprint}
+    if (
+        retain_existing
+        and existing is not None
+        and existing.get("sweep_id") == sweep_id
+    ):
+        held.update(existing["link_fingerprints"])
+    if len(held) > MAXIMUM_COHORT_SIZE:
+        raise OverflowError("Package defer holds too many link fingerprints")
     package[PACKAGE_DEFER_KEY] = {
         "crypter": crypter,
         "reason_code": reason_code,
@@ -500,7 +545,7 @@ def _write_generation_hold(
         "observation_holds": observation_holds,
         "schema_version": SWEEP_SCHEMA_VERSION,
         "sweep_id": sweep_id,
-        "link_fingerprint": link_fingerprint,
+        "link_fingerprints": sorted(held),
     }
     return json.dumps(package)
 
@@ -597,11 +642,18 @@ class CrypterCooldownService:
         committed = {}
 
         def commit(current_values):
-            record, decision = transition(
-                self._current_decision(current_values[0], now), now
-            )
+            current = self._current_decision(current_values[0], now)
+            record, decision = transition(current, now)
             committed.update(decision)
-            write = package_write(decision)
+            current_accepted = (
+                current.get("accepted_offers") if isinstance(current, dict) else None
+            )
+            record_accepted = (
+                record.get("accepted_offers") if isinstance(record, dict) else None
+            )
+            write = (
+                package_write(decision) if record_accepted != current_accepted else None
+            )
             return (
                 None if record is None else encode_decision_record(record),
                 *(
@@ -701,6 +753,9 @@ class CrypterCooldownService:
                 link_fingerprint=link_fingerprint,
                 retry_after_epoch=decision["retry_after_epoch"],
                 observation_holds=0 if decision["instruction"] == "cooldown" else 1,
+                # An individual decision never holds a cohort, so its hold is
+                # exactly the link this report proved and nothing else.
+                retain_existing=decision["state"] != "individual",
             )
 
         return self._commit_transition(
@@ -1073,7 +1128,7 @@ class CrypterCooldownService:
                     {
                         "schema_version": existing["schema_version"],
                         "sweep_id": existing["sweep_id"],
-                        "link_fingerprint": existing["link_fingerprint"],
+                        "link_fingerprints": existing["link_fingerprints"],
                     }
                 )
             package[PACKAGE_DEFER_KEY] = dict(stored)
@@ -1252,12 +1307,15 @@ class CrypterCooldownService:
         )
         return "deleted" if status == "deferred" else status
 
-    def _compare_and_clear(self, package_id, crypter, sweep_id):
+    def _compare_and_clear(self, package_id, crypter, sweep_id, link_fingerprint=None):
         """Drop a package hold only while it still belongs to this generation.
 
         The comparison runs inside the clearing transaction against the value
         that is current there, so a newer generation written meanwhile survives
         instead of being erased by a decision taken on an earlier read.
+        `link_fingerprint` releases exactly one held link and leaves the other
+        links of the same package held; the block itself is removed once the
+        last one is released.
         """
         cleared = {"done": False}
 
@@ -1266,6 +1324,19 @@ class CrypterCooldownService:
                 return current_value
             if crypter is not None and deferred["crypter"] != crypter:
                 return current_value
+            if link_fingerprint is not None:
+                remaining = [
+                    entry
+                    for entry in deferred["link_fingerprints"]
+                    if entry != link_fingerprint
+                ]
+                if len(remaining) == len(deferred["link_fingerprints"]):
+                    return current_value
+                cleared["done"] = True
+                if remaining:
+                    deferred["link_fingerprints"] = remaining
+                    package[PACKAGE_DEFER_KEY] = deferred
+                    return json.dumps(package)
             package.pop(PACKAGE_DEFER_KEY)
             cleared["done"] = True
             return json.dumps(package)
@@ -1275,11 +1346,18 @@ class CrypterCooldownService:
             return "cleared"
         return "generation_mismatch" if status == "deferred" else status
 
-    def compare_and_clear_package_defer(self, package_id, *, sweep_id):
+    def compare_and_clear_package_defer(
+        self, package_id, *, sweep_id, link_fingerprint=None
+    ):
         """Clear one package hold of exactly this sweep generation."""
         package_id = _validate_package_id(package_id)
         sweep_id = _validate_sweep_id(sweep_id)
-        return self._compare_and_clear(package_id, None, sweep_id) == "cleared"
+        if link_fingerprint is not None:
+            link_fingerprint = validate_link_fingerprint(link_fingerprint)
+        return (
+            self._compare_and_clear(package_id, None, sweep_id, link_fingerprint)
+            == "cleared"
+        )
 
     def clear_crypter_generation_holds(self, crypter, *, sweep_id):
         """Best-effort removal of every package hold of one sweep generation.
