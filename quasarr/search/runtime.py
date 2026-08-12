@@ -8,6 +8,8 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 
+from quasarr.providers.log import debug
+
 SOURCE_OUTCOMES = (
     "completed",
     "dropped",
@@ -93,7 +95,9 @@ class SearchRuntime:
         # tests; none of the counters below are time-based.
         self._clock = clock
         self._memory_reader = memory_reader
-        self._lock = threading.RLock()
+        # Reclaimer callbacks run after this lock is released, so transition
+        # bookkeeping has no load-bearing reentrancy.
+        self._lock = threading.Lock()
         self._counters = dict.fromkeys(_COUNTER_KEYS, 0)
         self._active_requests = 0
         self._active_source_tasks = 0
@@ -110,14 +114,16 @@ class SearchRuntime:
             self._counters["categories_planned"] += int(category_count)
             self._counters["families_planned"] += int(family_count)
             self._active_requests += 1
-            self._cancel_idle_reclaim_locked()
+            reclaimer = self._idle_reclaimer
+        self._cancel_idle_reclaim(reclaimer)
         try:
             yield self
         finally:
             with self._lock:
                 self._counters["requests_completed"] += 1
                 self._active_requests -= 1
-                self._schedule_idle_reclaim_locked()
+                reclaimer = self._idle_reclaimer if self._is_idle_locked() else None
+            self._schedule_idle_reclaim(reclaimer)
 
     @contextmanager
     def source_task(self) -> Iterator["SearchRuntime"]:
@@ -127,13 +133,15 @@ class SearchRuntime:
             self._peak_active_source_tasks = max(
                 self._peak_active_source_tasks, self._active_source_tasks
             )
-            self._cancel_idle_reclaim_locked()
+            reclaimer = self._idle_reclaimer
+        self._cancel_idle_reclaim(reclaimer)
         try:
             yield self
         finally:
             with self._lock:
                 self._active_source_tasks -= 1
-                self._schedule_idle_reclaim_locked()
+                reclaimer = self._idle_reclaimer if self._is_idle_locked() else None
+            self._schedule_idle_reclaim(reclaimer)
 
     def record_source_outcome(self, outcome: str) -> None:
         if outcome not in SOURCE_OUTCOMES:
@@ -157,7 +165,8 @@ class SearchRuntime:
         token = _OverdueToken()
         with self._lock:
             self._overdue_tokens.add(token)
-            self._cancel_idle_reclaim_locked()
+            reclaimer = self._idle_reclaimer
+        self._cancel_idle_reclaim(reclaimer)
         return token
 
     def resolve_source_overdue(self, token: object) -> bool:
@@ -168,8 +177,9 @@ class SearchRuntime:
             if token not in self._overdue_tokens:
                 return False
             self._overdue_tokens.remove(token)
-            self._schedule_idle_reclaim_locked()
-            return True
+            reclaimer = self._idle_reclaimer if self._is_idle_locked() else None
+        self._schedule_idle_reclaim(reclaimer)
+        return True
 
     def is_idle(self) -> bool:
         with self._lock:
@@ -217,19 +227,26 @@ class SearchRuntime:
             and not self._overdue_tokens
         )
 
-    def _cancel_idle_reclaim_locked(self) -> None:
-        if self._idle_reclaimer is None:
+    def _cancel_idle_reclaim(self, reclaimer) -> None:
+        if reclaimer is None:
             return
         try:
-            self._idle_reclaimer.cancel_for_activity()
+            reclaimer.cancel_for_activity()
         except Exception:
-            pass
+            self._log_idle_reclaimer_failure("activity callback")
 
-    def _schedule_idle_reclaim_locked(self) -> None:
-        if self._idle_reclaimer is None or not self._is_idle_locked():
+    def _schedule_idle_reclaim(self, reclaimer) -> None:
+        if reclaimer is None:
             return
         try:
-            self._idle_reclaimer.schedule_if_quiet()
+            reclaimer.schedule_if_quiet()
+        except Exception:
+            self._log_idle_reclaimer_failure("quiet callback")
+
+    @staticmethod
+    def _log_idle_reclaimer_failure(callback: str) -> None:
+        try:
+            debug(f"Search idle memory reclaimer {callback} failed")
         except Exception:
             pass
 

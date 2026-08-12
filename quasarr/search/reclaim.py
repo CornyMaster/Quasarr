@@ -48,15 +48,10 @@ class _NativeHeapTrimmer:
             return None
         try:
             libc = self._libc_loader("libc.so.6", use_errno=True)
-        except OSError:
-            return None
-        if not hasattr(libc, "malloc_trim"):
-            return None
-        malloc_trim = libc.malloc_trim
-        try:
+            malloc_trim = libc.malloc_trim
             malloc_trim.argtypes = [ctypes.c_size_t]
             malloc_trim.restype = ctypes.c_int
-        except (AttributeError, TypeError):
+        except Exception:
             return None
         return cast(Callable[[int], int], malloc_trim)
 
@@ -121,30 +116,59 @@ class IdleMemoryReclaimer:
         runtime.set_idle_reclaimer(self)
 
     def schedule_if_quiet(self) -> None:
-        if not self._runtime.is_idle():
-            return
-        now = self._clock()
-        with self._lock:
-            if self._timer is not None:
+        try:
+            if not self._runtime.is_idle():
                 return
-            if self._collecting:
-                self._schedule_after_collection = True
-                return
-            delay = self._quiet_seconds
-            if self._last_collection_at is not None:
-                delay = max(
-                    delay,
-                    self._minimum_interval_seconds - (now - self._last_collection_at),
+            with self._lock:
+                if self._timer is not None:
+                    return
+                if self._collecting:
+                    self._schedule_after_collection = True
+                    return
+
+            now = self._clock()
+            with self._lock:
+                if self._timer is not None:
+                    return
+                if self._collecting:
+                    self._schedule_after_collection = True
+                    return
+                delay = self._quiet_seconds
+                if self._last_collection_at is not None:
+                    delay = max(
+                        delay,
+                        self._minimum_interval_seconds
+                        - (now - self._last_collection_at),
+                    )
+                token = object()
+                activity_generation = self._activity_generation
+                timer = self._timer_factory(
+                    max(0, delay),
+                    lambda: self._timer_fired(token, activity_generation),
                 )
-            token = object()
-            timer = self._timer_factory(
-                max(0, delay),
-                lambda: self._timer_fired(token),
-            )
-            timer.daemon = True
-            self._timer = timer
-            self._timer_token = token
+                timer.daemon = True
+                self._timer = timer
+                self._timer_token = token
+        except Exception:
+            self._log_message("Search idle memory reclaim scheduling failed")
+            return
+
+        try:
+            if not self._runtime.is_idle():
+                self._discard_timer(token, timer)
+                return
+            with self._lock:
+                should_start = (
+                    token is self._timer_token
+                    and activity_generation == self._activity_generation
+                )
+            if not should_start:
+                timer.cancel()
+                return
             timer.start()
+        except Exception:
+            self._discard_timer(token, timer)
+            self._log_message("Search idle memory reclaim timer start failed")
 
     def cancel_for_activity(self) -> None:
         with self._lock:
@@ -153,25 +177,39 @@ class IdleMemoryReclaimer:
             self._timer = None
             self._timer_token = None
         if timer is not None:
-            timer.cancel()
+            try:
+                timer.cancel()
+            except Exception:
+                self._log_message("Search idle memory reclaim timer cancel failed")
 
     def collect_and_trim(self) -> dict[str, bool | int | None]:
         summary = _empty_summary()
-        if not self._runtime.is_idle():
+        try:
+            if not self._runtime.is_idle():
+                return summary
+            now = self._clock()
+            with self._lock:
+                if self._collecting:
+                    return summary
+                if (
+                    self._last_collection_at is not None
+                    and now - self._last_collection_at < self._minimum_interval_seconds
+                ):
+                    return summary
+                self._collecting = True
+                activity_generation = self._activity_generation
+        except Exception:
+            self._log_message("Search idle memory reclaim setup failed")
             return summary
 
-        now = self._clock()
-        with self._lock:
-            if self._collecting:
-                return summary
-            if (
-                self._last_collection_at is not None
-                and now - self._last_collection_at < self._minimum_interval_seconds
-            ):
-                return summary
-            self._collecting = True
-            activity_generation = self._activity_generation
+        return self._collect_claimed(summary, now, activity_generation)
 
+    def _collect_claimed(
+        self,
+        summary: dict[str, bool | int | None],
+        now: float,
+        activity_generation: int,
+    ) -> dict[str, bool | int | None]:
         try:
             if not self._quiet_is_unchanged(activity_generation):
                 return summary
@@ -204,13 +242,51 @@ class IdleMemoryReclaimer:
                 self.schedule_if_quiet()
         return summary
 
-    def _timer_fired(self, token: object) -> None:
+    def _timer_fired(self, token: object, activity_generation: int) -> None:
+        collection_claimed = False
+        try:
+            now = self._clock()
+            with self._lock:
+                if token is not self._timer_token:
+                    return
+                if activity_generation != self._activity_generation:
+                    self._timer = None
+                    self._timer_token = None
+                    return
+                self._timer = None
+                self._timer_token = None
+                if self._collecting:
+                    return
+                if (
+                    self._last_collection_at is not None
+                    and now - self._last_collection_at < self._minimum_interval_seconds
+                ):
+                    return
+                self._collecting = True
+                collection_claimed = True
+            self._collect_claimed(_empty_summary(), now, activity_generation)
+        except Exception:
+            with self._lock:
+                if token is self._timer_token:
+                    self._timer = None
+                    self._timer_token = None
+                if collection_claimed and self._collecting:
+                    self._collecting = False
+                schedule_after_collection = self._schedule_after_collection
+                self._schedule_after_collection = False
+            self._log_message("Search idle memory reclaim timer callback failed")
+            if schedule_after_collection:
+                self.schedule_if_quiet()
+
+    def _discard_timer(self, token: object, timer) -> None:
         with self._lock:
-            if token is not self._timer_token:
-                return
-            self._timer = None
-            self._timer_token = None
-        self.collect_and_trim()
+            if token is self._timer_token:
+                self._timer = None
+                self._timer_token = None
+        try:
+            timer.cancel()
+        except Exception:
+            self._log_message("Search idle memory reclaim timer cancel failed")
 
     def _quiet_is_unchanged(self, activity_generation: int) -> bool:
         if not self._runtime.is_idle():
@@ -231,7 +307,10 @@ class IdleMemoryReclaimer:
         return None
 
     def _log(self, summary: Mapping[str, bool | int | None]) -> None:
+        self._log_message(f"Search idle memory reclaim summary: {dict(summary)}")
+
+    def _log_message(self, message: str) -> None:
         try:
-            self._logger(f"Search idle memory reclaim summary: {dict(summary)}")
+            self._logger(message)
         except Exception:
             pass

@@ -61,6 +61,58 @@ class FakeTimerFactory:
         return timer
 
 
+class FailingOnceClock(FakeClock):
+    def __init__(self, now=100.0):
+        super().__init__(now)
+        self.fail_next = False
+
+    def __call__(self):
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("synthetic clock failure")
+        return super().__call__()
+
+
+class FailingTimerFactory(FakeTimerFactory):
+    def __init__(self, fail_on_call):
+        super().__init__()
+        self.calls = 0
+        self.fail_on_call = fail_on_call
+
+    def __call__(self, interval, callback):
+        self.calls += 1
+        if self.calls == self.fail_on_call:
+            raise RuntimeError("synthetic timer factory failure")
+        return super().__call__(interval, callback)
+
+
+class RaisingReclaimer:
+    def __init__(self):
+        self.calls = []
+
+    def cancel_for_activity(self):
+        self.calls.append("cancel")
+        raise RuntimeError("synthetic cancel failure")
+
+    def schedule_if_quiet(self):
+        self.calls.append("schedule")
+        raise RuntimeError("synthetic schedule failure")
+
+
+class HandoffActivityRuntime(SearchRuntime):
+    def __init__(self):
+        super().__init__(memory_reader=lambda: {})
+        self.activity_on_next_idle_check = False
+        self.activity_events = []
+
+    def is_idle(self):
+        if self.activity_on_next_idle_check:
+            self.activity_on_next_idle_check = False
+            with self.request(category_count=1, family_count=1):
+                self.activity_events.append("activity")
+        return super().is_idle()
+
+
 class RecordingCache:
     def __init__(self, events=None, expired=0):
         self.events = events if events is not None else []
@@ -160,6 +212,149 @@ class IdleMemoryReclaimerTests(unittest.TestCase):
         self.assertEqual(2, len(timers.timers))
         self.assertFalse(timers.timers[1].cancelled)
         self.assertEqual(30, timers.timers[1].interval)
+
+    def test_timer_handoff_activity_aborts_and_restarts_the_full_quiet_period(self):
+        runtime = HandoffActivityRuntime()
+        timers = FakeTimerFactory()
+        reclaim_events = []
+        reclaimer = self.make_reclaimer(
+            runtime=runtime,
+            timers=timers,
+            cache=RecordingCache(reclaim_events),
+            collector=lambda: reclaim_events.append("gc") or 0,
+            native_trimmer=lambda: reclaim_events.append("trim") or True,
+        )
+        reclaimer.schedule_if_quiet()
+        runtime.activity_on_next_idle_check = True
+
+        timers.timers[0].fire()
+
+        self.assertEqual(["activity"], runtime.activity_events)
+        self.assertEqual([], reclaim_events)
+        self.assertEqual(2, len(timers.timers))
+        self.assertEqual(30, timers.timers[1].interval)
+        self.assertTrue(timers.timers[1].started)
+
+    def test_timer_start_runs_outside_runtime_and_reclaimer_locks(self):
+        runtime = SearchRuntime(memory_reader=lambda: {})
+        lock_checks = []
+        timers = []
+
+        class LockCheckingTimer(FakeTimer):
+            def start(self):
+                lock_checks.append(
+                    (
+                        can_acquire_from_another_thread(runtime._lock),
+                        can_acquire_from_another_thread(reclaimer._lock),
+                    )
+                )
+                super().start()
+
+        def timer_factory(interval, callback):
+            timer = LockCheckingTimer(interval, callback)
+            timers.append(timer)
+            return timer
+
+        reclaimer = self.make_reclaimer(runtime=runtime, timers=timer_factory)
+
+        with runtime.request(category_count=1, family_count=1):
+            pass
+
+        self.assertEqual([(True, True)], lock_checks)
+        self.assertEqual(1, len(timers))
+
+    def test_raising_reclaimer_callbacks_do_not_fail_request_transitions(self):
+        runtime = SearchRuntime(memory_reader=lambda: {})
+        reclaimer = RaisingReclaimer()
+        runtime.set_idle_reclaimer(reclaimer)
+
+        with runtime.request(category_count=1, family_count=1):
+            pass
+
+        self.assertEqual(["cancel", "schedule"], reclaimer.calls)
+        self.assertEqual(0, runtime.snapshot()["active_requests"])
+
+    def test_raising_reclaimer_callbacks_do_not_fail_source_transitions(self):
+        runtime = SearchRuntime(memory_reader=lambda: {})
+        reclaimer = RaisingReclaimer()
+        runtime.set_idle_reclaimer(reclaimer)
+
+        with runtime.source_task():
+            pass
+
+        self.assertEqual(["cancel", "schedule"], reclaimer.calls)
+        self.assertEqual(0, runtime.snapshot()["active_source_tasks"])
+
+    def test_raising_reclaimer_callbacks_do_not_fail_overdue_transitions(self):
+        runtime = SearchRuntime(memory_reader=lambda: {})
+        reclaimer = RaisingReclaimer()
+        runtime.set_idle_reclaimer(reclaimer)
+
+        token = runtime.mark_source_overdue()
+        resolved = runtime.resolve_source_overdue(token)
+
+        self.assertTrue(resolved)
+        self.assertEqual(["cancel", "schedule"], reclaimer.calls)
+        self.assertEqual(0, runtime.snapshot()["overdue_source_tasks"])
+
+    def test_timer_callback_failure_is_contained_and_state_stays_schedulable(self):
+        clock = FailingOnceClock()
+        timers = FakeTimerFactory()
+        reclaimer = self.make_reclaimer(clock=clock, timers=timers)
+        reclaimer.schedule_if_quiet()
+        clock.fail_next = True
+
+        timers.timers[0].fire()
+        reclaimer.schedule_if_quiet()
+
+        self.assertEqual(2, len(timers.timers))
+        self.assertTrue(timers.timers[1].started)
+
+    def test_rearm_failure_is_contained_and_state_stays_schedulable(self):
+        runtime = SearchRuntime(memory_reader=lambda: {})
+        timers = FailingTimerFactory(fail_on_call=2)
+
+        class ActivityDuringSweepCache:
+            def sweep(self):
+                with runtime.request(category_count=1, family_count=1):
+                    pass
+                return 0
+
+        reclaimer = self.make_reclaimer(
+            runtime=runtime,
+            timers=timers,
+            cache=ActivityDuringSweepCache(),
+        )
+        reclaimer.schedule_if_quiet()
+
+        timers.timers[0].fire()
+        reclaimer.schedule_if_quiet()
+
+        self.assertEqual(3, timers.calls)
+        self.assertEqual(2, len(timers.timers))
+        self.assertTrue(timers.timers[1].started)
+
+    def test_timer_start_failure_clears_the_token_for_a_later_schedule(self):
+        timers = FakeTimerFactory()
+
+        class StartFailureTimer(FakeTimer):
+            def start(self):
+                raise RuntimeError("synthetic timer start failure")
+
+        def fail_first_start(interval, callback):
+            if not timers.timers:
+                timer = StartFailureTimer(interval, callback)
+                timers.timers.append(timer)
+                return timer
+            return timers(interval, callback)
+
+        reclaimer = self.make_reclaimer(timers=fail_first_start)
+
+        reclaimer.schedule_if_quiet()
+        reclaimer.schedule_if_quiet()
+
+        self.assertEqual(2, len(timers.timers))
+        self.assertTrue(timers.timers[1].started)
 
     def test_source_and_overdue_transitions_each_reset_the_quiet_timer(self):
         runtime = SearchRuntime(memory_reader=lambda: {})
@@ -487,6 +682,19 @@ class NativeHeapTrimmerTests(unittest.TestCase):
         self.assertFalse(trimmer())
         self.assertEqual([("libc.so.6", True)], loads)
 
+    def test_a_non_oserror_loader_failure_is_a_permanent_no_op(self):
+        loads = []
+
+        def broken_loader(name, *, use_errno):
+            loads.append((name, use_errno))
+            raise RuntimeError("synthetic loader failure")
+
+        trimmer = _NativeHeapTrimmer(platform="linux", libc_loader=broken_loader)
+
+        self.assertFalse(trimmer())
+        self.assertFalse(trimmer())
+        self.assertEqual([("libc.so.6", True)], loads)
+
     def test_a_libc_without_malloc_trim_is_a_permanent_no_op(self):
         loads = []
 
@@ -499,6 +707,57 @@ class NativeHeapTrimmerTests(unittest.TestCase):
         self.assertFalse(trimmer())
         self.assertFalse(trimmer())
         self.assertEqual([("libc.so.6", True)], loads)
+
+    def test_a_symbol_setup_failure_is_a_permanent_no_op(self):
+        loads = []
+
+        class FailingSignatureMallocTrim:
+            restype = None
+
+            @property
+            def argtypes(self):
+                return None
+
+            @argtypes.setter
+            def argtypes(self, _value):
+                raise RuntimeError("synthetic signature failure")
+
+            def __call__(self, _padding):
+                return 1
+
+        libc = type("FakeLibc", (), {"malloc_trim": FailingSignatureMallocTrim()})()
+
+        def load_libc(name, *, use_errno):
+            loads.append((name, use_errno))
+            return libc
+
+        trimmer = _NativeHeapTrimmer(platform="linux", libc_loader=load_libc)
+
+        self.assertFalse(trimmer())
+        self.assertFalse(trimmer())
+        self.assertEqual([("libc.so.6", True)], loads)
+
+    def test_a_trim_call_failure_is_a_permanent_no_op(self):
+        loads = []
+
+        class FailingMallocTrim(FakeMallocTrim):
+            def __call__(self, padding):
+                self.calls.append(padding)
+                raise RuntimeError("synthetic trim failure")
+
+        malloc_trim = FailingMallocTrim()
+        libc = type("FakeLibc", (), {"malloc_trim": malloc_trim})()
+
+        def load_libc(name, *, use_errno):
+            loads.append((name, use_errno))
+            return libc
+
+        trimmer = _NativeHeapTrimmer(platform="linux", libc_loader=load_libc)
+
+        self.assertFalse(trimmer())
+        self.assertFalse(trimmer())
+        self.assertEqual([("libc.so.6", True)], loads)
+        self.assertEqual([0], malloc_trim.calls)
 
     def test_glibc_malloc_trim_is_typed_cached_and_called_with_zero(self):
         loads = []
