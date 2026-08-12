@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 
 import hashlib
+import importlib.util
 import json
+import sys
 import threading
 import unittest
+from unittest.mock import patch
 
+import quasarr.providers.crypter_cooldowns as cooldown_module
 from quasarr.downloads import (
     classify_links,
     detect_crypter,
@@ -16,6 +20,7 @@ from quasarr.providers.crypter_cooldowns import (
     normalize_crypter_key,
     validate_link_fingerprint,
 )
+from quasarr.providers.log import _contexts_to_str
 
 PACKAGE_A = "Quasarr_movies_00000000000000000000000000000000"
 PACKAGE_B = "Quasarr_movies_11111111111111111111111111111111"
@@ -37,8 +42,11 @@ class FakeDatabase:
         self.rows = {}
         self.lock = threading.Lock()
         self.mutation_count = 0
+        self.retrieve_count = 0
+        self.before_mutation = None
 
     def retrieve(self, key):
+        self.retrieve_count += 1
         return self.rows.get(key)
 
     def update_store(self, key, value):
@@ -48,6 +56,10 @@ class FakeDatabase:
     def mutate_value(self, key, mutator):
         with self.lock:
             self.mutation_count += 1
+            if self.before_mutation is not None:
+                before_mutation = self.before_mutation
+                self.before_mutation = None
+                before_mutation()
             value = mutator(self.rows.get(key))
             if value is None:
                 self.rows.pop(key, None)
@@ -61,7 +73,6 @@ class FakeSharedState:
         self.values = {"crypter_cooldown_hours": cooldown_hours}
         self.databases = {
             "crypter_cooldowns": FakeDatabase(),
-            "protected": FakeDatabase(),
         }
 
     def get_db(self, table):
@@ -126,6 +137,25 @@ class ProtectedCrypterResolverTests(unittest.TestCase):
                     normalize_crypter_key(value)
 
 
+class CooldownModuleBoundaryTests(unittest.TestCase):
+    def test_module_import_does_not_require_downloads(self):
+        spec = importlib.util.spec_from_file_location(
+            "_crypter_cooldown_import_probe", cooldown_module.__file__
+        )
+        module = importlib.util.module_from_spec(spec)
+
+        with patch.dict(sys.modules, {"quasarr.downloads": None}):
+            spec.loader.exec_module(module)
+
+    def test_log_context_uses_concise_cooldown_marker(self):
+        context, source = _contexts_to_str(
+            ["quasarr", "providers", "crypter_cooldowns"]
+        )
+
+        self.assertEqual("🔌⏳", context)
+        self.assertEqual("", source)
+
+
 class CrypterCooldownServiceTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock(1_700_000_000)
@@ -144,24 +174,6 @@ class CrypterCooldownServiceTests(unittest.TestCase):
         self.clock.now += 1
         decision = self._observe(PACKAGE_C, "c")
         return decision
-
-    def _seed_protected_package(self, package_id=PACKAGE_A, probe_requested=False):
-        protected = {
-            "title": "Synthetic.Release",
-            "links": [["https://filecrypt.invalid/container/1", "filecrypt"]],
-            "password": "",
-            "deferred": {
-                "crypter": "filecrypt",
-                "reason_code": REASON,
-                "since_epoch": self.clock.now,
-                "retry_after_epoch": self.clock.now + 24 * 60 * 60,
-                "probe_requested": probe_requested,
-                "observation_holds": 1,
-            },
-        }
-        self.shared_state.databases["protected"].update_store(
-            package_id, json.dumps(protected)
-        )
 
     def test_first_observation_starts_provisional_hold(self):
         decision = self.service.observe(
@@ -195,7 +207,7 @@ class CrypterCooldownServiceTests(unittest.TestCase):
             stored,
         )
 
-    def test_duplicate_package_or_fingerprint_refreshes_without_new_evidence(self):
+    def test_duplicate_package_or_fingerprint_does_not_refresh_evidence(self):
         self._observe(PACKAGE_A, "a")
 
         self.clock.now += 10
@@ -216,12 +228,34 @@ class CrypterCooldownServiceTests(unittest.TestCase):
             {item["package_id"] for item in stored["observations"]},
         )
         self.assertEqual(
-            self.clock.now - 10,
+            self.clock.now - 30,
             next(
                 item["seen_at_epoch"]
                 for item in stored["observations"]
                 if item["package_id"] == PACKAGE_A
             ),
+        )
+
+    def test_duplicate_cannot_extend_evidence_beyond_fixed_window(self):
+        self._observe(PACKAGE_A, "a")
+        self.clock.now += 899
+        duplicate = self._observe(PACKAGE_A, "b")
+        after_duplicate = json.loads(
+            self.shared_state.databases["crypter_cooldowns"].rows["filecrypt"]
+        )
+        self.assertEqual(self.clock.now - 899, after_duplicate["first_seen_epoch"])
+        self.assertEqual(self.clock.now - 899, after_duplicate["last_seen_epoch"])
+        self.clock.now += 2
+
+        decision = self._observe(PACKAGE_B, "b")
+
+        self.assertEqual(1, duplicate["evidence_count"])
+        self.assertEqual(1, decision["evidence_count"])
+        snapshot = self.service.snapshot("filecrypt")
+        self.assertEqual(self.clock.now, snapshot["first_seen_epoch"])
+        self.assertEqual(
+            [PACKAGE_B],
+            [item["package_id"] for item in snapshot["observations"]],
         )
 
     def test_three_distinct_observations_create_cooldown(self):
@@ -239,6 +273,25 @@ class CrypterCooldownServiceTests(unittest.TestCase):
         self.assertEqual(3, snapshot["evidence_count"])
         self.assertEqual(expected_retry, snapshot["retry_after_epoch"])
         self.assertNotIn("probe", json.dumps(snapshot))
+
+    def test_duplicate_evidence_does_not_extend_active_cooldown(self):
+        initial = self._enter_cooldown()
+        initial_retry_after = initial["package_retry_after_epoch"]
+        initial_last_seen = self.clock.now
+
+        self.clock.now += 60
+        duplicate_package = self._observe(PACKAGE_A, "d")
+        self.clock.now += 60
+        duplicate_fingerprint = self._observe(PACKAGE_D, "a")
+
+        self.assertEqual(
+            initial_retry_after, duplicate_package["package_retry_after_epoch"]
+        )
+        self.assertEqual(
+            initial_retry_after, duplicate_fingerprint["package_retry_after_epoch"]
+        )
+        snapshot = self.service.snapshot("filecrypt")
+        self.assertEqual(initial_last_seen, snapshot["last_seen_epoch"])
 
     def test_observations_outside_window_are_pruned(self):
         self._observe(PACKAGE_A, "a")
@@ -304,38 +357,6 @@ class CrypterCooldownServiceTests(unittest.TestCase):
             "filecrypt", self.shared_state.databases["crypter_cooldowns"].rows
         )
 
-    def test_probe_request_is_consumed_exactly_once(self):
-        self._seed_protected_package()
-
-        result = self.service.request_probe([PACKAGE_A])
-
-        self.assertIsInstance(result, dict)
-        self.assertEqual([PACKAGE_A], result["requested"])
-        self.assertTrue(self.service.consume_probe(PACKAGE_A, "filecrypt"))
-        self.assertFalse(self.service.consume_probe(PACKAGE_A, "filecrypt"))
-        protected = json.loads(
-            self.shared_state.databases["protected"].rows[PACKAGE_A]
-        )
-        self.assertFalse(protected["deferred"]["probe_requested"])
-
-    def test_blocked_probe_restarts_full_cooldown(self):
-        initial = self._enter_cooldown()
-        self._seed_protected_package()
-        self.service.request_probe([PACKAGE_A])
-        self.assertTrue(self.service.consume_probe(PACKAGE_A, "filecrypt"))
-        self.clock.now += 60 * 60
-
-        restarted = self._observe(PACKAGE_A, "a")
-
-        self.assertGreater(
-            restarted["package_retry_after_epoch"],
-            initial["package_retry_after_epoch"],
-        )
-        self.assertEqual(
-            self.clock.now + 24 * 60 * 60,
-            restarted["package_retry_after_epoch"],
-        )
-
     def test_invalid_observations_raise_without_database_writes(self):
         invalid = (
             ("hide", PACKAGE_A, "a" * 64, REASON),
@@ -372,29 +393,125 @@ class CrypterCooldownServiceTests(unittest.TestCase):
         self.assertNotIn('"url"', stored)
         self.assertIn(fingerprint, stored)
 
-    def test_persisted_schema_rejects_probe_state_and_probe_fields(self):
+    def test_additive_persisted_fields_are_ignored_without_rewriting_the_row(self):
+        database = self.shared_state.databases["crypter_cooldowns"]
+        self._observe(PACKAGE_A, "a")
+        persisted = json.loads(database.rows["filecrypt"])
+        persisted["future_metadata"] = {"sensitive_marker": "do-not-log"}
+        persisted["observations"][0]["future_observation_field"] = "ignored"
+        raw_record = json.dumps(persisted)
+        database.rows["filecrypt"] = raw_record
+        database.mutation_count = 0
+
+        snapshot = self.service.snapshot("filecrypt")
+
+        self.assertEqual("observing", snapshot["state"])
+        self.assertNotIn("future_metadata", snapshot)
+        self.assertNotIn(
+            "future_observation_field", snapshot["observations"][0]
+        )
+        self.assertEqual(raw_record, database.rows["filecrypt"])
+        self.assertEqual(0, database.mutation_count)
+
+    def test_invalid_persisted_rows_self_heal_with_sanitized_warning(self):
         database = self.shared_state.databases["crypter_cooldowns"]
         self._observe(PACKAGE_A, "a")
         valid_record = json.loads(database.rows["filecrypt"])
-        invalid_records = []
+        missing_required = dict(valid_record)
+        del missing_required["observations"]
+        missing_observation_field = json.loads(json.dumps(valid_record))
+        del missing_observation_field["observations"][0]["link_fingerprint"]
+        unsupported_state = dict(valid_record)
+        unsupported_state["state"] = "future-sensitive-state"
+        invalid_rows = (
+            "not-json-sensitive-marker",
+            json.dumps(missing_required),
+            json.dumps(missing_observation_field),
+            json.dumps(unsupported_state),
+        )
 
-        probe_state = dict(valid_record)
-        probe_state["state"] = "probe"
-        invalid_records.append(probe_state)
-
-        probe_field = dict(valid_record)
-        probe_field["probe_requested"] = True
-        invalid_records.append(probe_field)
-
-        for record in invalid_records:
-            with self.subTest(record=record):
-                raw_record = json.dumps(record)
+        for raw_record in invalid_rows:
+            with self.subTest(raw_record=raw_record):
                 database.rows["filecrypt"] = raw_record
+                database.mutation_count = 0
 
-                with self.assertRaises(ValueError):
-                    self.service.snapshot("filecrypt")
+                with patch(
+                    "quasarr.providers.crypter_cooldowns.warn", create=True
+                ) as warning:
+                    snapshot = self.service.snapshot("filecrypt")
 
-                self.assertEqual(raw_record, database.rows["filecrypt"])
+                self.assertEqual("available", snapshot["state"])
+                self.assertNotIn("filecrypt", database.rows)
+                self.assertEqual(1, database.mutation_count)
+                warning.assert_called_once()
+                warning_text = str(warning.call_args)
+                self.assertIn("filecrypt", warning_text)
+                self.assertNotIn(raw_record, warning_text)
+
+    def test_observation_replaces_invalid_row_and_logs_sanitized_warning(self):
+        database = self.shared_state.databases["crypter_cooldowns"]
+        raw_record = "malformed-sensitive-marker"
+        database.rows["filecrypt"] = raw_record
+
+        with patch(
+            "quasarr.providers.crypter_cooldowns.warn", create=True
+        ) as warning:
+            decision = self._observe(PACKAGE_A, "a")
+
+        self.assertEqual("observing", decision["state"])
+        self.assertEqual(1, decision["evidence_count"])
+        persisted = json.loads(database.rows["filecrypt"])
+        self.assertEqual(PACKAGE_A, persisted["observations"][0]["package_id"])
+        warning.assert_called_once()
+        warning_text = str(warning.call_args)
+        self.assertIn("filecrypt", warning_text)
+        self.assertNotIn(raw_record, warning_text)
+
+    def test_cleanup_returns_concurrent_valid_replacement(self):
+        database = self.shared_state.databases["crypter_cooldowns"]
+        database.rows["filecrypt"] = "malformed-sensitive-marker"
+        concurrent_record = {
+            "state": "cooldown",
+            "reason_code": REASON,
+            "first_seen_epoch": self.clock.now,
+            "last_seen_epoch": self.clock.now,
+            "retry_after_epoch": self.clock.now + 24 * 60 * 60,
+            "observations": [
+                {
+                    "package_id": PACKAGE_A,
+                    "link_fingerprint": "a" * 64,
+                    "seen_at_epoch": self.clock.now,
+                }
+            ],
+        }
+        concurrent_value = json.dumps(concurrent_record)
+        database.before_mutation = lambda: database.rows.__setitem__(
+            "filecrypt", concurrent_value
+        )
+
+        with patch("quasarr.providers.crypter_cooldowns.warn"):
+            snapshot = self.service.snapshot("filecrypt")
+
+        self.assertEqual("cooldown", snapshot["state"])
+        self.assertEqual(1, snapshot["evidence_count"])
+        self.assertEqual(concurrent_value, database.rows["filecrypt"])
+
+    def test_missing_and_valid_snapshots_are_read_only(self):
+        database = self.shared_state.databases["crypter_cooldowns"]
+
+        self.assertEqual("available", self.service.snapshot("filecrypt")["state"])
+        self.assertEqual(1, database.retrieve_count)
+        self.assertEqual(0, database.mutation_count)
+
+        self._observe(PACKAGE_A, "a")
+        database.retrieve_count = 0
+        database.mutation_count = 0
+
+        self.assertEqual("observing", self.service.snapshot("filecrypt")["state"])
+        self.assertFalse(self.service.is_cooling("filecrypt"))
+        self.assertEqual(0, self.service.retry_after("filecrypt"))
+        self.assertEqual(3, database.retrieve_count)
+        self.assertEqual(0, database.mutation_count)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ Locking contract:
 - `mutate_value` holds one SQLite write transaction across read, callback,
     and write. The callback runs once and cannot enter another locked
     Config/DataBase operation; it must return a string or None without side effects.
+    It must finish on the calling thread rather than spawning or delegating work.
+    The nested-call guard is thread-local and does not reject unrelated threads.
 """
 
 import sqlite3
@@ -280,8 +282,8 @@ class DataBase(object):
         if not callable(mutator):
             raise TypeError("mutator must be callable")
 
-        self._with_retry(lambda: self._conn.execute("BEGIN IMMEDIATE"))
         try:
+            self._with_retry(lambda: self._conn.execute("BEGIN IMMEDIATE"))
             query = f"SELECT value FROM {self._table} WHERE key=?"
             result = self._conn.execute(query, (key,)).fetchone()
             current_value = result[0] if result else None

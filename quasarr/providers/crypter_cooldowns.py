@@ -7,7 +7,7 @@ import re
 import time
 
 from quasarr.constants import PACKAGE_ID_PATTERN
-from quasarr.downloads import protected_crypter_keys
+from quasarr.providers.log import warn
 
 OBSERVATION_WINDOW_SECONDS = 15 * 60
 MINIMUM_COOLDOWN_HOURS = 24
@@ -26,6 +26,8 @@ _OBSERVATION_KEYS = {"package_id", "link_fingerprint", "seen_at_epoch"}
 
 
 def normalize_crypter_key(value):
+    from quasarr.downloads import protected_crypter_keys
+
     if not isinstance(value, str):
         raise ValueError("Unsupported linkcrypter key")
     normalized = value.strip().lower()
@@ -65,7 +67,7 @@ def _decode_record(value):
         record = json.loads(value)
     except (TypeError, json.JSONDecodeError) as error:
         raise ValueError("Invalid persisted linkcrypter JSON") from error
-    if not isinstance(record, dict) or set(record) != _RECORD_KEYS:
+    if not isinstance(record, dict) or not _RECORD_KEYS.issubset(record):
         raise ValueError("Invalid persisted linkcrypter record")
     if record["state"] not in {"observing", "cooldown"}:
         raise ValueError("Invalid persisted linkcrypter state")
@@ -78,13 +80,30 @@ def _decode_record(value):
         _validate_epoch(record[field_name], field_name)
     if not isinstance(record["observations"], list):
         raise ValueError("Invalid persisted linkcrypter observations")
+    observations = []
     for observation in record["observations"]:
-        if not isinstance(observation, dict) or set(observation) != _OBSERVATION_KEYS:
+        if not isinstance(observation, dict) or not _OBSERVATION_KEYS.issubset(
+            observation
+        ):
             raise ValueError("Invalid persisted linkcrypter observation")
         _validate_package_id(observation["package_id"])
         validate_link_fingerprint(observation["link_fingerprint"])
         _validate_epoch(observation["seen_at_epoch"], "seen_at_epoch")
-    return record
+        observations.append(
+            {
+                "package_id": observation["package_id"],
+                "link_fingerprint": observation["link_fingerprint"],
+                "seen_at_epoch": observation["seen_at_epoch"],
+            }
+        )
+    return {
+        "state": record["state"],
+        "reason_code": record["reason_code"],
+        "first_seen_epoch": record["first_seen_epoch"],
+        "last_seen_epoch": record["last_seen_epoch"],
+        "retry_after_epoch": record["retry_after_epoch"],
+        "observations": observations,
+    }
 
 
 def _encode_record(record):
@@ -119,6 +138,10 @@ class CrypterCooldownService:
         return max(MINIMUM_COOLDOWN_HOURS, hours) * 60 * 60
 
     @staticmethod
+    def _warn_invalid_record(crypter):
+        warn(f'Discarding invalid persisted cooldown for linkcrypter "{crypter}"')
+
+    @staticmethod
     def _prune_record(record, now):
         if record is None:
             return None
@@ -142,6 +165,35 @@ class CrypterCooldownService:
             record["last_seen_epoch"] = max(seen_at)
         return record
 
+    def _cleanup_snapshot(self, database, crypter, now, invalid_observed=False):
+        result = {}
+        invalid = {"observed": invalid_observed}
+
+        def cleanup(current_value):
+            try:
+                record = _decode_record(current_value)
+            except ValueError:
+                invalid["observed"] = True
+                result.update(_available_snapshot())
+                return None
+
+            observation_count = len(record["observations"]) if record else 0
+            record = self._prune_record(record, now)
+            if record is None:
+                result.update(_available_snapshot())
+                return None
+
+            result.update(record)
+            result["evidence_count"] = len(record["observations"])
+            if len(record["observations"]) == observation_count:
+                return current_value
+            return _encode_record(record)
+
+        database.mutate_value(crypter, cleanup)
+        if invalid["observed"]:
+            self._warn_invalid_record(crypter)
+        return result
+
     def observe(self, crypter, package_id, link_fingerprint, reason_code):
         crypter = normalize_crypter_key(crypter)
         package_id = _validate_package_id(package_id)
@@ -150,9 +202,15 @@ class CrypterCooldownService:
         now = int(self._clock())
         cooldown_seconds = self._cooldown_seconds()
         decision = {}
+        invalid_record = {"found": False}
 
         def update_record(current_value):
-            record = self._prune_record(_decode_record(current_value), now)
+            try:
+                record = _decode_record(current_value)
+            except ValueError:
+                invalid_record["found"] = True
+                record = None
+            record = self._prune_record(record, now)
             if record is None:
                 record = {
                     "state": "observing",
@@ -180,21 +238,20 @@ class CrypterCooldownService:
                         "seen_at_epoch": now,
                     }
                 )
-            else:
-                duplicate["seen_at_epoch"] = now
 
             seen_at = [
                 observation["seen_at_epoch"]
                 for observation in record["observations"]
             ]
             record["first_seen_epoch"] = min(seen_at)
-            record["last_seen_epoch"] = now
+            record["last_seen_epoch"] = max(seen_at)
             evidence_count = len(record["observations"])
             existing_retry_after = record["retry_after_epoch"]
             if record["state"] == "cooldown" or evidence_count >= EVIDENCE_THRESHOLD:
                 record["state"] = "cooldown"
                 record["retry_after_epoch"] = max(
-                    existing_retry_after, now + cooldown_seconds
+                    existing_retry_after,
+                    record["last_seen_epoch"] + cooldown_seconds,
                 )
                 package_retry_after = record["retry_after_epoch"]
             else:
@@ -211,28 +268,35 @@ class CrypterCooldownService:
             )
             return _encode_record(record)
 
-        self._shared_state.get_db("crypter_cooldowns").mutate_value(
-            crypter, update_record
-        )
+        database = self._shared_state.get_db("crypter_cooldowns")
+        database.mutate_value(crypter, update_record)
+        if invalid_record["found"]:
+            self._warn_invalid_record(crypter)
         return decision
 
     def snapshot(self, crypter):
         crypter = normalize_crypter_key(crypter)
         now = int(self._clock())
-        result = {}
+        database = self._shared_state.get_db("crypter_cooldowns")
+        current_value = database.retrieve(crypter)
+        if current_value is None:
+            return _available_snapshot()
+        try:
+            record = _decode_record(current_value)
+        except ValueError:
+            return self._cleanup_snapshot(
+                database, crypter, now, invalid_observed=True
+            )
 
-        def read_record(current_value):
-            record = self._prune_record(_decode_record(current_value), now)
-            if record is None:
-                result.update(_available_snapshot())
-                return None
-            result.update(record)
-            result["evidence_count"] = len(record["observations"])
-            return _encode_record(record)
+        observation_count = len(record["observations"])
+        record = self._prune_record(record, now)
+        if record is None:
+            return self._cleanup_snapshot(database, crypter, now)
+        if len(record["observations"]) != observation_count:
+            return self._cleanup_snapshot(database, crypter, now)
 
-        self._shared_state.get_db("crypter_cooldowns").mutate_value(
-            crypter, read_record
-        )
+        result = dict(record)
+        result["evidence_count"] = len(record["observations"])
         return result
 
     def is_cooling(self, crypter):
@@ -246,80 +310,3 @@ class CrypterCooldownService:
         self._shared_state.get_db("crypter_cooldowns").mutate_value(
             crypter, lambda _current_value: None
         )
-
-    def request_probe(self, package_ids):
-        if not isinstance(package_ids, (list, tuple, set, frozenset)):
-            raise ValueError("package_ids must be a collection")
-
-        requested = []
-        rejected = []
-        seen = set()
-        database = self._shared_state.get_db("protected")
-        for package_id in package_ids:
-            try:
-                package_id = _validate_package_id(package_id)
-            except ValueError:
-                rejected.append({"package_id": package_id, "reason": "invalid_id"})
-                continue
-            if package_id in seen:
-                continue
-            seen.add(package_id)
-            outcome = {"requested": False, "reason": "unknown_package"}
-
-            def request(current_value, request_outcome=outcome):
-                if current_value is None:
-                    return None
-                try:
-                    package = json.loads(current_value)
-                except (TypeError, json.JSONDecodeError):
-                    request_outcome["reason"] = "invalid_package"
-                    return current_value
-                deferred = package.get("deferred") if isinstance(package, dict) else None
-                if not isinstance(deferred, dict):
-                    request_outcome["reason"] = "not_deferred"
-                    return current_value
-                try:
-                    normalize_crypter_key(deferred.get("crypter"))
-                except ValueError:
-                    request_outcome["reason"] = "invalid_deferred_crypter"
-                    return current_value
-                deferred["probe_requested"] = True
-                request_outcome["requested"] = True
-                return json.dumps(package, separators=(",", ":"), sort_keys=True)
-
-            database.mutate_value(package_id, request)
-            if outcome["requested"]:
-                requested.append(package_id)
-            else:
-                rejected.append(
-                    {"package_id": package_id, "reason": outcome["reason"]}
-                )
-        return {"requested": requested, "rejected": rejected}
-
-    def consume_probe(self, package_id, crypter):
-        package_id = _validate_package_id(package_id)
-        crypter = normalize_crypter_key(crypter)
-        consumed = {"value": False}
-
-        def consume(current_value):
-            if current_value is None:
-                return None
-            try:
-                package = json.loads(current_value)
-            except (TypeError, json.JSONDecodeError):
-                return current_value
-            deferred = package.get("deferred") if isinstance(package, dict) else None
-            if not isinstance(deferred, dict):
-                return current_value
-            try:
-                deferred_crypter = normalize_crypter_key(deferred.get("crypter"))
-            except ValueError:
-                return current_value
-            if deferred_crypter != crypter or deferred.get("probe_requested") is not True:
-                return current_value
-            deferred["probe_requested"] = False
-            consumed["value"] = True
-            return json.dumps(package, separators=(",", ":"), sort_keys=True)
-
-        self._shared_state.get_db("protected").mutate_value(package_id, consume)
-        return consumed["value"]

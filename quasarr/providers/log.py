@@ -71,6 +71,7 @@ _context_replace = {
     "hide": "👻",  # /quasarr/linkcrypters/hide.py
     "packages": "📦",  # /quasarr/api/packages/*
     "providers": "🔌",  # /quasarr/providers/*
+    "crypter_cooldowns": "⏳",  # /quasarr/providers/crypter_cooldowns.py
     "html_templates": "🎨",  # /quasarr/providers/html_templates.py
     "imdb_metadata": "🎬",  # /quasarr/providers/imdb_metadata.py
     "xem_metadata": "📚",  # /quasarr/providers/xem_metadata.py
