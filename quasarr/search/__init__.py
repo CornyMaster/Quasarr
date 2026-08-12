@@ -33,6 +33,10 @@ from quasarr.search.singleflight import (
 from quasarr.search.singleflight import SharedWork as SharedWork  # explicit re-export
 from quasarr.search.singleflight import search_singleflight
 from quasarr.search.sources import get_sources
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    use_search_budget,
+)
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 from quasarr.storage.categories import get_search_category_sources
 
@@ -342,6 +346,25 @@ def get_search_results(
     return sliced_results
 
 
+class SourceTaskOutcome:
+    """What one source worker produced, private to `quasarr.search`.
+
+    A bare release list cannot say whether it is the whole answer: a source
+    that stops early because its budget went returns the same shape as one that
+    finished. Carrying `budget_exhausted` alongside the releases is what lets
+    the fan-out answer with a partial result without caching it for a full TTL.
+    An exception is carried rather than raised out of the worker so the one
+    shared future keeps holding an outcome for every collector.
+    """
+
+    __slots__ = ("budget_exhausted", "error", "results")
+
+    def __init__(self, results, budget_exhausted, error):
+        self.results = results
+        self.budget_exhausted = budget_exhausted
+        self.error = error
+
+
 class _Completion:
     """A source result and its finish time, shared through the future.
 
@@ -363,15 +386,15 @@ def _is_cacheable(future, completion, deadline):
 
     A result that landed after the deadline is answered with but never cached:
     the deadline had already given up on it, and caching would keep serving it
-    for the whole TTL. A source still returns a bare release list, so a partial
-    answer is today indistinguishable from a complete one - Task 5 wraps the
-    return value in a `SourceTaskOutcome` and this predicate then gains
-    `and not outcome.budget_exhausted`. Raised exceptions are already excluded
-    by the caller's `except` branch.
+    for the whole TTL. The same holds for a source that ran out of its budget:
+    it answered with what it had, which is not the answer a later request
+    deserves. Raised exceptions are already excluded by the caller's `except`
+    branch.
     """
     return (
         future.done()
         and not future.cancelled()
+        and not completion.result.budget_exhausted
         and completion.at is not None
         and completion.at <= deadline
     )
@@ -478,10 +501,24 @@ class SearchExecutor:
                         source_func=func,
                         task_runtime=runtime,
                         now=self._clock,
+                        task_deadline=deadline,
                     ):
-                        with task_runtime.source_task():
-                            result = source_func()
-                        return _Completion(result, now())
+                        with (
+                            task_runtime.source_task(),
+                            use_search_budget(task_deadline, clock=now) as budget,
+                        ):
+                            try:
+                                outcome = SourceTaskOutcome(
+                                    source_func(), budget.exhausted, None
+                                )
+                            except SearchBudgetExhausted:
+                                # The source stopped itself instead of finishing,
+                                # so it has nothing to answer with - but it is out
+                                # of time, not broken.
+                                outcome = SourceTaskOutcome([], True, None)
+                            except Exception as exc:
+                                outcome = SourceTaskOutcome([], budget.exhausted, exc)
+                        return _Completion(outcome, now())
 
                     shared_work = search_singleflight.submit(
                         key, executor, run_source, deadline
@@ -508,8 +545,19 @@ class SearchExecutor:
                     index, cache_meta, source_name, shared_work = future_to_meta[future]
                     try:
                         completion = future.result()
-                        res = completion.result
-                        if res and len(res) > 0:
+                        outcome = completion.result
+                        if outcome.error is not None:
+                            # Re-raised here so a failure keeps the one error
+                            # path, whether it came out of the future or was
+                            # carried back inside the outcome.
+                            raise outcome.error
+                        res = outcome.results
+                        if outcome.budget_exhausted:
+                            get_source_logger(source_name).warn(
+                                "Ran out of time, this result is incomplete"
+                            )
+                            badge = f"<bg yellow><black>{source_name.upper()}</black></bg yellow>"
+                        elif res and len(res) > 0:
                             badge = f"<bg green><black>{source_name.upper()}</black></bg green>"
                         else:
                             get_source_logger(source_name).debug(
@@ -527,7 +575,11 @@ class SearchExecutor:
                             cache_key, cache_ttl = cache_meta
                             search_cache.set(cache_key, res, ttl=cache_ttl)
                         if shared_work.is_leader:
-                            runtime.record_source_outcome("completed")
+                            runtime.record_source_outcome(
+                                "budget_exhausted"
+                                if outcome.budget_exhausted
+                                else "completed"
+                            )
                     except Exception as e:
                         if shared_work.is_leader:
                             runtime.record_source_outcome("errored")
