@@ -1,6 +1,6 @@
 import time
 import unittest
-from threading import Barrier, Event
+from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +16,25 @@ class FakeSource:
 
     def search(self, *args, **kwargs):
         return self._func()
+
+
+class ThreadScopedClock:
+    """Deterministic stand-in for time.time() across the fan-out boundary.
+
+    The fan-out thread always reads a time before the deadline and a source
+    worker always reads one after it, so "finished too late" is decided by the
+    code under test rather than by how fast the machine happens to be.
+    """
+
+    def __init__(self, fanout_time, worker_time):
+        self._fanout_thread = get_ident()
+        self._fanout_time = fanout_time
+        self._worker_time = worker_time
+
+    def __call__(self):
+        if get_ident() == self._fanout_thread:
+            return self._fanout_time
+        return self._worker_time
 
 
 class SearchFanoutDeadlineTests(unittest.TestCase):
@@ -172,6 +191,70 @@ class SearchFanoutDeadlineTests(unittest.TestCase):
         results, _, _, _ = executor.run_all()
 
         self.assertEqual(count, len(results))
+
+
+class SearchCacheEligibilityTests(unittest.TestCase):
+    """Only an ordinary, complete release list produced at or before the
+    deadline may be written to the cache."""
+
+    def setUp(self):
+        self.runtime = SearchRuntime(memory_reader=lambda: {})
+        self.cache = SearchCache()
+
+    def run_one(self, source, deadline, clock=time.time):
+        executor = SearchExecutor(deadline=deadline, clock=clock)
+        executor.add(source, (None, 0.0, 2000), {}, use_cache=True)
+        with (
+            patch("quasarr.search.search_runtime", self.runtime, create=True),
+            patch("quasarr.search.search_cache", self.cache),
+        ):
+            return executor.run_all()
+
+    def test_a_result_finished_after_the_deadline_is_never_cached(self):
+        # as_completed keeps a 0.1s floor under its timeout, so a source that
+        # lands just past the deadline is still collected. Answering with it is
+        # fine; caching it would keep serving a result the deadline had already
+        # given up on for the whole TTL.
+        deadline = 1005.0
+        clock = ThreadScopedClock(fanout_time=1000.0, worker_time=deadline + 1.0)
+
+        results, bar, _, _ = self.run_one(
+            FakeSource("lt", lambda: [{"details": {"title": "Late.Release"}}]),
+            deadline,
+            clock,
+        )
+
+        self.assertEqual({}, self.cache.cache)
+        # Response semantics are unchanged: it was collected, so it is answered
+        # with and counted as completed.
+        self.assertEqual(["Late.Release"], [r["details"]["title"] for r in results])
+        self.assertIn("LT", bar)
+        self.assertEqual(1, self.runtime.snapshot()["source_completed"])
+
+    def test_a_result_finished_on_the_deadline_is_still_cached(self):
+        # The bound is inclusive: a source that lands exactly on the deadline
+        # answered in time and must keep its entry.
+        deadline = 1005.0
+        clock = ThreadScopedClock(fanout_time=1000.0, worker_time=deadline)
+
+        results, _, _, _ = self.run_one(
+            FakeSource("ot", lambda: [{"details": {"title": "On.Time"}}]),
+            deadline,
+            clock,
+        )
+
+        self.assertEqual(["On.Time"], [r["details"]["title"] for r in results])
+        self.assertEqual(1, len(self.cache.cache))
+
+    def test_a_source_that_raises_is_not_cached(self):
+        def fail():
+            raise RuntimeError("synthetic source failure")
+
+        results, _, _, _ = self.run_one(FakeSource("er", fail), time.time() + 5.0)
+
+        self.assertEqual([], results)
+        self.assertEqual({}, self.cache.cache)
+        self.assertEqual(1, self.runtime.snapshot()["source_errored"])
 
 
 class MetadataWarmingDeadlineTests(unittest.TestCase):

@@ -103,6 +103,58 @@ class SearchCacheTests(unittest.TestCase):
         # Expiry is not an eviction: only a capacity limit evicts a live entry.
         self.assertEqual((0, 1, 0), self.counters())
 
+    def test_mutating_the_written_list_afterwards_cannot_change_what_is_retained(self):
+        # The caller keeps its own list after handing it over. If the cache kept
+        # that same object, appending to it would grow a retained entry behind
+        # the accounting and past the release bound.
+        cache = SearchCache(clock=self.clock)
+        value = releases(1)
+        cache.set("a", value, ttl=300)
+
+        value.append({"details": {"title": "Smuggled.In"}})
+
+        self.assertEqual(1, len(cache.get("a")[0]))
+        self.assertEqual({"entry_count": 1, "release_count": 1}, counts(cache))
+
+    def test_mutating_a_returned_list_cannot_change_what_is_retained(self):
+        cache = SearchCache(clock=self.clock)
+        cache.set("a", releases(1), ttl=300)
+
+        handed_out, _ = cache.get("a")
+        handed_out.append({"details": {"title": "Smuggled.In"}})
+
+        self.assertEqual(1, len(cache.get("a")[0]))
+        self.assertEqual({"entry_count": 1, "release_count": 1}, counts(cache))
+
+    def test_appending_after_a_write_cannot_push_the_cache_past_its_bound(self):
+        # The bound has to hold against what is actually reachable from the
+        # cache, not only against what was counted at write time.
+        cache = SearchCache(max_entries=4, max_releases=3, clock=self.clock)
+        value = releases(2)
+        cache.set("a", value, ttl=300)
+
+        value.extend(releases(50))
+        cache.set("b", releases(1), ttl=300)
+
+        retained = sum(len(entry.value) for entry in cache.cache.values())
+        self.assertLessEqual(retained, 3)
+        self.assertEqual(retained, cache.stats()["release_count"])
+
+    def test_each_read_hands_out_its_own_list_of_the_same_release_objects(self):
+        cache = SearchCache(clock=self.clock)
+        value = releases(1)
+        cache.set("a", value, ttl=300)
+
+        first, _ = cache.get("a")
+        second, _ = cache.get("a")
+
+        self.assertIsInstance(first, list)
+        self.assertIsNot(first, second)
+        # Only the list is owned by the cache: the releases inside it are never
+        # mutated by the fan-out, and copying every dict on each read would cost
+        # more than the cache saves.
+        self.assertIs(value[0], first[0])
+
     def test_reading_an_entry_makes_it_the_most_recent_one(self):
         # The plan's worked example: "a" survives the third insert only because
         # reading it moved it behind "b" in LRU order.
@@ -247,19 +299,28 @@ class SearchCacheTests(unittest.TestCase):
         # the total must always describe exactly what is still retained.
         cache = SearchCache(max_entries=8, max_releases=24, clock=self.clock)
         barrier = Barrier(4)
+        failures = []
 
         def worker(worker_id):
-            barrier.wait(10)
-            for index in range(30):
-                key = f"{worker_id}-{index % 5}"
-                cache.set(key, releases(index % 4), ttl=300)
-                cache.get(key)
+            try:
+                barrier.wait(10)
+                for index in range(30):
+                    key = f"{worker_id}-{index % 5}"
+                    cache.set(key, releases(index % 4), ttl=300)
+                    cache.get(key)
+            except Exception as exc:
+                failures.append(exc)
 
         threads = [Thread(target=worker, args=(worker_id,)) for worker_id in range(4)]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join(30)
+
+        # A worker that raised or never finished would otherwise leave the
+        # invariants below asserted against a cache nobody raced.
+        self.assertEqual([], [repr(exc) for exc in failures])
+        self.assertEqual([], [thread.name for thread in threads if thread.is_alive()])
 
         stats = cache.stats()
         retained = list(cache.cache.values())

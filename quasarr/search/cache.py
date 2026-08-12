@@ -17,11 +17,11 @@ MAX_CACHE_RELEASES = 50000
 
 
 class _Entry(NamedTuple):
+    # The cache's own list, never the caller's: an alias the caller keeps
+    # appending to would grow a retained entry behind the accounting and past
+    # the release bound. The releases inside it are shared, not copied.
     value: list
     expires_at: float
-    # Counted once at write time: accounting stays consistent even if the caller
-    # later mutates the list it handed over.
-    releases: int
 
 
 class SearchCache:
@@ -54,7 +54,9 @@ class SearchCache:
             entry = self.cache.get(key)
             if entry is not None and now < entry.expires_at:
                 self.cache.move_to_end(key)
-                hit = (entry.value, entry.expires_at)
+                # A fresh list on the way out as well: a caller that appends to
+                # what it got back must not change what stays retained.
+                hit = (list(entry.value), entry.expires_at)
             else:
                 hit = None
                 if entry is not None:
@@ -69,14 +71,14 @@ class SearchCache:
 
     def set(self, key: Hashable, value: list, ttl: float = 300) -> None:
         now = self._clock()
+        stored = list(value)
         with self._lock:
             # Expired entries go first, so no live entry is evicted while stale
             # ones still hold the room.
             self._sweep_locked(now)
             self._discard_locked(key)
-            releases = len(value)
-            self.cache[key] = _Entry(value, now + ttl, releases)
-            self._release_count += releases
+            self.cache[key] = _Entry(stored, now + ttl)
+            self._release_count += len(stored)
             evicted = self._evict_locked()
         for _ in range(evicted):
             search_runtime.record_cache_eviction()
@@ -123,7 +125,9 @@ class SearchCache:
     def _discard_locked(self, key: Hashable) -> None:
         entry = self.cache.pop(key, None)
         if entry is not None:
-            self._release_count -= entry.releases
+            # The list is the cache's own, so its length cannot have drifted
+            # from what was counted at write time.
+            self._release_count -= len(entry.value)
 
 
 search_cache = SearchCache()

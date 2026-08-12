@@ -337,16 +337,54 @@ def get_search_results(
     return sliced_results
 
 
+class _Completion:
+    """When a source task finished, recorded before its future is marked done.
+
+    `Future.add_done_callback` cannot carry this: `set_result` notifies the
+    `as_completed` waiter *before* it invokes callbacks, so the collecting
+    thread can reach the cache write while the timestamp is still missing.
+    Writing it inside the submitted callable's `finally` always wins that race.
+    """
+
+    __slots__ = ("at",)
+
+    def __init__(self):
+        self.at = None
+
+
+def _is_cacheable(future, completion, deadline):
+    """Whether a collected result may be written to the search cache.
+
+    A result that landed after the deadline is answered with but never cached:
+    the deadline had already given up on it, and caching would keep serving it
+    for the whole TTL. A source still returns a bare release list, so a partial
+    answer is today indistinguishable from a complete one - Task 5 wraps the
+    return value in a `SourceTaskOutcome` and this predicate then gains
+    `and not outcome.budget_exhausted`. Raised exceptions are already excluded
+    by the caller's `except` branch.
+    """
+    return (
+        future.done()
+        and not future.cancelled()
+        and completion.at is not None
+        and completion.at <= deadline
+    )
+
+
 class SearchExecutor:
-    def __init__(self, deadline=None):
+    def __init__(self, deadline=None, clock=time.time):
         self.searches = []
+        # Wall clock, injected so deadline behavior stays deterministic in tests.
+        # It must stay wall-clock: the deadline is an absolute time.time() that
+        # callers hand in, so SearchRuntime's monotonic clock cannot be used.
+        self._clock = clock
         # Absolute time this fan-out must be answered by. Callers that run several
         # executors for one *arr request pass their own so the runs share a single
         # deadline instead of each starting a fresh one.
         self.deadline = (
             deadline
             if deadline is not None
-            else time.time() + SEARCH_FANOUT_DEADLINE_SECONDS
+            else clock() + SEARCH_FANOUT_DEADLINE_SECONDS
         )
 
     def add(
@@ -412,12 +450,12 @@ class SearchExecutor:
                     results.extend(cached_result)
 
                     # Calculate TTL for this cached item
-                    ttl_left = exp - time.time()
+                    ttl_left = exp - self._clock()
                     if ttl_left < min_ttl:
                         min_ttl = ttl_left
                 else:
                     all_cached = False
-                    if time.time() >= deadline:
+                    if self._clock() >= deadline:
                         # Nothing left to spend. Starting the work anyway would
                         # only detach a worker whose result this response can no
                         # longer use, and hit the source a second time for it.
@@ -430,13 +468,28 @@ class SearchExecutor:
                         )
                         continue
 
-                    def run_source(source_func=func, task_runtime=runtime):
-                        with task_runtime.source_task():
-                            return source_func()
+                    completion = _Completion()
+
+                    def run_source(
+                        source_func=func,
+                        task_runtime=runtime,
+                        finished=completion,
+                        now=self._clock,
+                    ):
+                        try:
+                            with task_runtime.source_task():
+                                return source_func()
+                        finally:
+                            finished.at = now()
 
                     future = executor.submit(run_source)
                     cache_meta = (key, ttl) if use_cache else None
-                    future_to_meta[future] = (current_index, cache_meta, source_name)
+                    future_to_meta[future] = (
+                        current_index,
+                        cache_meta,
+                        source_name,
+                        completion,
+                    )
                     pending_futures.append(future)
                     current_index += 1
 
@@ -446,7 +499,7 @@ class SearchExecutor:
 
                 def collect(future):
                     collected.add(future)
-                    index, cache_meta, source_name = future_to_meta[future]
+                    index, cache_meta, source_name, completion = future_to_meta[future]
                     try:
                         res = future.result()
                         if res and len(res) > 0:
@@ -459,8 +512,9 @@ class SearchExecutor:
 
                         results_badges[index] = badge
                         results.extend(res)
-                        if cache_meta:
+                        if cache_meta and _is_cacheable(future, completion, deadline):
                             cache_key, cache_ttl = cache_meta
+                            search_cache.set(cache_key, res, ttl=cache_ttl)
                             search_cache.set(cache_key, res, ttl=cache_ttl)
                         runtime.record_source_outcome("completed")
                     except Exception as e:
@@ -472,7 +526,7 @@ class SearchExecutor:
 
                 try:
                     for future in as_completed(
-                        pending_futures, timeout=max(0.1, deadline - time.time())
+                        pending_futures, timeout=max(0.1, deadline - self._clock())
                     ):
                         collect(future)
                 except FutureTimeoutError:
@@ -486,7 +540,7 @@ class SearchExecutor:
                             collect(future)
                             continue
 
-                        index, _, source_name = future_to_meta[future]
+                        index, _, source_name, _ = future_to_meta[future]
                         results_badges[index] = (
                             f"<bg yellow><black>{source_name.upper()}</black></bg yellow>"
                         )
