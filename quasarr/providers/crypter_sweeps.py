@@ -183,6 +183,26 @@ def _members(value, minimum):
     return members
 
 
+def _cohort_cooldown_members(value):
+    members = _members(value, MINIMUM_CONCLUSIVE_COHORT_SIZE)
+    cooldown_responses = 0
+    for entry in members:
+        if entry["result"] != "blocked":
+            raise ValueError("Cohort cooldown members must all be blocked")
+        if (
+            entry["tested_epoch"] == 0
+            or entry["offer_id"] == ""
+            or entry["offer_expires_epoch"] == 0
+            or entry["tested_epoch"] > entry["offer_expires_epoch"]
+            or entry["response_instruction"] not in ("hold", "cooldown")
+        ):
+            raise ValueError("Invalid blocked cohort member")
+        cooldown_responses += entry["response_instruction"] == "cooldown"
+    if cooldown_responses != 1:
+        raise ValueError("Cohort cooldown must retain one cooldown response")
+    return members
+
+
 def _live_offer(value):
     if value is None:
         return None
@@ -220,7 +240,7 @@ def _build_sweeping(raw):
 
 
 def _build_cohort_cooldown(raw):
-    members = _members(raw["members"], MINIMUM_CONCLUSIVE_COHORT_SIZE)
+    members = _cohort_cooldown_members(raw["members"])
     cohort_size = raw["cohort_size"]
     if type(cohort_size) is not int or cohort_size != len(members):
         raise ValueError('Invalid linkcrypter decision field "cohort_size"')
@@ -329,7 +349,11 @@ def decode_decision_record(value, *, now):
     """
     if not isinstance(value, str):
         return None
-    if len(value.encode("utf-8")) > MAXIMUM_COHORT_RECORD_BYTES:
+    try:
+        encoded_size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+    if encoded_size > MAXIMUM_COHORT_RECORD_BYTES:
         return None
     try:
         raw = json.loads(value)
@@ -352,10 +376,14 @@ def encode_decision_record(record):
     encoded row exceeds `MAXIMUM_COHORT_RECORD_BYTES`, so an oversized cohort
     rolls the whole transition back instead of committing dropped members.
     """
-    encoded = json.dumps(
-        _validate_record(record), separators=(",", ":"), sort_keys=True
-    )
-    if len(encoded.encode("utf-8")) > MAXIMUM_COHORT_RECORD_BYTES:
+    try:
+        encoded = json.dumps(
+            _validate_record(record), separators=(",", ":"), sort_keys=True
+        )
+        encoded_size = len(encoded.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ValueError("Linkcrypter decision record is not valid UTF-8") from error
+    if encoded_size > MAXIMUM_COHORT_RECORD_BYTES:
         raise OverflowError("Linkcrypter decision record is too large to store")
     return encoded
 

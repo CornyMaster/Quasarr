@@ -112,7 +112,13 @@ def _decode_record(value):
         # literal raises a plain ValueError and a value nested past the recursion
         # limit a RecursionError. Either one escaping here would brick the read.
         raise ValueError("Invalid persisted linkcrypter JSON") from error
-    if not isinstance(record, dict) or not _RECORD_KEYS.issubset(record):
+    if (
+        not isinstance(record, dict)
+        or "schema_version" in record
+        or not _RECORD_KEYS.issubset(record)
+    ):
+        # Key presence establishes versioning. Unsupported or malformed
+        # versioned rows must never inherit permissive legacy compatibility.
         raise ValueError("Invalid persisted linkcrypter record")
     if not isinstance(record["state"], str) or record["state"] not in {
         "observing",
@@ -342,12 +348,19 @@ class CrypterCooldownService:
         invalid = {"observed": invalid_observed}
 
         def cleanup(current_value):
+            decision = decode_decision_record(current_value, now=now)
+            if decision is not None:
+                invalid["observed"] = False
+                result.update(_legacy_shaped_snapshot(decision, now))
+                return current_value
+
             try:
                 record = _decode_record(current_value)
             except ValueError:
                 invalid["observed"] = True
                 result.update(_available_snapshot())
                 return None
+            invalid["observed"] = False
 
             observation_count = len(record["observations"]) if record else 0
             record = self._prune_record(record, now)

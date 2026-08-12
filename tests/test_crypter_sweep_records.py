@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from collections.abc import Callable
 from unittest import mock
 
 import quasarr.providers.crypter_cooldowns as cooldown_module
@@ -72,7 +73,7 @@ def blocked_members(count=MINIMUM_CONCLUSIVE_COHORT_SIZE):
             tested_epoch=NOW,
             offer_id=f"{index:032x}",
             offer_expires_epoch=NOW + OFFER_LEASE_SECONDS,
-            response_instruction="hold",
+            response_instruction="cooldown" if index == count else "hold",
         )
         for index in range(1, count + 1)
     ]
@@ -431,6 +432,93 @@ class DecisionRecordCodecTests(unittest.TestCase):
             "cohort size can never disagree with the frozen member list",
         )
 
+    def test_cohort_cooldown_requires_complete_coherent_blocked_members(self):
+        offered = [
+            member(
+                index,
+                result="offered",
+                offer_id=f"{index:032x}",
+                offer_expires_epoch=NOW + OFFER_LEASE_SECONDS,
+            )
+            for index in range(1, MINIMUM_CONCLUSIVE_COHORT_SIZE + 1)
+        ]
+        unknown = [
+            member(
+                index,
+                result="unknown",
+                tested_epoch=NOW,
+                offer_id=f"{index:032x}",
+                offer_expires_epoch=NOW + OFFER_LEASE_SECONDS,
+            )
+            for index in range(1, MINIMUM_CONCLUSIVE_COHORT_SIZE + 1)
+        ]
+        invalid_members = {
+            "pending results": [
+                member(index) for index in range(1, MINIMUM_CONCLUSIVE_COHORT_SIZE + 1)
+            ],
+            "offered results": offered,
+            "unknown results": unknown,
+            "untested blocked result": [
+                member(1, **{**blocked_members()[0], "tested_epoch": 0}),
+                *blocked_members()[1:],
+            ],
+            "blocked result without offer id": [
+                member(1, **{**blocked_members()[0], "offer_id": ""}),
+                *blocked_members()[1:],
+            ],
+            "blocked result without offer expiry": [
+                member(1, **{**blocked_members()[0], "offer_expires_epoch": 0}),
+                *blocked_members()[1:],
+            ],
+            "blocked result after offer expiry": [
+                member(
+                    1,
+                    **{
+                        **blocked_members()[0],
+                        "offer_expires_epoch": NOW - 1,
+                    },
+                ),
+                *blocked_members()[1:],
+            ],
+            "blocked result without replay instruction": [
+                member(1, **{**blocked_members()[0], "response_instruction": ""}),
+                *blocked_members()[1:],
+            ],
+            "blocked result with legacy replay instruction": [
+                member(
+                    1,
+                    **{
+                        **blocked_members()[0],
+                        "response_instruction": "legacy_failure",
+                    },
+                ),
+                *blocked_members()[1:],
+            ],
+            "no cooldown replay instruction": [
+                dict(entry, response_instruction="hold") for entry in blocked_members()
+            ],
+            "multiple cooldown replay instructions": [
+                dict(entry, response_instruction="cooldown")
+                for entry in blocked_members()
+            ],
+        }
+
+        self.assertEqual(
+            cohort_cooldown_record(),
+            decode_decision_record(
+                encode_decision_record(cohort_cooldown_record()), now=NOW
+            ),
+        )
+        for name, members in invalid_members.items():
+            with self.subTest(case=name):
+                record = cohort_cooldown_record(members=members)
+                self.assertIsNone(
+                    decode_decision_record(json.dumps(record), now=NOW),
+                    "malformed terminal members cannot become cohort evidence",
+                )
+                with self.assertRaises(ValueError):
+                    encode_decision_record(record)
+
     def test_result_instruction_mode_and_reason_enums_are_closed(self):
         for value in ("tested", "clear", "", None, True):
             with self.subTest(result=repr(value)):
@@ -545,6 +633,15 @@ class DecisionRecordCodecTests(unittest.TestCase):
         for value in unreadable:
             with self.subTest(value=repr(value)[:40]):
                 self.assertIsNone(decode_decision_record(value, now=NOW))
+
+    def test_lone_surrogates_cannot_escape_codec_byte_sizing(self):
+        self.assertIsNone(decode_decision_record("\ud800", now=NOW))
+
+        with mock.patch.object(sweep_module.json, "dumps", return_value="\ud800"):
+            with self.assertRaises((ValueError, OverflowError)) as caught:
+                encode_decision_record(sweeping_record())
+
+        self.assertNotIsInstance(caught.exception, UnicodeEncodeError)
 
     def test_expiry_boundaries_are_exact(self):
         sweeping = sweeping_record()
@@ -745,6 +842,25 @@ class LegacyMigrationTests(unittest.TestCase):
             decode_decision_record(encode_decision_record(migrated), now=NOW),
         )
 
+    def test_only_genuinely_unversioned_rows_use_legacy_migration(self):
+        legacy = json.loads(
+            self.legacy_record("cooldown", [NOW - 60], retry_after_epoch=COOLDOWN_RETRY)
+        )
+        self.assertIsNotNone(
+            migrate_legacy_record(
+                json.dumps(dict(legacy, additive_legacy_field="preserved")), now=NOW
+            ),
+            "unversioned legacy rows retain their additive-field compatibility",
+        )
+
+        for version in (2, 3, 99, None, True, "3"):
+            with self.subTest(schema_version=repr(version)):
+                hybrid = dict(legacy, schema_version=version)
+                self.assertIsNone(
+                    migrate_legacy_record(json.dumps(hybrid), now=NOW),
+                    "a versioned row must never fall back to the legacy decoder",
+                )
+
     def test_migration_counts_surviving_evidence_and_floors_it_at_one(self):
         value = self.legacy_record(
             "cooldown",
@@ -837,12 +953,17 @@ class ServiceSnapshotTests(unittest.TestCase):
         def __init__(self):
             self.rows = {}
             self.mutation_count = 0
+            self.before_mutation: Callable[[], None] | None = None
 
         def retrieve(self, key):
             return self.rows.get(key)
 
         def mutate_value(self, key, mutator):
             self.mutation_count += 1
+            if self.before_mutation is not None:
+                before_mutation = self.before_mutation
+                self.before_mutation = None
+                before_mutation()
             value = mutator(self.rows.get(key))
             if value is None:
                 self.rows.pop(key, None)
@@ -877,6 +998,24 @@ class ServiceSnapshotTests(unittest.TestCase):
         }
         snapshot.update(overrides)
         return snapshot
+
+    def legacy_cooldown_value(self, **overrides):
+        record = {
+            "state": "cooldown",
+            "reason_code": REASON,
+            "first_seen_epoch": NOW - 60,
+            "last_seen_epoch": NOW - 60,
+            "retry_after_epoch": COOLDOWN_RETRY,
+            "observations": [
+                {
+                    "package_id": "Quasarr_movies_00000000000000000000000000000001",
+                    "link_fingerprint": fingerprint(1),
+                    "seen_at_epoch": NOW - 60,
+                }
+            ],
+        }
+        record.update(overrides)
+        return json.dumps(record)
 
     def test_version_two_rows_project_into_the_existing_snapshot_keys(self):
         cases = (
@@ -963,6 +1102,61 @@ class ServiceSnapshotTests(unittest.TestCase):
         self.assertFalse(service.is_cooling("filecrypt"))
         self.assertEqual(0, self.database.mutation_count)
         self.assertEqual(stored, self.database.rows["filecrypt"])
+
+    def test_snapshot_never_falls_back_from_versioned_to_legacy_fields(self):
+        legacy = json.loads(self.legacy_cooldown_value())
+
+        additive = self.service(
+            json.dumps(dict(legacy, additive_legacy_field="allowed"))
+        ).snapshot("filecrypt")
+        self.assertEqual("cooldown", additive["state"])
+        self.assertEqual(1, additive["evidence_count"])
+        self.assertEqual(0, self.database.mutation_count)
+
+        for version in (2, 3, 99, None, True, "3"):
+            with self.subTest(schema_version=repr(version)):
+                service = self.service(json.dumps(dict(legacy, schema_version=version)))
+                with mock.patch.object(cooldown_module, "warn") as warn:
+                    self.assertEqual(
+                        self.legacy_snapshot(), service.snapshot("filecrypt")
+                    )
+
+                self.assertEqual(1, self.database.mutation_count)
+                self.assertNotIn("filecrypt", self.database.rows)
+                warn.assert_called_once()
+
+    def test_cleanup_preserves_a_concurrently_installed_version_two_row(self):
+        concurrent_value = encode_decision_record(cohort_cooldown_record())
+        future_hybrid = json.loads(self.legacy_cooldown_value())
+        future_hybrid["schema_version"] = 3
+        initial_rows = {
+            "invalid": "malformed-sensitive-marker",
+            "expired legacy": self.legacy_cooldown_value(retry_after_epoch=NOW),
+            "future hybrid": json.dumps(future_hybrid),
+        }
+
+        for name, stored in initial_rows.items():
+            with self.subTest(initial=name):
+                service = self.service(stored)
+                self.database.before_mutation = lambda: self.database.rows.__setitem__(
+                    "filecrypt", concurrent_value
+                )
+
+                with mock.patch.object(cooldown_module, "warn") as warn:
+                    snapshot = service.snapshot("filecrypt")
+
+                self.assertEqual(
+                    self.legacy_snapshot(
+                        state="cooldown",
+                        reason_code=REASON,
+                        retry_after_epoch=COOLDOWN_RETRY,
+                        evidence_count=MINIMUM_CONCLUSIVE_COHORT_SIZE,
+                    ),
+                    snapshot,
+                )
+                self.assertEqual(1, self.database.mutation_count)
+                self.assertEqual(concurrent_value, self.database.rows["filecrypt"])
+                warn.assert_not_called()
 
     def test_unreadable_and_expired_version_two_rows_self_heal_on_read(self):
         deeply_nested = "[" * 100_000 + "]" * 100_000
