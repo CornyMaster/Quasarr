@@ -9,9 +9,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.downloads import resolve_protected_crypter_key
+from quasarr.providers.crypter_sweeps import (
+    MAXIMUM_COHORT_OCCURRENCES,
+    MAXIMUM_COHORT_SIZE,
+    helper_package_is_candidate,
+)
 
 _FILECRYPT_CRYPTER = "filecrypt"
-_MAXIMUM_FILECRYPT_CANDIDATES = 100
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
@@ -71,30 +75,37 @@ def _canonical_rows(protected_rows):
 
 
 def enumerate_filecrypt_candidates(protected_rows) -> FilecryptInventory:
-    """Build the bounded unique Filecrypt inventory from protected DB rows."""
+    """Build the bounded unique Filecrypt inventory from protected DB rows.
+
+    Both capacity limits fail closed. Truncating occurrences would leave a
+    denominator that looks complete, so the whole inventory becomes inconclusive
+    instead - unique fingerprint 101 and occurrence 1001 each return the same
+    empty sentinel without inspecting any later link.
+    """
     occurrences_by_fingerprint = {}
+    occurrence_count = 0
 
     for package_id, raw_package in _canonical_rows(protected_rows):
         try:
             package = json.loads(raw_package)
         except (TypeError, ValueError, RecursionError):
             continue
-        if not isinstance(package, dict) or "disabled" in package:
-            continue
-        links = package.get("links")
-        if not isinstance(links, list):
+        if not helper_package_is_candidate(package):
             continue
 
-        for link_index, link in enumerate(links):
+        for link_index, link in enumerate(package["links"]):
             if resolve_protected_crypter_key(link) != _FILECRYPT_CRYPTER:
                 continue
+            if occurrence_count == MAXIMUM_COHORT_OCCURRENCES:
+                return FilecryptInventory(candidates=(), oversized=True)
             fingerprint = link_fingerprint(_FILECRYPT_CRYPTER, link[0])
             occurrences = occurrences_by_fingerprint.get(fingerprint)
             if occurrences is None:
-                if len(occurrences_by_fingerprint) == _MAXIMUM_FILECRYPT_CANDIDATES:
+                if len(occurrences_by_fingerprint) == MAXIMUM_COHORT_SIZE:
                     return FilecryptInventory(candidates=(), oversized=True)
                 occurrences = []
                 occurrences_by_fingerprint[fingerprint] = occurrences
+            occurrence_count += 1
             occurrences.append(
                 FilecryptOccurrence(
                     package_id=package_id,

@@ -15,6 +15,11 @@ from quasarr.providers.crypter_candidates import (
     link_fingerprint,
     normalize_crypter_url,
 )
+from quasarr.providers.crypter_sweeps import (
+    MAXIMUM_COHORT_OCCURRENCES,
+    MAXIMUM_COHORT_SIZE,
+    helper_package_is_candidate,
+)
 
 
 def package_id(index, category="movies"):
@@ -208,6 +213,93 @@ class FilecryptCandidateInventoryTests(unittest.TestCase):
 
         self.assertEqual(FilecryptInventory(candidates=(), oversized=True), inventory)
         self.assertEqual(101, resolver_calls)
+
+    def test_retains_every_occurrence_up_to_the_occurrence_bound(self):
+        # 1000 occurrences spread over the 100 allowed fingerprints stay conclusive.
+        links = [
+            [
+                f"https://filecrypt.invalid/Container/{index % MAXIMUM_COHORT_SIZE:03d}",
+                "filecrypt",
+            ]
+            for index in range(MAXIMUM_COHORT_OCCURRENCES)
+        ]
+
+        inventory = enumerate_filecrypt_candidates(
+            [protected_row(package_id(11), links)]
+        )
+
+        self.assertFalse(inventory.oversized)
+        self.assertEqual(MAXIMUM_COHORT_SIZE, len(inventory.candidates))
+        self.assertEqual(
+            MAXIMUM_COHORT_OCCURRENCES,
+            sum(len(candidate.occurrences) for candidate in inventory.candidates),
+        )
+
+    def test_returns_empty_oversized_sentinel_at_occurrence_1001(self):
+        # The 1001st occurrence repeats an already known fingerprint, so only the
+        # occurrence bound can explain the sentinel - never the 100-unique bound.
+        links = [
+            [
+                f"https://filecrypt.invalid/Container/{index % MAXIMUM_COHORT_SIZE:03d}",
+                "filecrypt",
+            ]
+            for index in range(MAXIMUM_COHORT_OCCURRENCES + 3)
+        ]
+        resolver_calls = 0
+
+        def guarded_resolver(link):
+            nonlocal resolver_calls
+            resolver_calls += 1
+            if resolver_calls > MAXIMUM_COHORT_OCCURRENCES + 1:
+                self.fail("inventory inspected a link after occurrence 1000")
+            return resolve_protected_crypter_key(link)
+
+        with mock.patch(
+            "quasarr.providers.crypter_candidates.resolve_protected_crypter_key",
+            side_effect=guarded_resolver,
+        ):
+            inventory = enumerate_filecrypt_candidates(
+                [protected_row(package_id(12), links)]
+            )
+
+        self.assertEqual(FilecryptInventory(candidates=(), oversized=True), inventory)
+        self.assertEqual(MAXIMUM_COHORT_OCCURRENCES + 1, resolver_calls)
+
+    def test_inventory_admits_exactly_the_shared_handout_candidate_packages(self):
+        link = ["https://filecrypt.invalid/Container/Shared", "filecrypt"]
+        complete = {
+            "title": "Synthetic.Release.Shared",
+            "password": "",
+            "links": [link],
+        }
+        rejected = {
+            "missing title": {k: v for k, v in complete.items() if k != "title"},
+            "missing password": {k: v for k, v in complete.items() if k != "password"},
+            "empty links": dict(complete, links=[]),
+            "non-list links": dict(complete, links=link[0]),
+            "disabled": dict(complete, disabled=False),
+        }
+        rows = [
+            (package_id(20 + index), json.dumps(package))
+            for index, package in enumerate(rejected.values())
+        ]
+
+        self.assertEqual(
+            FilecryptInventory(candidates=(), oversized=False),
+            enumerate_filecrypt_candidates(rows),
+        )
+        for name, package in rejected.items():
+            with self.subTest(package=name):
+                self.assertFalse(helper_package_is_candidate(package))
+        self.assertTrue(helper_package_is_candidate(complete))
+        self.assertEqual(
+            1,
+            len(
+                enumerate_filecrypt_candidates(
+                    [*rows, (package_id(30), json.dumps(complete))]
+                ).candidates
+            ),
+        )
 
     def test_dataclasses_are_frozen_and_not_json_serializable(self):
         link = ["https://filecrypt.invalid/Container/Frozen", "filecrypt"]

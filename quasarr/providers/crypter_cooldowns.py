@@ -7,6 +7,7 @@ import re
 import time
 
 from quasarr.constants import PACKAGE_ID_PATTERN
+from quasarr.providers.crypter_sweeps import decision_snapshot, decode_decision_record
 from quasarr.providers.log import warn
 
 OBSERVATION_WINDOW_SECONDS = 15 * 60
@@ -106,7 +107,10 @@ def _decode_record(value):
         return None
     try:
         record = json.loads(value)
-    except (TypeError, json.JSONDecodeError) as error:
+    except (TypeError, ValueError, RecursionError) as error:
+        # Not every parse failure is a JSONDecodeError: an oversized integer
+        # literal raises a plain ValueError and a value nested past the recursion
+        # limit a RecursionError. Either one escaping here would brick the read.
         raise ValueError("Invalid persisted linkcrypter JSON") from error
     if not isinstance(record, dict) or not _RECORD_KEYS.issubset(record):
         raise ValueError("Invalid persisted linkcrypter record")
@@ -197,6 +201,38 @@ def _available_snapshot():
         "observations": [],
         "evidence_count": 0,
     }
+
+
+def _legacy_shaped_snapshot(decision, now):
+    """Express a version-two decision in the snapshot shape callers read today.
+
+    Task 4 owns the transitions; until then a version-two row only has to answer
+    the existing keys, and only a real cooldown may gate a linkcrypter. A sweep
+    is the closest analogue of the legacy evidence-gathering state, while healthy
+    and individual suppress global blocking and therefore read as available.
+    """
+    projected = decision_snapshot(decision, now=now)
+    if projected["state"] == "cooldown":
+        return {
+            "state": "cooldown",
+            "reason_code": projected["reason_code"],
+            "first_seen_epoch": 0,
+            "last_seen_epoch": 0,
+            "retry_after_epoch": projected["retry_after_epoch"],
+            "observations": [],
+            "evidence_count": projected["evidence_count"],
+        }
+    if projected["state"] == "sweeping":
+        return {
+            "state": "observing",
+            "reason_code": projected["reason_code"],
+            "first_seen_epoch": projected["opened_epoch"],
+            "last_seen_epoch": projected["opened_epoch"],
+            "retry_after_epoch": 0,
+            "observations": [],
+            "evidence_count": projected["evidence_count"],
+        }
+    return _available_snapshot()
 
 
 def decode_pending_crypter_events(value):
@@ -443,6 +479,9 @@ class CrypterCooldownService:
         current_value = database.retrieve(crypter)
         if current_value is None:
             return _available_snapshot()
+        decision = decode_decision_record(current_value, now=now)
+        if decision is not None:
+            return _legacy_shaped_snapshot(decision, now)
         try:
             record = _decode_record(current_value)
         except ValueError:
