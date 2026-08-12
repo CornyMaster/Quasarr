@@ -60,6 +60,28 @@ def link_fingerprint(crypter: str, url: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def package_owns_fingerprint(raw_package, crypter: str, fingerprint: str) -> bool:
+    """Whether one stored protected row still carries this exact crypter link.
+
+    Narrow by design: it parses one raw row and proves one fingerprint, so a
+    report whose global inventory could not be read may still authorize a hold
+    on the package it names - and only on that package.
+    """
+    try:
+        package = json.loads(raw_package)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    if not helper_package_is_candidate(package):
+        return False
+    for link in package["links"]:
+        if resolve_protected_crypter_key(link) != crypter:
+            continue
+        url = link[0] if isinstance(link, (list, tuple)) and link else link
+        if isinstance(url, str) and link_fingerprint(crypter, url) == fingerprint:
+            return True
+    return False
+
+
 def _canonical_rows(protected_rows):
     rows = []
     for row in protected_rows or ():

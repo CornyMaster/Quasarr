@@ -692,16 +692,15 @@ class SponsorsHelperApiTests(unittest.TestCase):
         self.assertEqual("Deferred.Package", retained["title"])
         self.assertNotIn("deferred", retained)
 
-    def test_crypter_access_package_clear_failure_keeps_all_state_held(self):
+    def test_crypter_access_package_cleanup_failure_still_proves_health(self):
         state, service = self.deferred_state()
 
-        def fail_package_clear():
-            raise RuntimeError("database unavailable")
-
-        state.databases["protected"].before_mutation = fail_package_clear
-
-        with self.assertRaises(HTTPError) as context:
-            self.call_json_route(
+        with mock.patch.object(
+            state.databases["protected"],
+            "mutate_value",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            result = self.call_json_route(
                 "/sponsors_helper/api/crypter-access/",
                 state,
                 {
@@ -711,6 +710,34 @@ class SponsorsHelperApiTests(unittest.TestCase):
                 },
                 service,
             )
+
+        # Health is committed before any release runs, so a storage failure can
+        # only leave metadata behind that the committed window already killed.
+        self.assertEqual(
+            {"success": True, "state": "available", "cleared": True}, result
+        )
+        self.assertEqual("available", service.snapshot("filecrypt")["state"])
+        self.assertIsNotNone(service.get_package_defer(PACKAGE_A))
+
+    def test_crypter_access_health_commit_failure_releases_nothing(self):
+        state, service = self.deferred_state()
+
+        with mock.patch.object(
+            state.databases["crypter_cooldowns"],
+            "mutate_value",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            with self.assertRaises(HTTPError) as context:
+                self.call_json_route(
+                    "/sponsors_helper/api/crypter-access/",
+                    state,
+                    {
+                        "package_id": PACKAGE_A,
+                        "crypter": "filecrypt",
+                        "access": "clear",
+                    },
+                    service,
+                )
 
         self.assertEqual(500, context.exception.status_code)
         self.assertEqual("observing", service.snapshot("filecrypt")["state"])

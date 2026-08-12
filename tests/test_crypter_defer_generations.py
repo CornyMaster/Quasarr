@@ -256,6 +256,7 @@ def accepted_offer(index, instruction="hold", **overrides):
         "offer_id": offer_id(index),
         "link_fingerprint": fingerprint(index),
         "mode": "sweep",
+        "outcome": "blocked",
         "state": "sweeping",
         "instruction": instruction,
         "accepted": "",

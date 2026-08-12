@@ -12,8 +12,13 @@ from bottle import Bottle, HTTPError, HTTPResponse
 
 from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
 from quasarr.api.sponsors_helper.cohort_protocol import (
+    COHORT_REPORT,
     CRYPTER_DEFER_CAPABILITY,
     FILECRYPT_COHORT_CAPABILITY,
+    MALFORMED_REPORT,
+    VERSION_ONE_REPORT,
+    classify_access_report,
+    classify_blocked_report,
     helper_supports_cohort,
     normalize_access_report,
     normalize_blocked_report,
@@ -453,6 +458,75 @@ class CohortProtocolTests(unittest.TestCase):
         body, status = render_access_response(bypass_decision(), offer_id="b" * 32)
         self.assertEqual(409, status)
         self.assertEqual("stale", body["instruction"])
+
+    def test_report_classification_is_tri_state(self):
+        identity = {"sweep_id": "a" * 32, "offer_id": "b" * 32}
+        blocked = {
+            "package_id": package(1),
+            "crypter": CRYPTER,
+            "reason_code": REASON,
+            "link_fingerprint": "c" * 64,
+        }
+        access = {
+            "package_id": package(1),
+            "crypter": CRYPTER,
+            "access": "clear",
+            "link_fingerprint": "c" * 64,
+        }
+
+        for name, base, classify in (
+            ("blocked", blocked, classify_blocked_report),
+            ("access", access, classify_access_report),
+        ):
+            cases = (
+                # No cohort identity at all is ordinary version-one work, and a
+                # version-one report is not held to the exact cohort spelling.
+                (base, VERSION_ONE_REPORT),
+                ({**base, "crypter": "Filecrypt"}, VERSION_ONE_REPORT),
+                ({**base, "link_fingerprint": "nope"}, VERSION_ONE_REPORT),
+                ({**base, **identity}, COHORT_REPORT),
+                # Explicit but incomplete or misspelled cohort intent.
+                ({**base, "sweep_id": "a" * 32}, MALFORMED_REPORT),
+                ({**base, "offer_id": "b" * 32}, MALFORMED_REPORT),
+                ({**base, **identity, "sweep_id": None}, MALFORMED_REPORT),
+                ({**base, **identity, "offer_id": "b" * 31}, MALFORMED_REPORT),
+                ({**base, **identity, "sweep_id": "A" * 32}, MALFORMED_REPORT),
+                ({**base, **identity, "link_fingerprint": "c" * 63}, MALFORMED_REPORT),
+                ({**base, **identity, "package_id": 7}, MALFORMED_REPORT),
+                ({**base, **identity, "crypter": "Filecrypt"}, MALFORMED_REPORT),
+                ({**base, **identity, "crypter": " filecrypt"}, MALFORMED_REPORT),
+                ({**base, **identity, "crypter": "filecrypt "}, MALFORMED_REPORT),
+                ({**base, **identity, "crypter": "tolink"}, MALFORMED_REPORT),
+                (None, VERSION_ONE_REPORT),
+                ([], VERSION_ONE_REPORT),
+            )
+            for payload, expected in cases:
+                with self.subTest(route=name, payload=payload):
+                    kind, report = classify(payload)
+                    self.assertEqual(expected, kind)
+                    self.assertIs(expected == COHORT_REPORT, report is not None)
+
+    def test_the_route_specific_field_decides_the_last_third_of_the_intent(self):
+        identity = {
+            "package_id": package(1),
+            "crypter": CRYPTER,
+            "link_fingerprint": "c" * 64,
+            "sweep_id": "a" * 32,
+            "offer_id": "b" * 32,
+        }
+
+        self.assertEqual(MALFORMED_REPORT, classify_blocked_report(dict(identity))[0])
+        self.assertEqual(
+            MALFORMED_REPORT,
+            classify_blocked_report({**identity, "reason_code": 7})[0],
+        )
+        self.assertEqual(MALFORMED_REPORT, classify_access_report(dict(identity))[0])
+        for access in ("CLEAR", "blocked", "", None):
+            with self.subTest(access=access):
+                self.assertEqual(
+                    MALFORMED_REPORT,
+                    classify_access_report({**identity, "access": access})[0],
+                )
 
 
 class CohortHandoutTests(CohortApiTestCase):
@@ -942,7 +1016,9 @@ class CohortDeferMatrixTests(CohortApiTestCase):
         )
         state.get_db.assert_not_called()
 
-    def test_a_malformed_offer_falls_back_to_v1_and_keeps_the_cohort_state(self):
+    def test_a_report_naming_no_offer_falls_back_to_v1_and_keeps_the_cohort_state(
+        self,
+    ):
         self.store(filecrypt_rows(5))
         offer, handout = self.handout_offer()
         before = self.state.databases["crypter_cooldowns"].rows[CRYPTER]
@@ -954,8 +1030,6 @@ class CohortDeferMatrixTests(CohortApiTestCase):
                 "crypter": CRYPTER,
                 "reason_code": REASON,
                 "link_fingerprint": offer["link_fingerprint"],
-                "sweep_id": "not-a-sweep",
-                "offer_id": offer["offer_id"],
             },
         )
 
@@ -1318,6 +1392,497 @@ class CohortAccessTests(CohortApiTestCase):
             self.assertIsNone(service.get_package_defer(package_id))
 
 
+class MalformedCohortIntentTests(CohortApiTestCase):
+    """Explicit cohort intent that does not parse never reaches version one."""
+
+    BLOCKED_BREAKAGE = (
+        {"sweep_id": "not-a-sweep"},
+        {"offer_id": ""},
+        {"offer_id": None},
+        {"crypter": "Filecrypt"},
+        {"crypter": " filecrypt"},
+        {"link_fingerprint": "c" * 63},
+        {"reason_code": 7},
+    )
+    ACCESS_BREAKAGE = (
+        {"sweep_id": "a" * 31},
+        {"offer_id": "b" * 64},
+        {"crypter": "FILECRYPT"},
+        {"crypter": "tolink"},
+        {"access": "blocked"},
+    )
+
+    def blocked(self, offer, package_id, **overrides):
+        payload = self.blocked_payload(offer, package_id)
+        payload.update(overrides)
+        return payload
+
+    def access(self, offer, package_id, **overrides):
+        payload = self.access_payload(offer, package_id)
+        payload.update(overrides)
+        return payload
+
+    def assert_rejected(self, rule, payload):
+        with self.assertRaises(HTTPError) as raised:
+            self.call(rule, payload)
+        self.assertEqual(400, raised.exception.status_code)
+
+    def assert_state_survives(self, action):
+        decision = self.state.databases["crypter_cooldowns"].rows[CRYPTER]
+        packages = dict(self.state.databases["protected"].rows)
+
+        action()
+
+        self.assertEqual(
+            decision, self.state.databases["crypter_cooldowns"].rows[CRYPTER]
+        )
+        self.assertEqual(packages, self.state.databases["protected"].rows)
+
+    def test_a_malformed_blocked_report_survives_a_live_sweep_byte_identically(self):
+        self.store(filecrypt_rows(5))
+        offer, handout = self.handout_offer()
+
+        for overrides in self.BLOCKED_BREAKAGE:
+            with self.subTest(**overrides):
+                self.assert_state_survives(
+                    lambda overrides=overrides: self.assert_rejected(
+                        DEFER_RULE, self.blocked(offer, handout["id"], **overrides)
+                    )
+                )
+        self.assertEqual("sweeping", self.decision_row()["state"])
+
+    def test_a_malformed_access_report_survives_a_live_cooldown_byte_identically(self):
+        self.store(filecrypt_rows(5))
+        self.drive_blocked(5)
+        offer = {
+            "link_fingerprint": fingerprint_of(filecrypt_url(1)),
+            "sweep_id": self.decision_row()["sweep_id"],
+            "offer_id": "f" * 32,
+        }
+
+        for overrides in self.ACCESS_BREAKAGE:
+            with self.subTest(**overrides):
+                self.assert_state_survives(
+                    lambda overrides=overrides: self.assert_rejected(
+                        ACCESS_RULE, self.access(offer, package(1), **overrides)
+                    )
+                )
+        self.assertEqual("cooldown", self.decision_row()["state"])
+
+    def test_a_malformed_blocked_report_never_opens_a_legacy_observation(self):
+        self.store(filecrypt_rows(5))
+
+        self.assert_rejected(
+            DEFER_RULE,
+            {
+                "package_id": package(1),
+                "crypter": CRYPTER,
+                "reason_code": REASON,
+                "link_fingerprint": fingerprint_of(filecrypt_url(1)),
+                "offer_id": "b" * 32,
+            },
+        )
+
+        self.assertIsNone(self.decision_row())
+        self.assertIsNone(self.service().get_package_defer(package(1)))
+
+    def test_a_report_without_any_cohort_field_still_takes_the_version_one_route(self):
+        self.store(filecrypt_rows(5))
+
+        response = self.call(
+            DEFER_RULE,
+            {
+                "package_id": package(1),
+                "crypter": "Filecrypt",
+                "reason_code": REASON,
+                "link_fingerprint": fingerprint_of(filecrypt_url(1)),
+            },
+        )
+
+        self.assertEqual("hold", response["instruction"])
+        self.assertIsNotNone(self.service().get_package_defer(package(1)))
+
+
+class OfferOccurrenceBindingTests(CohortApiTestCase):
+    """A handout is bound to the exact stored occurrence, not to a fingerprint."""
+
+    def handout_naming(self, wanted, attempts=10):
+        """Answer offers with BLOCKED until the wanted member is the one offered."""
+        for _ in range(attempts):
+            offer, handout = self.handout_offer()
+            if offer["link_fingerprint"] == wanted:
+                return offer, handout
+            self.call(DEFER_RULE, self.blocked_payload(offer, handout["id"]))
+        raise AssertionError("the wanted cohort member was never offered")
+
+    def test_only_the_selected_index_of_a_duplicated_fingerprint_is_handed_out(self):
+        stored = filecrypt_url(1)
+        duplicate = f"{stored}#mirror"
+        rows = filecrypt_rows(4, start=2)
+        rows[package(1)] = protected_blob([[stored, CRYPTER], [duplicate, CRYPTER]])
+        self.store(rows)
+        shared = fingerprint_of(stored)
+        self.assertEqual(shared, fingerprint_of(duplicate))
+
+        offer, handout = self.handout_naming(shared)
+
+        urls = [entry[0] for entry in handout["url"]]
+        self.assertEqual(package(1), handout["id"])
+        self.assertEqual([stored], [url for url in urls if "filecrypt" in url])
+        self.assertEqual(stored, urls[0])
+        self.assertNotIn(duplicate, urls)
+        self.assertEqual(shared, offer["link_fingerprint"])
+
+    def test_the_bound_occurrence_is_the_inventorys_own_first_occurrence(self):
+        stored = filecrypt_url(1)
+        rows = filecrypt_rows(4, start=2)
+        rows[package(1)] = protected_blob(
+            [["https://tolink.invalid/one", "tolink"], [stored, CRYPTER]]
+        )
+        self.store(rows)
+
+        offer, handout = self.handout_naming(fingerprint_of(stored))
+
+        inventory = enumerate_filecrypt_candidates(
+            self.state.databases["protected"].retrieve_all_titles()
+        )
+        occurrence = next(
+            candidate.occurrences[0]
+            for candidate in inventory.candidates
+            if candidate.fingerprint == offer["link_fingerprint"]
+        )
+        self.assertEqual(1, occurrence.link_index)
+        urls = [entry[0] for entry in handout["url"]]
+        self.assertEqual(occurrence.package_id, handout["id"])
+        self.assertEqual(stored, urls[0])
+
+    def test_a_fingerprint_shared_by_two_packages_hands_out_the_lowest_one(self):
+        shared_url = filecrypt_url(1)
+        rows = filecrypt_rows(4, start=3)
+        rows[package(1)] = protected_blob([[shared_url, CRYPTER]])
+        rows[package(2)] = protected_blob([[f"{shared_url}#other", CRYPTER]])
+        self.store(rows)
+
+        _offer, handout = self.handout_naming(fingerprint_of(shared_url))
+
+        self.assertEqual(package(1), handout["id"])
+        self.assertEqual([shared_url], [entry[0] for entry in handout["url"]])
+
+
+class ManualProbeTargetingTests(CohortApiTestCase):
+    """A queued probe authorizes one package, so the offer must name its member."""
+
+    def cooled_cohort(self):
+        self.store(filecrypt_rows(5))
+        self.drive_blocked(5)
+        self.assertEqual("cooldown", self.decision_row()["state"])
+
+    def package_other_than_the_first_member(self):
+        first = self.decision_row()["members"][0]["link_fingerprint"]
+        return next(
+            package(index)
+            for index in range(1, 6)
+            if fingerprint_of(filecrypt_url(index)) != first
+        )
+
+    def test_a_probe_offers_the_queued_package_not_the_cohort_head(self):
+        self.cooled_cohort()
+        target = self.package_other_than_the_first_member()
+        self.service().request_probe([target])
+
+        handout = self.to_decrypt()
+
+        index = int(target.rsplit("_", 1)[1], 16)
+        self.assertEqual(target, handout["id"])
+        self.assertEqual("probe", handout["crypter_offer"]["mode"])
+        self.assertEqual(
+            fingerprint_of(filecrypt_url(index)),
+            handout["crypter_offer"]["link_fingerprint"],
+        )
+        self.assertEqual([filecrypt_url(index)], [entry[0] for entry in handout["url"]])
+        self.assertIs(
+            False, self.service().get_package_defer(target)["probe_requested"]
+        )
+
+    def test_a_probe_on_a_multi_member_package_offers_its_lowest_stored_link(self):
+        rows = filecrypt_rows(3, start=2)
+        rows[package(1)] = protected_blob(
+            [[filecrypt_url(1), CRYPTER], [filecrypt_url(9), CRYPTER]]
+        )
+        self.store(rows)
+        self.drive_blocked(5)
+        self.assertEqual("cooldown", self.decision_row()["state"])
+        self.service().request_probe([package(1)])
+
+        handout = self.to_decrypt()
+
+        self.assertEqual(package(1), handout["id"])
+        self.assertEqual(
+            fingerprint_of(filecrypt_url(1)),
+            handout["crypter_offer"]["link_fingerprint"],
+        )
+        self.assertEqual([filecrypt_url(1)], [entry[0] for entry in handout["url"]])
+
+    def test_an_untyped_handout_never_spends_a_cohort_probe(self):
+        self.cooled_cohort()
+        target = self.package_other_than_the_first_member()
+        self.service().request_probe([target])
+
+        with self.assertRaises(HTTPError) as raised:
+            self.to_decrypt(capabilities=[CRYPTER_DEFER_CAPABILITY])
+
+        self.assertEqual(404, raised.exception.status_code)
+        self.assertIs(True, self.service().get_package_defer(target)["probe_requested"])
+
+
+class OfferOwnershipTests(CohortApiTestCase):
+    """A report may only write rows the reporting package still owns."""
+
+    def stranger_for(self, package_id):
+        return next(
+            package(index) for index in range(1, 6) if package(index) != package_id
+        )
+
+    def assert_stale_and_untouched(self, payload):
+        packages = dict(self.state.databases["protected"].rows)
+
+        response = self.call(DEFER_RULE, payload)
+
+        self.assertEqual("stale", response["instruction"])
+        self.assertEqual(0, response["retry_after_epoch"])
+        self.assertEqual("none", response["hold_type"])
+        self.assertEqual(packages, self.state.databases["protected"].rows)
+
+    def test_a_report_from_a_package_without_the_offered_link_is_stale(self):
+        self.store(filecrypt_rows(5))
+        offer, handout = self.handout_offer()
+
+        self.assert_stale_and_untouched(
+            self.blocked_payload(offer, self.stranger_for(handout["id"]))
+        )
+
+    def test_a_report_naming_an_arbitrary_canonical_package_is_stale(self):
+        self.store(filecrypt_rows(5))
+        offer, _handout = self.handout_offer()
+
+        self.assert_stale_and_untouched(self.blocked_payload(offer, package(999)))
+
+    def test_a_report_from_a_deleted_package_is_stale(self):
+        self.store(filecrypt_rows(5))
+        offer, handout = self.handout_offer()
+        self.state.databases["protected"].rows.pop(handout["id"])
+
+        self.assert_stale_and_untouched(self.blocked_payload(offer, handout["id"]))
+
+    def test_a_report_from_a_package_whose_links_changed_is_stale(self):
+        self.store(filecrypt_rows(5))
+        offer, handout = self.handout_offer()
+        self.state.databases["protected"].update_store(
+            handout["id"], protected_blob([[filecrypt_url(77), CRYPTER]])
+        )
+
+        self.assert_stale_and_untouched(self.blocked_payload(offer, handout["id"]))
+
+    def test_a_stale_access_report_from_a_foreign_package_releases_nothing(self):
+        self.store(filecrypt_rows(5))
+        self.drive_blocked(3)
+        offer, handout = self.handout_offer()
+        held = dict(self.state.databases["protected"].rows)
+
+        response = self.call(
+            ACCESS_RULE,
+            self.access_payload(offer, self.stranger_for(handout["id"])),
+        )
+
+        self.assertIsInstance(response, HTTPResponse)
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("stale", json.loads(response.body)["instruction"])
+        self.assertEqual(held, self.state.databases["protected"].rows)
+        self.assertEqual("sweeping", self.decision_row()["state"])
+
+    def test_an_unreadable_inventory_holds_the_package_that_proves_the_link(self):
+        self.store(filecrypt_rows(5))
+        offer, handout = self.handout_offer()
+
+        with mock.patch(
+            "quasarr.api.sponsors_helper.enumerate_filecrypt_candidates",
+            side_effect=RuntimeError("inventory unavailable"),
+        ):
+            response = self.call(DEFER_RULE, self.blocked_payload(offer, handout["id"]))
+
+        self.assertEqual("hold", response["instruction"])
+        self.assertEqual("inventory_unavailable", self.decision_row()["reason"])
+        deferred = self.service().get_package_defer(handout["id"])
+        self.assertEqual([offer["link_fingerprint"]], deferred["link_fingerprints"])
+
+    def test_an_unreadable_inventory_writes_no_row_it_cannot_prove(self):
+        self.store(filecrypt_rows(5))
+        offer, handout = self.handout_offer()
+        stranger = self.stranger_for(handout["id"])
+        packages = dict(self.state.databases["protected"].rows)
+
+        with mock.patch(
+            "quasarr.api.sponsors_helper.enumerate_filecrypt_candidates",
+            side_effect=RuntimeError("inventory unavailable"),
+        ):
+            response = self.call(DEFER_RULE, self.blocked_payload(offer, stranger))
+
+        self.assertEqual("individual", response["state"])
+        self.assertEqual("inventory_unavailable", self.decision_row()["reason"])
+        self.assertEqual(packages, self.state.databases["protected"].rows)
+
+
+class VersionOnePrecedenceRaceTests(CohortApiTestCase):
+    """The version-one answer follows the row current inside its own transaction."""
+
+    def legacy_report(self, package_id=None):
+        return self.call(
+            DEFER_RULE,
+            {
+                "package_id": package_id or package(1),
+                "crypter": CRYPTER,
+                "reason_code": REASON,
+                "link_fingerprint": fingerprint_of(filecrypt_url(1)),
+            },
+        )
+
+    def test_a_sweep_installed_before_the_transaction_wins_the_answer(self):
+        self.store(filecrypt_rows(5))
+        self.to_decrypt()
+        sweeping = self.state.databases["crypter_cooldowns"].rows.pop(CRYPTER)
+        packages = dict(self.state.databases["protected"].rows)
+
+        def install_sweep():
+            self.state.databases["crypter_cooldowns"].rows[CRYPTER] = sweeping
+
+        self.state.databases["crypter_cooldowns"].before_mutation = install_sweep
+
+        response = self.legacy_report()
+
+        self.assertEqual("legacy_failure", response["instruction"])
+        self.assertEqual("none", response["hold_type"])
+        self.assertEqual(0, response["retry_after_epoch"])
+        self.assertEqual(
+            sweeping, self.state.databases["crypter_cooldowns"].rows[CRYPTER]
+        )
+        self.assertEqual(packages, self.state.databases["protected"].rows)
+
+    def test_a_hold_written_before_the_transaction_is_read_inside_it(self):
+        self.store(filecrypt_rows(5))
+        first = self.legacy_report()
+        self.assertEqual("hold", first["instruction"])
+        held = json.dumps(self.package_row(package(1)))
+        self.state.databases["protected"].rows[package(1)] = protected_blob(
+            [[filecrypt_url(1), CRYPTER]]
+        )
+
+        def restore_hold():
+            self.state.databases["protected"].rows[package(1)] = held
+
+        # The hook runs at the start of the one transaction, so a route that
+        # pre-read the package would still answer from the unheld row.
+        self.state.databases["crypter_cooldowns"].before_mutation = restore_hold
+
+        second = self.legacy_report()
+
+        self.assertEqual("legacy_failure", second["instruction"])
+        self.assertEqual("none", second["hold_type"])
+
+
+class LegacyClearOrderingTests(CohortApiTestCase):
+    """Health is proven first; every physical release is best effort after it."""
+
+    def cohort_hold(self):
+        self.store(filecrypt_rows(5))
+        self.drive_blocked(5)
+        target = next(
+            package(index)
+            for index in range(1, 6)
+            if self.service().get_package_defer(package(index))
+        )
+        return target
+
+    def clear(self, package_id):
+        return self.call(
+            ACCESS_RULE,
+            {"package_id": package_id, "crypter": CRYPTER, "access": "clear"},
+        )
+
+    def test_a_failed_health_commit_releases_no_package_hold(self):
+        target = self.cohort_hold()
+        packages = dict(self.state.databases["protected"].rows)
+        crypter_db = self.state.databases["crypter_cooldowns"]
+
+        with mock.patch.object(
+            crypter_db, "mutate_value", side_effect=RuntimeError("health commit failed")
+        ):
+            with self.assertRaises(HTTPError) as raised:
+                self.clear(target)
+
+        self.assertEqual(500, raised.exception.status_code)
+        self.assertEqual(packages, self.state.databases["protected"].rows)
+        self.assertEqual("cooldown", self.decision_row()["state"])
+
+    def test_a_failed_package_cleanup_still_acknowledges_proven_health(self):
+        target = self.cohort_hold()
+        protected_db = self.state.databases["protected"]
+
+        with mock.patch.object(
+            protected_db, "mutate_value", side_effect=RuntimeError("cleanup failed")
+        ):
+            response = self.clear(target)
+
+        self.assertEqual(
+            {"success": True, "state": "available", "cleared": True}, response
+        )
+        self.assertEqual("healthy", self.decision_row()["state"])
+
+    def test_a_newer_generation_row_survives_the_cleanup(self):
+        target = self.cohort_hold()
+        protected_db = self.state.databases["protected"]
+        newer = {
+            "crypter": CRYPTER,
+            "reason_code": REASON,
+            "since_epoch": NOW,
+            "retry_after_epoch": NOW + SWEEP_WINDOW,
+            "probe_requested": False,
+            "observation_holds": 1,
+            "schema_version": 2,
+            "sweep_id": "e" * 32,
+            "link_fingerprints": [fingerprint_of(filecrypt_url(1))],
+        }
+
+        def install_newer_generation():
+            row = json.loads(protected_db.rows[target])
+            row["deferred"] = newer
+            protected_db.rows[target] = json.dumps(row)
+
+        protected_db.before_mutation = install_newer_generation
+
+        response = self.clear(target)
+
+        self.assertIs(True, response["cleared"])
+        self.assertEqual(newer, self.package_row(target)["deferred"])
+
+    def test_a_legacy_hold_of_the_reporting_package_is_physically_released(self):
+        self.store(filecrypt_rows(1))
+        self.call(
+            DEFER_RULE,
+            {
+                "package_id": package(1),
+                "crypter": CRYPTER,
+                "reason_code": REASON,
+                "link_fingerprint": fingerprint_of(filecrypt_url(1)),
+            },
+        )
+        self.assertIsNotNone(self.service().get_package_defer(package(1)))
+
+        self.clear(package(1))
+
+        self.assertNotIn("deferred", self.package_row(package(1)))
+        self.assertEqual("healthy", self.decision_row()["state"])
+
+
 class RealDatabaseCohortTests(unittest.TestCase):
     """The whole route path against the real SQLite storage layer."""
 
@@ -1463,6 +2028,52 @@ class RealDatabaseCohortTests(unittest.TestCase):
         self.assertEqual(0, service.count_active_deferred_packages())
         for index in range(1, 6):
             self.assertIsNone(service.get_package_defer(package(index)))
+
+    def test_a_sweep_that_opens_before_the_transaction_wins_the_legacy_answer(self):
+        protected = self.state.get_db("protected")
+        for index in range(1, 6):
+            protected.update_store(
+                package(index), protected_blob([[filecrypt_url(index), CRYPTER]])
+            )
+        self.call(
+            DECRYPT_RULE,
+            {"supported_urls": ["filecrypt.invalid"], "capabilities": CAPABILITIES},
+        )
+        cooldowns = self.state.get_db("crypter_cooldowns")
+        sweeping = cooldowns.retrieve(CRYPTER)
+        cooldowns.mutate_value(CRYPTER, lambda _current: None)
+        self.assertIsNone(cooldowns.retrieve(CRYPTER))
+
+        original = DataBase.mutate_values
+        installed = []
+
+        def install_sweep_then_commit(database, targets, mutator):
+            if not installed:
+                installed.append(True)
+                competitor = DataBase("crypter_cooldowns")
+                try:
+                    competitor.update_store(CRYPTER, sweeping)
+                finally:
+                    competitor._conn.close()
+            return original(database, targets, mutator)
+
+        with mock.patch.object(DataBase, "mutate_values", install_sweep_then_commit):
+            response = self.call(
+                DEFER_RULE,
+                {
+                    "package_id": package(1),
+                    "crypter": CRYPTER,
+                    "reason_code": REASON,
+                    "link_fingerprint": fingerprint_of(filecrypt_url(1)),
+                },
+            )
+
+        self.assertEqual([True], installed)
+        self.assertEqual("legacy_failure", response["instruction"])
+        self.assertEqual("none", response["hold_type"])
+        self.assertEqual(0, response["retry_after_epoch"])
+        self.assertEqual(sweeping, cooldowns.retrieve(CRYPTER))
+        self.assertNotIn("deferred", json.loads(protected.retrieve(package(1))))
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ INDIVIDUAL_REASONS = frozenset(
 MEMBER_RESULTS = frozenset({"pending", "offered", "blocked", "unknown"})
 RESPONSE_INSTRUCTIONS = frozenset({"", "hold", "cooldown", "legacy_failure"})
 ACCEPTED_VALUES = frozenset({"", "unknown"})
+ACCEPTED_OUTCOMES = frozenset({"blocked", "clear", "unknown"})
 OFFER_MODES = frozenset({"sweep", "retest", "individual", "probe"})
 ACCEPTED_STATES = frozenset({"sweeping", "cooldown", "healthy", "individual"})
 HOLD_TYPES = frozenset({"none", "provisional", "crypter_cooldown"})
@@ -77,6 +78,7 @@ _ACCEPTED_OFFER_KEYS = frozenset(
         "offer_id",
         "link_fingerprint",
         "mode",
+        "outcome",
         "state",
         "instruction",
         "accepted",
@@ -285,6 +287,7 @@ def _accepted_offers(value, used):
             "offer_id": offer_id,
             "link_fingerprint": link_fingerprint,
             "mode": _choice(entry["mode"], OFFER_MODES, "mode"),
+            "outcome": _choice(entry["outcome"], ACCEPTED_OUTCOMES, "outcome"),
             "state": _choice(entry["state"], ACCEPTED_STATES, "state"),
             "instruction": _choice(
                 entry["instruction"], RESPONSE_INSTRUCTIONS, "instruction"
@@ -322,8 +325,10 @@ def _validate_accepted_response(entry):
             and hold_type == "none"
             and retry_after == 0
         )
+        outcome = "clear"
     elif accepted == "unknown":
         coherent = instruction == "" and hold_type == "none" and retry_after == 0
+        outcome = "unknown"
     elif instruction == "hold":
         coherent = (
             state in ("sweeping", "individual")
@@ -331,6 +336,7 @@ def _validate_accepted_response(entry):
             and hold_type == "provisional"
             and retry_after > 0
         )
+        outcome = "blocked"
     elif instruction == "cooldown":
         coherent = (
             state == "cooldown"
@@ -338,6 +344,7 @@ def _validate_accepted_response(entry):
             and hold_type == "crypter_cooldown"
             and retry_after > 0
         )
+        outcome = "blocked"
     elif instruction == "legacy_failure":
         coherent = (
             state in ("healthy", "individual")
@@ -345,9 +352,13 @@ def _validate_accepted_response(entry):
             and hold_type == "none"
             and retry_after == 0
         )
+        outcome = "blocked"
     else:
         coherent = False
-    if not coherent:
+        outcome = ""
+    # The retained outcome kind is what decides which route may replay this
+    # entry, so it must describe the response it was stored with.
+    if not coherent or entry["outcome"] != outcome:
         raise ValueError("Invalid linkcrypter accepted response")
 
 
@@ -927,17 +938,20 @@ def _accepted_entry(record, offer):
     return None
 
 
-def _store_accepted(record, offer, mode, decision):
+def _store_accepted(record, offer, mode, decision, outcome):
     """Retain one accepted result so its report can be replayed verbatim.
 
     One entry per frozen fingerprint: a later accepted result for the same link
     supersedes the earlier one, which bounds the history by the cohort itself
-    and makes the superseded identity stale rather than replayable.
+    and makes the superseded identity stale rather than replayable. `outcome` is
+    the kind of report that produced it, so only the route that can answer that
+    kind may replay it.
     """
     entry = {
         "offer_id": offer.offer_id,
         "link_fingerprint": offer.fingerprint,
         "mode": mode,
+        "outcome": outcome,
         "state": decision["state"],
         "instruction": decision["instruction"],
         "accepted": decision["accepted"],
@@ -962,8 +976,13 @@ def _store_accepted(record, offer, mode, decision):
 
 
 def _replay(record, entry, now):
-    """Answer a duplicate report with the exact response it already accepted."""
-    del now
+    """Answer a duplicate report with the verdict it already accepted.
+
+    The verdict fields are the retained ones - the report may not be re-decided
+    - while the sweep counters are recomputed from the record that is current
+    now, so a replay never reports a denominator the linkcrypter left behind.
+    """
+    sweep_id, tested, total, deadline = _counters(record, now)
     return _decision(
         instruction=entry["instruction"],
         state=entry["state"],
@@ -972,10 +991,10 @@ def _replay(record, entry, now):
         cleared=entry["cleared"],
         evidence_count=entry["evidence_count"],
         retry_after_epoch=entry["retry_after_epoch"],
-        sweep_id=_generation_id(record),
-        sweep_tested=entry["sweep_tested"],
-        sweep_total=entry["sweep_total"],
-        sweep_deadline_epoch=entry["sweep_deadline_epoch"],
+        sweep_id=sweep_id,
+        sweep_tested=tested,
+        sweep_total=total,
+        sweep_deadline_epoch=deadline,
     )
 
 
@@ -987,6 +1006,30 @@ def _released_slot(record, offer):
             entry for entry in updated["retest_members"] if entry != offer.fingerprint
         ]
     return updated
+
+
+def _counters(record, now):
+    """The generation identity and sweep counters one record reports right now."""
+    snapshot = decision_snapshot(record, now=now)
+    state = snapshot["state"]
+    if state == "sweeping":
+        deadline = snapshot["sweep_deadline_epoch"]
+    elif state == "cooldown":
+        deadline = snapshot["retry_after_epoch"]
+    elif state == "available":
+        deadline = 0
+    else:
+        deadline = snapshot["until_epoch"]
+    if state == "individual" and snapshot["reason_code"] == "cohort_oversized":
+        total = OVERSIZED_COHORT_SENTINEL
+    else:
+        total = snapshot["sweep_total"]
+    return (
+        snapshot["sweep_id"] or snapshot["generation_id"],
+        snapshot["sweep_tested"],
+        total,
+        deadline,
+    )
 
 
 def _situation(
@@ -1004,15 +1047,8 @@ def _situation(
 ):
     """Project the record a report ended on into the fixed decision shape."""
     snapshot = decision_snapshot(record, now=now)
+    sweep_id, sweep_tested, sweep_total, deadline = _counters(record, now)
     state = snapshot["state"]
-    if state == "sweeping":
-        deadline = snapshot["sweep_deadline_epoch"]
-    elif state == "cooldown":
-        deadline = snapshot["retry_after_epoch"]
-    elif state == "available":
-        deadline = 0
-    else:
-        deadline = snapshot["until_epoch"]
 
     # Only a sweep or a cohort cooldown ever asks for a hold, so the resulting
     # hold type follows from the state the report ended on.
@@ -1023,13 +1059,6 @@ def _situation(
     else:
         hold_type, retry_after_epoch = "provisional", deadline
 
-    if total is not None:
-        sweep_total = total
-    elif state == "individual" and snapshot["reason_code"] == "cohort_oversized":
-        sweep_total = OVERSIZED_COHORT_SENTINEL
-    else:
-        sweep_total = snapshot["sweep_total"]
-
     return _decision(
         instruction=instruction,
         state=state,
@@ -1038,9 +1067,9 @@ def _situation(
         cleared=cleared,
         evidence_count=snapshot["evidence_count"],
         retry_after_epoch=retry_after_epoch,
-        sweep_id=snapshot["sweep_id"] or snapshot["generation_id"],
-        sweep_tested=snapshot["sweep_tested"] if tested is None else tested,
-        sweep_total=sweep_total,
+        sweep_id=sweep_id,
+        sweep_tested=sweep_tested if tested is None else tested,
+        sweep_total=sweep_total if total is None else total,
         sweep_deadline_epoch=deadline if sweep_deadline is None else sweep_deadline,
         events=events,
     )
@@ -1048,6 +1077,11 @@ def _situation(
 
 def _stale(record, now):
     return _situation(record, now, instruction="stale")
+
+
+def stale_decision(record, *, now):
+    """The non-destructive answer to a report this decision cannot own."""
+    return _stale(record, now)
 
 
 def bypass_decision():
@@ -1149,12 +1183,20 @@ def _slot_is_leasable(record, now):
     return live is None or live["offer_expires_epoch"] <= now
 
 
-def lease_next_offer(record, inventory, *, now, offer_id_factory, mode=None):
+def lease_next_offer(
+    record, inventory, *, now, offer_id_factory, mode=None, preferred_fingerprint=None
+):
     """Lease at most one offer, or answer that there is no work to hand out.
 
     A member or record-level slot with a live lease is never handed out twice,
     an expired unaccepted lease is replaced under a fresh ID, and nothing is
     ever leased at or after the current window's deadline.
+
+    `preferred_fingerprint` names the exact member the caller can actually hand
+    out. A manual probe requires one, because the probe authorizes one package
+    and a lease for a member that package does not contain could never be
+    answered. Anything that cannot be leased exactly as named leases nothing and
+    mints no identity, so an impossible request changes no state at all.
     """
     if not isinstance(record, dict):
         return record, None
@@ -1163,12 +1205,18 @@ def lease_next_offer(record, inventory, *, now, offer_id_factory, mode=None):
         return record, None
 
     if state == "sweeping":
-        return _lease_sweep_offer(record, now, offer_id_factory, mode)
+        return _lease_sweep_offer(
+            record, now, offer_id_factory, mode, preferred_fingerprint
+        )
     if state == "cooldown":
         # A migrated legacy cooldown owns no cohort and never issues one.
         if mode != "probe" or "members" not in record:
             return record, None
-        link_fingerprint = record["members"][0]["link_fingerprint"]
+        if preferred_fingerprint is None:
+            return record, None
+        if _member_index(record, preferred_fingerprint) is None:
+            return record, None
+        link_fingerprint = preferred_fingerprint
     elif state == "healthy":
         if mode not in (None, "retest") or not record["retest_members"]:
             return record, None
@@ -1183,6 +1231,8 @@ def lease_next_offer(record, inventory, *, now, offer_id_factory, mode=None):
         link_fingerprint = fingerprints[0]
         mode = "individual"
 
+    if preferred_fingerprint is not None and link_fingerprint != preferred_fingerprint:
+        return record, None
     if not _slot_is_leasable(record, now):
         return record, None
     offer_id = _mint_offer_id(record, offer_id_factory)
@@ -1197,15 +1247,23 @@ def lease_next_offer(record, inventory, *, now, offer_id_factory, mode=None):
     )
 
 
-def _lease_sweep_offer(record, now, offer_id_factory, mode):
+def _lease_sweep_offer(record, now, offer_id_factory, mode, preferred_fingerprint=None):
     if mode not in (None, "sweep"):
         return record, None
     index = next(
         (
             position
             for position, entry in enumerate(record["members"])
-            if entry["result"] == "pending"
-            or (entry["result"] == "offered" and entry["offer_expires_epoch"] <= now)
+            if (
+                preferred_fingerprint is None
+                or entry["link_fingerprint"] == preferred_fingerprint
+            )
+            and (
+                entry["result"] == "pending"
+                or (
+                    entry["result"] == "offered" and entry["offer_expires_epoch"] <= now
+                )
+            )
         ),
         None,
     )
@@ -1243,6 +1301,10 @@ def record_blocked(record, offer, inventory, *, now, cooldown_seconds):
         return record, _stale(record, now)
     accepted = _accepted_entry(record, offer)
     if accepted is not None:
+        # Only the route that produced a result may replay it; presenting an
+        # accepted CLEAR or UNKNOWN here is a stale report, never an answer.
+        if accepted["outcome"] != "blocked":
+            return record, _stale(record, now)
         return record, _replay(record, accepted, now)
     if record["state"] == "sweeping":
         return _blocked_in_sweep(record, offer, inventory, now, cooldown_seconds)
@@ -1327,7 +1389,7 @@ def _conclude_sweep(record, members, index, offer, inventory, now, cooldown_seco
             tested=tested,
             sweep_deadline=record["deadline_epoch"],
         )
-        return _store_accepted(tainted, offer, "sweep", decision), decision
+        return _store_accepted(tainted, offer, "sweep", decision, "blocked"), decision
 
     if (
         all_blocked
@@ -1356,7 +1418,7 @@ def _conclude_sweep(record, members, index, offer, inventory, now, cooldown_seco
             hold=True,
             events={**counted, "cooldowns": 1},
         )
-        return _store_accepted(cooled, offer, "sweep", decision), decision
+        return _store_accepted(cooled, offer, "sweep", decision, "blocked"), decision
 
     if tested == total or lost:
         # An untested member that left the inventory can never be tested, so the
@@ -1382,11 +1444,11 @@ def _conclude_sweep(record, members, index, offer, inventory, now, cooldown_seco
             tested=tested,
             sweep_deadline=record["deadline_epoch"],
         )
-        return _store_accepted(concluded, offer, "sweep", decision), decision
+        return _store_accepted(concluded, offer, "sweep", decision, "blocked"), decision
 
     updated = {**record, "members": members}
     decision = _situation(updated, now, instruction="hold", hold=True, events=counted)
-    return _store_accepted(updated, offer, "sweep", decision), decision
+    return _store_accepted(updated, offer, "sweep", decision, "blocked"), decision
 
 
 def _blocked_in_cooldown(record, offer, now):
@@ -1396,7 +1458,9 @@ def _blocked_in_cooldown(record, offer, now):
     _kind, _index, stored = located
     updated = _released_slot(record, offer)
     decision = _situation(updated, now, instruction="cooldown", hold=True)
-    return _store_accepted(updated, offer, stored["mode"], decision), decision
+    return _store_accepted(
+        updated, offer, stored["mode"], decision, "blocked"
+    ), decision
 
 
 def _blocked_outside_cohort(record, offer, now):
@@ -1407,7 +1471,9 @@ def _blocked_outside_cohort(record, offer, now):
     _kind, _index, stored = located
     updated = _released_slot(record, offer)
     decision = _situation(updated, now, instruction="legacy_failure")
-    return _store_accepted(updated, offer, stored["mode"], decision), decision
+    return _store_accepted(
+        updated, offer, stored["mode"], decision, "blocked"
+    ), decision
 
 
 def record_access(record, offer, access, inventory, *, now):
@@ -1425,6 +1491,8 @@ def record_access(record, offer, access, inventory, *, now):
         return record, _stale(record, now)
     accepted = _accepted_entry(record, offer)
     if accepted is not None:
+        if accepted["outcome"] != access:
+            return record, _stale(record, now)
         return record, _replay(record, accepted, now)
     if access == "clear":
         return _record_clear(record, offer, now)
@@ -1458,7 +1526,7 @@ def _record_clear(record, offer, now):
         "used_offer_ids": record["used_offer_ids"],
     }
     decision = _situation(healthy, now, cleared=True)
-    return _store_accepted(healthy, offer, mode, decision), decision
+    return _store_accepted(healthy, offer, mode, decision, "clear"), decision
 
 
 def _record_unknown(record, offer, now):
@@ -1469,7 +1537,9 @@ def _record_unknown(record, offer, now):
     if kind == "slot":
         updated = _released_slot(record, offer)
         decision = _situation(updated, now, accepted="unknown")
-        return _store_accepted(updated, offer, stored["mode"], decision), decision
+        return _store_accepted(
+            updated, offer, stored["mode"], decision, "unknown"
+        ), decision
 
     members = list(record["members"])
     members[index] = {
@@ -1484,7 +1554,7 @@ def _record_unknown(record, offer, now):
         # An UNKNOWN never ends a sweep early; it only makes it inconclusive.
         updated = {**record, "members": members}
         decision = _situation(updated, now, accepted="unknown")
-        return _store_accepted(updated, offer, "sweep", decision), decision
+        return _store_accepted(updated, offer, "sweep", decision, "unknown"), decision
     concluded = _individual(
         "sweep_inconclusive",
         record["sweep_id"],
@@ -1500,7 +1570,7 @@ def _record_unknown(record, offer, now):
         tested=tested,
         sweep_deadline=record["deadline_epoch"],
     )
-    return _store_accepted(concluded, offer, "sweep", decision), decision
+    return _store_accepted(concluded, offer, "sweep", decision, "unknown"), decision
 
 
 def _legacy_decision(state, evidence_count, retry_after_epoch, *, recorded=False):

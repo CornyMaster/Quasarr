@@ -28,6 +28,7 @@ from quasarr.providers.crypter_sweeps import (
     MAXIMUM_OFFER_ID_ATTEMPTS,
     MINIMUM_CONCLUSIVE_COHORT_SIZE,
     OFFER_LEASE_SECONDS,
+    OVERSIZED_COHORT_SENTINEL,
     SWEEP_WINDOW_SECONDS,
     Offer,
     decision_snapshot,
@@ -140,6 +141,7 @@ def accepted_offer(index, **overrides):
         "offer_id": offer_id(index),
         "link_fingerprint": fingerprint(index),
         "mode": "sweep",
+        "outcome": "blocked",
         "state": "sweeping",
         "instruction": "hold",
         "accepted": "",
@@ -459,9 +461,14 @@ class LeaseOfferTests(unittest.TestCase):
     def setUp(self):
         self.ids = SequentialIds()
 
-    def lease(self, record, inventory=None, *, now=NOW, mode=None):
+    def lease(self, record, inventory=None, *, now=NOW, mode=None, preferred=None):
         return lease_next_offer(
-            record, inventory, now=now, offer_id_factory=self.ids, mode=mode
+            record,
+            inventory,
+            now=now,
+            offer_id_factory=self.ids,
+            mode=mode,
+            preferred_fingerprint=preferred,
         )
 
     def test_a_sweep_leases_pending_members_in_frozen_order(self):
@@ -502,23 +509,37 @@ class LeaseOfferTests(unittest.TestCase):
 
     def test_no_offer_is_leased_at_or_after_a_deadline(self):
         cases = (
-            (sweeping_record(3), DEADLINE, None),
+            (sweeping_record(3), DEADLINE, None, None),
             (
                 healthy_record(retest=[fingerprint(1)]),
                 NOW + HEALTHY_SUPPRESSION_SECONDS,
                 None,
+                None,
             ),
-            (individual_record(), NOW + SWEEP_WINDOW_SECONDS, "individual"),
-            (cohort_cooldown_record(), NOW + COOLDOWN_SECONDS, "probe"),
+            (individual_record(), NOW + SWEEP_WINDOW_SECONDS, "individual", None),
+            (
+                cohort_cooldown_record(),
+                NOW + COOLDOWN_SECONDS,
+                "probe",
+                fingerprint(1),
+            ),
         )
-        for record, deadline, mode in cases:
+        for record, deadline, mode, preferred in cases:
             with self.subTest(state=record["state"]):
                 _record, at_deadline = self.lease(
-                    record, cohort_inventory(3), now=deadline, mode=mode
+                    record,
+                    cohort_inventory(3),
+                    now=deadline,
+                    mode=mode,
+                    preferred=preferred,
                 )
                 self.assertIsNone(at_deadline)
                 _record, before = self.lease(
-                    record, cohort_inventory(3), now=deadline - 1, mode=mode
+                    record,
+                    cohort_inventory(3),
+                    now=deadline - 1,
+                    mode=mode,
+                    preferred=preferred,
                 )
                 self.assertIsNotNone(before)
 
@@ -579,7 +600,9 @@ class LeaseOfferTests(unittest.TestCase):
         _unchanged, implicit = self.lease(record, cohort_inventory(5))
         self.assertIsNone(implicit)
 
-        leased, probe = self.lease(record, cohort_inventory(5), mode="probe")
+        leased, probe = self.lease(
+            record, cohort_inventory(5), mode="probe", preferred=fingerprint(1)
+        )
         self.assertEqual("probe", probe.mode)
         self.assertEqual(fingerprint(1), probe.fingerprint)
         self.assertEqual(NOW + COOLDOWN_SECONDS, probe.deadline_epoch)
@@ -588,7 +611,9 @@ class LeaseOfferTests(unittest.TestCase):
     def test_a_migrated_legacy_cooldown_never_issues_a_cohort_offer(self):
         record = legacy_cooldown_record()
 
-        unchanged, offer = self.lease(record, cohort_inventory(5), mode="probe")
+        unchanged, offer = self.lease(
+            record, cohort_inventory(5), mode="probe", preferred=fingerprint(1)
+        )
 
         self.assertIsNone(offer)
         self.assertEqual(record, unchanged)
@@ -605,6 +630,207 @@ class LeaseOfferTests(unittest.TestCase):
         self.assertEqual(
             record, decode_decision_record(encode_decision_record(record), now=NOW)
         )
+
+
+class PreferredMemberLeaseTests(unittest.TestCase):
+    """A manual probe authorizes one package, so its member must be named."""
+
+    def setUp(self):
+        self.ids = SequentialIds()
+
+    def lease(self, record, inventory=None, *, now=NOW, mode=None, preferred=None):
+        return lease_next_offer(
+            record,
+            inventory,
+            now=now,
+            offer_id_factory=self.ids,
+            mode=mode,
+            preferred_fingerprint=preferred,
+        )
+
+    def test_a_cooldown_probe_leases_the_named_member_not_the_first(self):
+        record = cohort_cooldown_record()
+
+        leased, probe = self.lease(
+            record, cohort_inventory(5), mode="probe", preferred=fingerprint(4)
+        )
+
+        self.assertEqual("probe", probe.mode)
+        self.assertEqual(fingerprint(4), probe.fingerprint)
+        self.assertEqual(probe.offer_id, leased["live_offer"]["offer_id"])
+        self.assertEqual(fingerprint(4), leased["live_offer"]["offer_fingerprint"])
+
+    def test_a_probe_without_a_named_member_leases_nothing_and_mints_nothing(self):
+        record = cohort_cooldown_record()
+
+        unchanged, offer = self.lease(record, cohort_inventory(5), mode="probe")
+
+        self.assertIsNone(offer)
+        self.assertEqual(record, unchanged)
+        self.assertEqual([], self.ids.minted)
+
+    def test_a_probe_for_a_fingerprint_outside_the_cohort_changes_nothing(self):
+        record = cohort_cooldown_record()
+
+        unchanged, offer = self.lease(
+            record, cohort_inventory(9), mode="probe", preferred=fingerprint(9)
+        )
+
+        self.assertIsNone(offer)
+        self.assertEqual(record, unchanged)
+        self.assertEqual([], self.ids.minted)
+
+    def test_a_sweep_leases_exactly_the_named_pending_member(self):
+        record = sweeping_record(3)
+
+        leased, offer = self.lease(record, mode="sweep", preferred=fingerprint(3))
+
+        self.assertEqual(fingerprint(3), offer.fingerprint)
+        self.assertEqual(
+            ["pending", "pending", "offered"],
+            [entry["result"] for entry in leased["members"]],
+        )
+
+    def test_a_named_member_that_is_not_leasable_changes_nothing(self):
+        record = sweeping_record(3, members=[blocked_member(1), member(2), member(3)])
+
+        unchanged, offer = self.lease(record, mode="sweep", preferred=fingerprint(1))
+
+        self.assertIsNone(offer)
+        self.assertEqual(record, unchanged)
+        self.assertEqual([], self.ids.minted)
+
+    def test_a_retest_queue_only_answers_its_own_head(self):
+        record = healthy_record(retest=[fingerprint(2), fingerprint(7)])
+
+        unchanged, refused = self.lease(record, preferred=fingerprint(7))
+        self.assertIsNone(refused)
+        self.assertEqual(record, unchanged)
+        self.assertEqual([], self.ids.minted)
+
+        _leased, offered = self.lease(record, preferred=fingerprint(2))
+        self.assertEqual(fingerprint(2), offered.fingerprint)
+
+
+class TypedReplayTests(unittest.TestCase):
+    """An accepted result may only be replayed by the route that produced it."""
+
+    def blocked(self, record, offer, inventory=None, *, now=NOW):
+        return record_blocked(
+            record, offer, inventory, now=now, cooldown_seconds=COOLDOWN_SECONDS
+        )
+
+    def access(self, record, offer, access, *, now=NOW):
+        return record_access(record, offer, access, None, now=now)
+
+    def offered(self, size=5, *, index=1):
+        members = [
+            member(position, "offered", offer=offer_id(position))
+            if position == index
+            else member(position)
+            for position in range(1, size + 1)
+        ]
+        return sweeping_record(size, members=members)
+
+    def test_the_accepted_history_stores_the_outcome_kind_it_answered(self):
+        record = self.offered()
+
+        held, _ = self.blocked(record, report(1), cohort_inventory(5))
+        cleared, _ = self.access(record, report(1), "clear")
+        unknown, _ = self.access(record, report(1), "unknown")
+
+        self.assertEqual(
+            ["blocked"], [entry["outcome"] for entry in held["accepted_offers"]]
+        )
+        self.assertEqual(
+            ["clear"], [entry["outcome"] for entry in cleared["accepted_offers"]]
+        )
+        self.assertEqual(
+            ["unknown"], [entry["outcome"] for entry in unknown["accepted_offers"]]
+        )
+
+    def test_an_accepted_access_result_is_never_replayed_as_a_blocked_report(self):
+        for access in ("clear", "unknown"):
+            with self.subTest(access=access):
+                record, answered = self.access(self.offered(), report(1), access)
+
+                unchanged, replay = self.blocked(record, report(1), cohort_inventory(5))
+
+                self.assertEqual("stale", replay["instruction"])
+                self.assertEqual("", replay["accepted"])
+                self.assertIs(False, replay["cleared"])
+                self.assertNotEqual(answered["instruction"], replay["instruction"])
+                self.assertEqual(record, unchanged)
+
+    def test_an_accepted_blocked_result_is_never_replayed_as_an_access_report(self):
+        record, held = self.blocked(self.offered(), report(1), cohort_inventory(5))
+        self.assertEqual("hold", held["instruction"])
+
+        for access in ("clear", "unknown"):
+            with self.subTest(access=access):
+                unchanged, replay = self.access(record, report(1), access)
+
+                self.assertEqual("stale", replay["instruction"])
+                self.assertIs(False, replay["cleared"])
+                self.assertEqual("", replay["accepted"])
+                self.assertEqual(record, unchanged)
+
+    def test_an_access_report_only_replays_its_own_kind(self):
+        record, accepted = self.access(self.offered(), report(1), "unknown")
+
+        _unchanged, mismatched = self.access(record, report(1), "clear")
+        self.assertEqual("stale", mismatched["instruction"])
+        self.assertIs(False, mismatched["cleared"])
+
+        _unchanged, replay = self.access(record, report(1), "unknown")
+        self.assertEqual(accepted["accepted"], replay["accepted"])
+        self.assertEqual(accepted["state"], replay["state"])
+
+    def test_a_replay_reports_current_counters_with_its_original_verdict(self):
+        record = sweeping_record(
+            5,
+            members=[
+                member(index, "offered", offer=offer_id(index)) for index in range(1, 6)
+            ],
+        )
+        inventory = cohort_inventory(5)
+        record, first = self.blocked(record, report(1), inventory)
+        self.assertEqual(1, first["sweep_tested"])
+
+        for index in (2, 3):
+            record, _answer = self.blocked(record, report(index), inventory)
+
+        unchanged, replay = self.blocked(record, report(1), inventory)
+
+        self.assertEqual(first["instruction"], replay["instruction"])
+        self.assertEqual(first["state"], replay["state"])
+        self.assertEqual(first["hold_type"], replay["hold_type"])
+        self.assertEqual(first["evidence_count"], replay["evidence_count"])
+        self.assertEqual(first["retry_after_epoch"], replay["retry_after_epoch"])
+        self.assertEqual(3, replay["sweep_tested"])
+        self.assertEqual(5, replay["sweep_total"])
+        self.assertEqual(SWEEP_ID, replay["sweep_id"])
+        self.assertEqual(record, unchanged)
+
+    def test_a_replay_inside_an_oversized_window_still_reports_the_sentinel(self):
+        accepted = accepted_offer(
+            1,
+            state="individual",
+            instruction="legacy_failure",
+            hold_type="none",
+            evidence_count=0,
+            retry_after_epoch=0,
+            sweep_tested=4,
+            sweep_total=4,
+        )
+        record = individual_record("cohort_oversized", accepted=[accepted])
+
+        unchanged, replay = self.blocked(record, report(1), None)
+
+        self.assertEqual(OVERSIZED_COHORT_SENTINEL, replay["sweep_total"])
+        self.assertEqual("legacy_failure", replay["instruction"])
+        self.assertEqual(SWEEP_ID, replay["sweep_id"])
+        self.assertEqual(record, unchanged)
 
 
 class RecordBlockedTests(unittest.TestCase):
@@ -1119,7 +1345,12 @@ class RecordAccessTests(unittest.TestCase):
     def test_clear_wins_over_a_completed_cohort_cooldown(self):
         record = cohort_cooldown_record()
         leased, probe = lease_next_offer(
-            record, None, now=NOW, offer_id_factory=SequentialIds(), mode="probe"
+            record,
+            None,
+            now=NOW,
+            offer_id_factory=SequentialIds(),
+            mode="probe",
+            preferred_fingerprint=fingerprint(1),
         )
 
         updated, decision = self.access(leased, probe, "clear", cohort_inventory(5))
@@ -1214,7 +1445,12 @@ class RecordAccessTests(unittest.TestCase):
     def test_a_probe_unknown_only_consumes_that_offer(self):
         record = cohort_cooldown_record()
         leased, probe = lease_next_offer(
-            record, None, now=NOW, offer_id_factory=SequentialIds(), mode="probe"
+            record,
+            None,
+            now=NOW,
+            offer_id_factory=SequentialIds(),
+            mode="probe",
+            preferred_fingerprint=fingerprint(1),
         )
 
         updated, decision = self.access(leased, probe, "unknown", cohort_inventory(5))
@@ -1363,9 +1599,6 @@ class AcceptedOfferReplayTests(unittest.TestCase):
             "hold_type",
             "evidence_count",
             "retry_after_epoch",
-            "sweep_tested",
-            "sweep_total",
-            "sweep_deadline_epoch",
         )
 
         for label, record, transition, replayed_at in cases:
@@ -1392,6 +1625,10 @@ class AcceptedOfferReplayTests(unittest.TestCase):
                     {field: accepted[field] for field in replay_fields},
                     {field: replay[field] for field in replay_fields},
                 )
+                # The verdict is replayed; the counters describe the record now.
+                current = decision_snapshot(unchanged, now=replayed_at)
+                self.assertEqual(current["sweep_tested"], replay["sweep_tested"])
+                self.assertEqual(current["sweep_total"], replay["sweep_total"])
                 self.assertEqual(NO_EVENTS, replay["events"])
 
     def test_an_expired_unaccepted_lease_is_stale_and_never_mutates(self):
@@ -1419,7 +1656,7 @@ class AcceptedOfferReplayTests(unittest.TestCase):
         self.assertEqual(first["instruction"], second["instruction"])
         self.assertEqual(NO_EVENTS, second["events"])
 
-    def test_a_replayed_report_answers_the_stored_response_and_counters(self):
+    def test_a_replayed_report_answers_its_verdict_with_current_counters(self):
         held, first = self.blocked(self.offered(1), report(1), cohort_inventory(5))
         self.assertEqual(1, first["sweep_tested"])
 
@@ -1442,7 +1679,9 @@ class AcceptedOfferReplayTests(unittest.TestCase):
             advanced, report(1), cohort_inventory(5), now=NOW + 20
         )
 
-        self.assertEqual(1, decision["sweep_tested"], "stored counters replay exactly")
+        self.assertEqual(
+            2, decision["sweep_tested"], "counters describe the record now"
+        )
         self.assertEqual(5, decision["sweep_total"])
         self.assertEqual("sweeping", decision["state"])
         self.assertEqual(DEADLINE, decision["retry_after_epoch"])
@@ -2080,7 +2319,7 @@ class CohortBlockedServiceTests(SweepServiceTestCase):
             [fingerprint(1)], self.stored_defer(package(1))["link_fingerprints"]
         )
 
-    def test_an_inventory_outage_holds_only_the_reporting_package(self):
+    def test_an_inventory_outage_ends_the_generation_fail_closed(self):
         offer = self.open_sweep()
         self.report_blocked(offer, package(1))
         second = self.service.prepare_offer(CRYPTER, self.inventory)
@@ -2099,14 +2338,16 @@ class CohortBlockedServiceTests(SweepServiceTestCase):
         self.assertEqual("individual", decision["state"])
         record = self.stored_decision()
         self.assertEqual("inventory_unavailable", record["reason"])
+        self.assertEqual([second["link_fingerprint"]], record["hold_fingerprints"])
         current = decision_snapshot(record, now=NOW)
-        self.assertTrue(
-            package_defer_is_active(self.stored_defer(package(2)), current, now=NOW)
-        )
         self.assertFalse(
             package_defer_is_active(self.stored_defer(package(1)), current, now=NOW),
             "the earlier member of the tainted generation is released",
         )
+        # These synthetic fingerprints are not the digests of the stored links,
+        # so the narrow verifier cannot prove the reporter owns the offer and no
+        # package row is written at all.
+        self.assertIsNone(self.stored_defer(package(2)))
         follow_up = self.service.prepare_offer(CRYPTER, self.inventory)
         self.assertEqual("individual", follow_up["mode"])
         self.assertEqual("individual", self.stored_decision()["state"])
@@ -2771,7 +3012,17 @@ class RealDatabaseSweepTests(unittest.TestCase):
 
     def test_a_clear_after_a_cooldown_reopens_every_held_package(self):
         inventory, _decision = self.drive_full_cohort()
-        probe = self.service.prepare_offer(CRYPTER, inventory, mode="probe")
+        reopened = DataBase("crypter_cooldowns")
+        self.addCleanup(reopened._conn.close)
+        cooled = decode_decision_record(reopened.retrieve(CRYPTER), now=NOW)
+        member_fingerprint = cooled["members"][2]["link_fingerprint"]
+        probe = self.service.prepare_offer(
+            CRYPTER,
+            inventory,
+            mode="probe",
+            preferred_fingerprint=member_fingerprint,
+        )
+        self.assertEqual(member_fingerprint, probe["link_fingerprint"])
 
         decision = self.service.record_cohort_access(
             CRYPTER,

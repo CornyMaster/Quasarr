@@ -1227,8 +1227,17 @@ class CohortSweepCounterTests(CrypterStatisticsTestCase):
             self.state.get_db("protected").retrieve_all_titles()
         )
 
-    def lease(self, mode=None):
-        return self.service.prepare_offer(CRYPTER, self.inventory(), mode=mode)
+    def lease(self, mode=None, preferred=None):
+        return self.service.prepare_offer(
+            CRYPTER, self.inventory(), mode=mode, preferred_fingerprint=preferred
+        )
+
+    def lease_probe(self):
+        """A probe names the member its package authorized, never the head."""
+        record = json.loads(self.state.get_db("crypter_cooldowns").retrieve(CRYPTER))
+        return self.lease(
+            mode="probe", preferred=record["members"][0]["link_fingerprint"]
+        )
 
     def report_blocked(self, offer, package_id):
         return self.service.record_cohort_blocked(
@@ -1329,7 +1338,7 @@ class CohortSweepCounterTests(CrypterStatisticsTestCase):
         self.drive_cohort()
         before = self.counters()[PROBES_KEY]
 
-        probe = self.lease(mode="probe")
+        probe = self.lease_probe()
 
         self.assertEqual("probe", probe["mode"])
         self.assertEqual(before, self.counters()[PROBES_KEY])
@@ -1338,7 +1347,7 @@ class CohortSweepCounterTests(CrypterStatisticsTestCase):
         self.drive_cohort()
         self.assertEqual(5, self.counters()[DEFERRED_KEY])
 
-        probe = self.lease(mode="probe")
+        probe = self.lease_probe()
         self.report_access(probe, self.package_for(probe), "clear")
 
         self.assertEqual(0, self.counters()[DEFERRED_KEY])

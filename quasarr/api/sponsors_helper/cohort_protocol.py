@@ -5,10 +5,12 @@
 """Pure parsing and rendering of the Filecrypt cohort protocol.
 
 Nothing here reads storage, settings, or a clock. A report is classified by
-what it carries, not by what the helper claims: a cohort report is exactly one
-that names a strictly valid Filecrypt offer identity, so a malformed or missing
-offer can only ever fall back to the version-one route instead of reaching a
-cohort wrapper.
+what it carries, not by what the helper claims, and that classification is
+tri-state: a body with no cohort identity field at all is ordinary version-one
+work, a body carrying the complete exact identity is a cohort report, and a
+body that names cohort intent it cannot spell correctly is malformed. Malformed
+is its own answer because falling back to the state-changing version-one route
+would let a typo mutate a package hold the helper never meant to touch.
 """
 
 import hashlib
@@ -21,9 +23,14 @@ TERMINAL_OPERATION_DOMAIN = "sponsors-helper-terminal-v2"
 
 COHORT_ACCESS_VALUES = frozenset({"clear", "unknown"})
 
+VERSION_ONE_REPORT = "v1"
+COHORT_REPORT = "cohort"
+MALFORMED_REPORT = "malformed"
+
 _IDENTIFIER_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _OFFER_IDENTITY_FIELDS = ("link_fingerprint", "sweep_id", "offer_id")
+_COHORT_INTENT_FIELDS = ("sweep_id", "offer_id")
 
 
 def _capabilities(payload):
@@ -78,13 +85,17 @@ def render_crypter_offer(offer, occurrence):
 
 
 def _offer_identity(payload):
-    """The exact offer identity a cohort report must carry, or None."""
+    """The exact offer identity a cohort report must carry, or None.
+
+    The linkcrypter name is compared literally: a cohort offer is minted against
+    one exact spelling, so accepting a normalized variant here would make the
+    identity the helper echoes back differ from the one it was handed.
+    """
     if not isinstance(payload, dict):
         return None
     if not {"package_id", "crypter"}.issubset(payload):
         return None
-    crypter = payload["crypter"]
-    if not isinstance(crypter, str) or crypter.strip().lower() != COHORT_CRYPTER:
+    if payload["crypter"] != COHORT_CRYPTER:
         return None
     if not isinstance(payload["package_id"], str):
         return None
@@ -102,11 +113,22 @@ def _offer_identity(payload):
     return identity
 
 
-def normalize_blocked_report(payload):
-    """One strictly valid cohort BLOCKED report, or None for a version-one one."""
+def _classify(payload, complete):
+    """Split one report body into version-one, cohort, or malformed intent."""
+    if not isinstance(payload, dict):
+        return VERSION_ONE_REPORT, None
+    if not any(field in payload for field in _COHORT_INTENT_FIELDS):
+        return VERSION_ONE_REPORT, None
     identity = _offer_identity(payload)
     if identity is None:
-        return None
+        return MALFORMED_REPORT, None
+    report = complete(payload, identity)
+    if report is None:
+        return MALFORMED_REPORT, None
+    return COHORT_REPORT, report
+
+
+def _complete_blocked(payload, identity):
     reason_code = payload.get("reason_code")
     if not isinstance(reason_code, str):
         return None
@@ -114,16 +136,32 @@ def normalize_blocked_report(payload):
     return identity
 
 
-def normalize_access_report(payload):
-    """One strictly valid cohort access report, or None for a version-one one."""
-    identity = _offer_identity(payload)
-    if identity is None:
-        return None
+def _complete_access(payload, identity):
     access = payload.get("access")
     if access not in COHORT_ACCESS_VALUES:
         return None
     identity["access"] = access
     return identity
+
+
+def classify_blocked_report(payload):
+    """The intent of one BLOCKED body and its cohort report when it has one."""
+    return _classify(payload, _complete_blocked)
+
+
+def classify_access_report(payload):
+    """The intent of one access body and its cohort report when it has one."""
+    return _classify(payload, _complete_access)
+
+
+def normalize_blocked_report(payload):
+    """One strictly valid cohort BLOCKED report, or None for anything else."""
+    return classify_blocked_report(payload)[1]
+
+
+def normalize_access_report(payload):
+    """One strictly valid cohort access report, or None for anything else."""
+    return classify_access_report(payload)[1]
 
 
 def render_defer_response(decision):

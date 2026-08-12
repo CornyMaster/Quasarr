@@ -26,6 +26,7 @@ from quasarr.providers.crypter_sweeps import (
     record_access,
     record_blocked,
     record_legacy_report,
+    stale_decision,
 )
 from quasarr.providers.log import warn
 
@@ -570,6 +571,98 @@ def _clear_generation_hold(current_value, _now, *, crypter, sweep_id):
     return json.dumps(package)
 
 
+def _package_defer_or_none(current_value):
+    """The decoded defer metadata of one raw row, plus whether it was unusable."""
+    package = _decode_package(current_value)
+    if package is None:
+        return None, False
+    try:
+        return decode_package_defer(package), False
+    except ValueError:
+        return None, True
+
+
+def _write_legacy_defer(
+    current_value, now, *, crypter, reason_code, retry_after_epoch, observation_holds
+):
+    """Attach the version-one hold to one protected row.
+
+    Answers the new raw value, the stored metadata (None when the row is missing
+    or unreadable), and whether existing metadata had to be discarded.
+    """
+    package = _decode_package(current_value)
+    if package is None:
+        return current_value, None, False
+    existing, invalid = _package_defer_or_none(current_value)
+
+    previous_holds = existing["observation_holds"] if existing else 0
+    previous_retry_after = existing["retry_after_epoch"] if existing else 0
+    if observation_holds and previous_holds >= observation_holds:
+        retry_after = previous_retry_after
+    else:
+        retry_after = max(previous_retry_after, retry_after_epoch)
+
+    stored = {
+        "crypter": crypter,
+        "reason_code": reason_code,
+        "since_epoch": existing["since_epoch"] if existing else now,
+        "retry_after_epoch": retry_after,
+        "probe_requested": existing["probe_requested"] if existing else False,
+        "observation_holds": max(previous_holds, observation_holds),
+    }
+    if existing and existing["crypter"] == crypter and "schema_version" in existing:
+        # This never mints a generation; it only refuses to strip one a stored
+        # hold already carries, which would leave that hold bound to nothing and
+        # impossible to clear by generation. A hold of a different linkcrypter
+        # never inherits it.
+        stored.update(
+            {
+                "schema_version": existing["schema_version"],
+                "sweep_id": existing["sweep_id"],
+                "link_fingerprints": existing["link_fingerprints"],
+            }
+        )
+    package[PACKAGE_DEFER_KEY] = dict(stored)
+    return json.dumps(package), stored, invalid
+
+
+def version_one_route_answer(decision, *, cohort_live, existing_defer):
+    """The exact version-one response mapping for one recorded report.
+
+    Pure, and decided inside the recording transaction: a live version-two
+    decision always outranks the version-one accumulator, so only a confirmed
+    cooldown still writes a package hold under one. `observation_holds` is None
+    when the answer writes no package metadata at all.
+    """
+    if decision["state"] == "cooldown":
+        return {
+            "instruction": "cooldown",
+            "hold_type": "crypter_cooldown",
+            "observation_holds": 0,
+            "retry_after_epoch": decision["package_retry_after_epoch"],
+        }
+    if cohort_live:
+        return {
+            "instruction": "legacy_failure",
+            "hold_type": "none",
+            "observation_holds": None,
+            "retry_after_epoch": 0,
+        }
+    if existing_defer and existing_defer["observation_holds"]:
+        return {
+            "instruction": "legacy_failure",
+            "hold_type": "none",
+            "observation_holds": 1,
+            "retry_after_epoch": 0,
+        }
+    return {
+        "instruction": "hold",
+        "hold_type": "provisional",
+        "observation_holds": 1,
+        "retry_after_epoch": decision["package_retry_after_epoch"],
+    }
+
+
 class CrypterCooldownService:
     def __init__(self, shared_state, clock=time.time):
         self._shared_state = shared_state
@@ -609,21 +702,44 @@ class CrypterCooldownService:
             return decision
         return migrate_legacy_record(current_value, now=now)
 
-    def _fingerprint_targets(self, package_id, link_fingerprint, inventory):
-        """Every live protected row carrying this exact link.
+    def _report_ownership(self, crypter, package_id, link_fingerprint, inventory):
+        """Whether one report may write, and which protected rows it may write.
+
+        An offer identity proves a generation, never a container, so the write
+        set is the live occurrence set of the reported link. While the inventory
+        can be read, a reporting package that does not own that link is stale
+        and writes nothing at all - a deleted, replaced, or simply wrong package
+        must never collect a hold for a link it does not carry. While it cannot,
+        one narrow row read may still prove the reporter itself; ownership that
+        stays unproven writes no row, so the fail-closed decision transition is
+        the only thing the report can still change.
 
         Resolved before the transaction opens, so no mutation callback ever
-        enumerates storage. An inventory that cannot prove the occurrence set
-        falls back to the reporting package alone, which is the non-destructive
-        hold an inventory read failure is allowed to produce.
+        enumerates or reads storage.
         """
-        targets = set()
-        for candidate in () if inventory is None else inventory.candidates:
-            if candidate.fingerprint == link_fingerprint:
-                targets.update(
-                    occurrence.package_id for occurrence in candidate.occurrences
-                )
-        return sorted(targets or {package_id})
+        if inventory is not None:
+            owners = sorted(
+                {
+                    occurrence.package_id
+                    for candidate in inventory.candidates
+                    if candidate.fingerprint == link_fingerprint
+                    for occurrence in candidate.occurrences
+                }
+            )
+            if package_id not in owners:
+                return True, ()
+            return False, tuple(owners)
+        try:
+            raw_package = self._shared_state.get_db("protected").retrieve(package_id)
+        except Exception:
+            raw_package = None
+        # Imported here because the candidate module reaches back into
+        # `quasarr.downloads`, which imports this one at module scope.
+        from quasarr.providers.crypter_candidates import package_owns_fingerprint
+
+        if package_owns_fingerprint(raw_package, crypter, link_fingerprint):
+            return False, (package_id,)
+        return False, ()
 
     def _commit_transition(self, crypter, targets, transition, package_write):
         """Commit one decision, its package rows, and its ledger deltas together.
@@ -667,18 +783,24 @@ class CrypterCooldownService:
         self._shared_state.get_db("crypter_cooldowns").mutate_values(keys, commit)
         return committed
 
-    def prepare_offer(self, crypter, inventory, *, mode=None):
+    def prepare_offer(
+        self, crypter, inventory, *, mode=None, preferred_fingerprint=None
+    ):
         """Open or advance the decision and lease at most one offer.
 
         `mode` requests a specific handout - the manual `probe` a cohort
         cooldown issues - and otherwise the natural mode of the current state.
-        `fail` mode is a pure bypass that neither creates, advances, expires, nor
-        clears cohort state. Returns the offer to hand out, or None when there is
-        no work.
+        `preferred_fingerprint` names the exact member the caller can hand out,
+        which a probe must supply because it authorizes one package. `fail` mode
+        is a pure bypass that neither creates, advances, expires, nor clears
+        cohort state. Returns the offer to hand out, or None when there is no
+        work.
         """
         crypter = normalize_crypter_key(crypter)
         if not crypter_blocks_deferred(self._shared_state):
             return None
+        if preferred_fingerprint is not None:
+            preferred_fingerprint = validate_link_fingerprint(preferred_fingerprint)
         now = int(self._clock())
         leased = {"offer": None}
 
@@ -695,6 +817,7 @@ class CrypterCooldownService:
                 now=now,
                 offer_id_factory=self._new_identifier,
                 mode=mode,
+                preferred_fingerprint=preferred_fingerprint,
             )
             leased["offer"] = offer
             return None if record is None else encode_decision_record(record)
@@ -736,8 +859,13 @@ class CrypterCooldownService:
         if not crypter_blocks_deferred(self._shared_state):
             return bypass_decision()
         cooldown_seconds = self._cooldown_seconds()
+        stale, targets = self._report_ownership(
+            crypter, package_id, link_fingerprint, inventory
+        )
 
         def transition(record, now):
+            if stale:
+                return record, stale_decision(record, now=now)
             return record_blocked(
                 record, offer, inventory, now=now, cooldown_seconds=cooldown_seconds
             )
@@ -761,7 +889,7 @@ class CrypterCooldownService:
 
         return self._commit_transition(
             crypter,
-            self._fingerprint_targets(package_id, link_fingerprint, inventory),
+            targets,
             transition,
             package_write,
         )
@@ -797,8 +925,13 @@ class CrypterCooldownService:
             raise ValueError(f'Unsupported linkcrypter access value "{access}"')
         if not crypter_blocks_deferred(self._shared_state):
             return bypass_decision()
+        stale, targets = self._report_ownership(
+            crypter, package_id, link_fingerprint, inventory
+        )
 
         def transition(record, now):
+            if stale:
+                return record, stale_decision(record, now=now)
             return record_access(record, offer, access, inventory, now=now)
 
         def package_write(decision):
@@ -810,7 +943,7 @@ class CrypterCooldownService:
 
         decision = self._commit_transition(
             crypter,
-            self._fingerprint_targets(package_id, link_fingerprint, inventory),
+            targets,
             transition,
             package_write,
         )
@@ -908,18 +1041,131 @@ class CrypterCooldownService:
         cohort decision exists.
         """
         crypter = normalize_crypter_key(crypter)
+        outcome = self._version_one_outcome(package_id, link_fingerprint, reason_code)
+        database = self._shared_state.get_db("crypter_cooldowns")
+
+        def record_and_count(current_values):
+            record_value, ledger_value = current_values
+            new_record = outcome["mutate_record"](record_value)
+            return new_record, _add_pending_crypter_events(
+                ledger_value, **self._legacy_events(outcome)
+            )
+
+        database.mutate_values(
+            (("crypter_cooldowns", crypter), (CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY)),
+            record_and_count,
+        )
+        if outcome["invalid_record"]:
+            self._warn_invalid_record(crypter)
+        return outcome["decision"]
+
+    def record_version_one_report(
+        self, crypter, package_id, link_fingerprint, reason_code
+    ):
+        """Commit one version-one report and its route answer in one transaction.
+
+        The accumulator, the version-two precedence mapping, and the package
+        hold are all decided against the row current inside this transaction, so
+        a cohort decision that opens between an earlier read and the commit can
+        never be answered as a version-one hold, nor have a legacy hold written
+        under it. Returns the recorded legacy decision plus the exact answer the
+        route owes, including whether the protected package was missing.
+        """
+        crypter = normalize_crypter_key(crypter)
+        outcome = self._version_one_outcome(package_id, link_fingerprint, reason_code)
+        package_id = _validate_package_id(package_id)
+        reason_code = _validate_reason_code(reason_code)
+        now = outcome["now"]
+        answer = {}
+
+        def commit(current_values):
+            record_value, package_value, ledger_value = current_values
+            new_record = outcome["mutate_record"](record_value)
+            existing, invalid = _package_defer_or_none(package_value)
+            outcome["invalid_defer"] = invalid
+            answer.update(
+                version_one_route_answer(
+                    outcome["decision"],
+                    cohort_live=outcome["cohort"],
+                    existing_defer=existing,
+                )
+            )
+            new_package = package_value
+            if answer["observation_holds"] is not None:
+                new_package, stored, _invalid = _write_legacy_defer(
+                    package_value,
+                    now,
+                    crypter=crypter,
+                    reason_code=reason_code,
+                    retry_after_epoch=outcome["decision"]["package_retry_after_epoch"],
+                    observation_holds=answer["observation_holds"],
+                )
+                answer["package_missing"] = stored is None
+            return (
+                new_record,
+                new_package,
+                _add_pending_crypter_events(
+                    ledger_value, **self._legacy_events(outcome)
+                ),
+            )
+
+        self._shared_state.get_db("crypter_cooldowns").mutate_values(
+            (
+                ("crypter_cooldowns", crypter),
+                ("protected", package_id),
+                (CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY),
+            ),
+            commit,
+        )
+        if outcome["invalid_record"]:
+            self._warn_invalid_record(crypter)
+        if outcome["invalid_defer"]:
+            self._warn_invalid_package_defer(package_id)
+        return {
+            "state": outcome["decision"]["state"],
+            "evidence_count": outcome["decision"]["evidence_count"],
+            "instruction": answer["instruction"],
+            "hold_type": answer["hold_type"],
+            "retry_after_epoch": answer["retry_after_epoch"],
+            "package_missing": answer.get("package_missing", False),
+        }
+
+    @staticmethod
+    def _legacy_events(outcome):
+        decision = outcome["decision"]
+        return {
+            "observations": int(decision["recorded"]),
+            "cooldowns": int(decision["cooldown_started"]),
+        }
+
+    def _version_one_outcome(self, package_id, link_fingerprint, reason_code):
+        """The shared version-one recording state and its linkcrypter mutator.
+
+        `mutate_record` answers the new linkcrypter row for the value current
+        inside a transaction and fills `decision`, `cohort` - whether a live
+        version-two decision took precedence - and `invalid_record`, so every
+        caller answers and writes from that one value instead of an earlier read.
+        """
         package_id = _validate_package_id(package_id)
         link_fingerprint = validate_link_fingerprint(link_fingerprint)
         reason_code = _validate_reason_code(reason_code)
         now = int(self._clock())
         cooldown_seconds = self._cooldown_seconds()
-        decision = {}
-        invalid_record = {"found": False}
+        outcome = {
+            "now": now,
+            "decision": {},
+            "cohort": False,
+            "invalid_record": False,
+            "invalid_defer": False,
+        }
+        decision = outcome["decision"]
 
-        def update_record(current_value):
+        def mutate_record(current_value):
             if is_decision_record(current_value):
+                current = decode_decision_record(current_value, now=now)
+                outcome["cohort"] = current is not None
                 record, legacy = record_legacy_report(
-                    decode_decision_record(current_value, now=now),
+                    current,
                     now=now,
                     generation_id_factory=self._new_identifier,
                 )
@@ -929,7 +1175,7 @@ class CrypterCooldownService:
             try:
                 record = _decode_record(current_value)
             except ValueError:
-                invalid_record["found"] = True
+                outcome["invalid_record"] = True
                 record = None
             record = self._prune_record(record, now)
             previous_state = record["state"] if record is not None else "available"
@@ -995,24 +1241,8 @@ class CrypterCooldownService:
             )
             return _encode_record(record)
 
-        database = self._shared_state.get_db("crypter_cooldowns")
-
-        def record_and_count(current_values):
-            record_value, ledger_value = current_values
-            new_record = update_record(record_value)
-            return new_record, _add_pending_crypter_events(
-                ledger_value,
-                observations=int(decision["recorded"]),
-                cooldowns=int(decision["cooldown_started"]),
-            )
-
-        database.mutate_values(
-            (("crypter_cooldowns", crypter), (CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY)),
-            record_and_count,
-        )
-        if invalid_record["found"]:
-            self._warn_invalid_record(crypter)
-        return decision
+        outcome["mutate_record"] = mutate_record
+        return outcome
 
     def crypter_projection(self, crypter):
         """The legacy-shaped snapshot and the version-two decision of one row read.
@@ -1067,17 +1297,24 @@ class CrypterCooldownService:
             crypter, lambda _current_value: None
         )
 
-    def record_legacy_success(self, crypter):
+    def record_legacy_success(self, crypter, *, package_id=None):
         """Apply a validated version-one CLEAR as the global healthy transition.
 
         The version-one route has no offer identity to validate, so this is the
         one safe path it may take into version-two state: it only ever replaces
         the decision with a health window, which logically invalidates every
         generation-bound hold at once and can never resurrect or extend a
-        cooldown. Returns the generation the committed window owns, so the
-        caller can run best-effort physical cleanup for it after the commit.
+        cooldown.
+
+        The health window is committed first and alone. Only afterwards does the
+        physical release run, and every part of it is best effort, so a failed
+        cleanup can never downgrade a proven acknowledgement and a failed commit
+        can never have released a hold that is still authorized. Returns the
+        generation the committed window owns.
         """
         crypter = normalize_crypter_key(crypter)
+        if package_id is not None:
+            package_id = _validate_package_id(package_id)
         now = int(self._clock())
         committed = {}
 
@@ -1091,7 +1328,52 @@ class CrypterCooldownService:
             return encode_decision_record(record)
 
         self._shared_state.get_db("crypter_cooldowns").mutate_value(crypter, advance)
-        return committed["sweep_id"]
+        sweep_id = committed["sweep_id"]
+        self._release_proven_holds(crypter, sweep_id, package_id)
+        return sweep_id
+
+    def _release_proven_holds(self, crypter, sweep_id, package_id):
+        """Best-effort physical cleanup after a committed health window.
+
+        Every removal compares inside its own transaction against the row that
+        is current there, so a newer generation installed meanwhile survives:
+        proving one container healthy releases the holds that generation was
+        carrying, never metadata written after the proof.
+        """
+        try:
+            self.clear_crypter_generation_holds(crypter, sweep_id=sweep_id)
+        except Exception:
+            warn(
+                "Deferred package cleanup after a successful linkcrypter access "
+                f'report failed for "{crypter}"; those holds are already inactive'
+            )
+        if package_id is None:
+            return
+        try:
+            # A hold the version-one accumulator wrote carries no generation, so
+            # the generation cleanup cannot name it; the reporting package is
+            # the one row a version-one CLEAR can still release by itself.
+            self._clear_proven_package_hold(package_id, crypter, sweep_id)
+        except Exception:
+            warn(
+                "Deferred metadata cleanup after a successful linkcrypter "
+                f'access report failed for "{crypter}"; that hold is already '
+                "inactive"
+            )
+
+    def _clear_proven_package_hold(self, package_id, crypter, sweep_id):
+        """Drop the reporting package's hold unless a newer generation owns it."""
+
+        def clear_proven(current_value, package, deferred):
+            if deferred["crypter"] != crypter:
+                return current_value
+            stored = deferred.get("sweep_id")
+            if stored is not None and stored != sweep_id:
+                return current_value
+            package.pop(PACKAGE_DEFER_KEY)
+            return json.dumps(package)
+
+        return self._mutate_deferred_package(package_id, clear_proven) == "deferred"
 
     def defer_package(
         self, package_id, crypter, reason_code, retry_after_epoch, observation_holds
@@ -1114,52 +1396,18 @@ class CrypterCooldownService:
         invalid_defer = {"found": False}
 
         def update_package(current_value):
-            package = _decode_package(current_value)
-            if package is None:
-                return current_value
-            try:
-                existing = decode_package_defer(package)
-            except ValueError:
-                invalid_defer["found"] = True
-                existing = None
-
-            previous_holds = existing["observation_holds"] if existing else 0
-            previous_retry_after = existing["retry_after_epoch"] if existing else 0
-            if observation_holds and previous_holds >= observation_holds:
-                retry_after = previous_retry_after
-            else:
-                retry_after = max(previous_retry_after, retry_after_epoch)
-
-            stored.update(
-                {
-                    "crypter": crypter,
-                    "reason_code": reason_code,
-                    "since_epoch": existing["since_epoch"] if existing else now,
-                    "retry_after_epoch": retry_after,
-                    "probe_requested": existing["probe_requested"]
-                    if existing
-                    else False,
-                    "observation_holds": max(previous_holds, observation_holds),
-                }
+            new_value, written, invalid = _write_legacy_defer(
+                current_value,
+                now,
+                crypter=crypter,
+                reason_code=reason_code,
+                retry_after_epoch=retry_after_epoch,
+                observation_holds=observation_holds,
             )
-            if (
-                existing
-                and existing["crypter"] == crypter
-                and "schema_version" in existing
-            ):
-                # This never mints a generation; it only refuses to strip one a
-                # stored hold already carries, which would leave that hold bound
-                # to nothing and impossible to clear by generation. A hold of a
-                # different linkcrypter never inherits it.
-                stored.update(
-                    {
-                        "schema_version": existing["schema_version"],
-                        "sweep_id": existing["sweep_id"],
-                        "link_fingerprints": existing["link_fingerprints"],
-                    }
-                )
-            package[PACKAGE_DEFER_KEY] = dict(stored)
-            return json.dumps(package)
+            invalid_defer["found"] = invalid
+            if written is not None:
+                stored.update(written)
+            return new_value
 
         self._shared_state.get_db("protected").mutate_value(package_id, update_package)
         if invalid_defer["found"]:

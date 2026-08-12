@@ -103,6 +103,7 @@ def accepted_offer(index, **overrides):
         "offer_id": f"{index:032x}",
         "link_fingerprint": fingerprint(index),
         "mode": "sweep",
+        "outcome": "blocked",
         "state": "sweeping",
         "instruction": "hold",
         "accepted": "",
@@ -991,6 +992,48 @@ class AcceptedOfferCodecTests(unittest.TestCase):
                 self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
                 with self.assertRaises(ValueError):
                     encode_decision_record(record)
+
+    def test_the_accepted_outcome_kind_must_match_the_response_it_replays(self):
+        cleared = {
+            "state": "healthy",
+            "instruction": "",
+            "cleared": True,
+            "hold_type": "none",
+            "retry_after_epoch": 0,
+        }
+        unknown = {
+            "instruction": "",
+            "accepted": "unknown",
+            "hold_type": "none",
+            "retry_after_epoch": 0,
+        }
+        rejected = (
+            accepted_offer(1, outcome="clear"),
+            accepted_offer(1, outcome="unknown"),
+            accepted_offer(1, outcome=""),
+            accepted_offer(1, outcome="hold"),
+            accepted_offer(1, outcome=None),
+            accepted_offer(1, outcome="blocked", **cleared),
+            accepted_offer(1, outcome="unknown", **cleared),
+            accepted_offer(1, outcome="blocked", **unknown),
+            accepted_offer(1, outcome="clear", **unknown),
+        )
+
+        for entry in rejected:
+            with self.subTest(outcome=repr(entry["outcome"])):
+                record = sweeping_record(
+                    accepted_offers=[entry], used_offer_ids=[entry["offer_id"]]
+                )
+                self.assertIsNone(decode_decision_record(json.dumps(record), now=NOW))
+
+        for outcome, overrides in (("clear", cleared), ("unknown", unknown)):
+            with self.subTest(accepted=outcome):
+                entry = accepted_offer(1, outcome=outcome, **overrides)
+                record = sweeping_record(
+                    accepted_offers=[entry], used_offer_ids=[entry["offer_id"]]
+                )
+                decoded = decode_decision_record(json.dumps(record), now=NOW)
+                self.assertEqual(outcome, decoded["accepted_offers"][0]["outcome"])
 
     def test_accepted_offers_are_bounded_by_the_cohort_maximum(self):
         entries = [
