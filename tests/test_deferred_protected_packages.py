@@ -5,6 +5,7 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+from quasarr.downloads import store_protected_links
 from quasarr.downloads.packages import delete_database_packages, get_packages
 from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 
@@ -32,6 +33,14 @@ class FakeDatabase:
         self.frozen = frozen
         self.mutation_count = 0
         self.retrieve_count = 0
+        # One-shot hook simulating a concurrent writer that lands just before
+        # the next write of this table starts reading.
+        self.before_write = None
+
+    def _interleave(self, key):
+        hook, self.before_write = self.before_write, None
+        if hook is not None:
+            hook(key)
 
     def retrieve(self, key):
         self.retrieve_count += 1
@@ -42,20 +51,24 @@ class FakeDatabase:
         return items if items else None
 
     def update_store(self, key, value):
+        self._interleave(key)
         self.rows[key] = value
         return True
 
     def delete(self, key):
+        self._interleave(key)
         if not self.frozen:
             self.rows.pop(key, None)
         return True
 
     def mutate_value(self, key, mutator):
+        self._interleave(key)
         with self.lock:
             self.mutation_count += 1
             value = mutator(self.rows.get(key))
             if value is None:
-                self.rows.pop(key, None)
+                if not self.frozen:
+                    self.rows.pop(key, None)
             else:
                 self.rows[key] = value
             return value
@@ -75,7 +88,11 @@ class FakeCache:
 
 class FakeSharedState:
     def __init__(self, frozen_protected=False):
-        self.values = {"crypter_cooldown_hours": 24}
+        self.values = {
+            "crypter_cooldown_hours": 24,
+            "database": self.get_db,
+            "external_address": "https://quasarr.invalid",
+        }
         self.databases = {
             "protected": FakeDatabase(frozen=frozen_protected),
             "failed": FakeDatabase(),
@@ -101,6 +118,19 @@ def protected_blob(title="Synthetic.Release.Example"):
         "imdb_id": "tt0000000",
         "notifications": [{"channel": "discord", "message_id": "1"}],
     }
+
+
+def deferred_block(**overrides):
+    block = {
+        "crypter": "filecrypt",
+        "reason_code": REASON,
+        "since_epoch": NOW,
+        "retry_after_epoch": NOW + PROVISIONAL_WINDOW,
+        "probe_requested": False,
+        "observation_holds": 1,
+    }
+    block.update(overrides)
+    return block
 
 
 class DeferredPackageMetadataTests(unittest.TestCase):
@@ -188,6 +218,49 @@ class DeferredPackageMetadataTests(unittest.TestCase):
         self.assertIn(PACKAGE_A, self.protected.rows)
         self.assertEqual(blob["title"], self._stored()["title"])
 
+    def test_defer_rejects_hold_counts_outside_the_single_hold_domain(self):
+        for holds in (2, 7, -1, True, 1.0, "1", None):
+            with self.subTest(observation_holds=holds):
+                with self.assertRaises(ValueError):
+                    self.service.defer_package(
+                        PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, holds
+                    )
+
+        self.assertEqual(0, self.protected.mutation_count)
+        self.assertNotIn("deferred", self._stored())
+
+    def test_impossible_hold_counts_are_ignored_and_self_heal_on_the_next_write(self):
+        blob = protected_blob()
+        blob["deferred"] = deferred_block(observation_holds=2)
+        self.protected.update_store(PACKAGE_A, json.dumps(blob))
+
+        self.assertIsNone(self.service.get_package_defer(PACKAGE_A))
+
+        healed = self.service.defer_package(
+            PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
+        )
+
+        self.assertEqual(deferred_block(), healed)
+        self.assertEqual(deferred_block(), self._stored()["deferred"])
+        self.assertEqual(
+            protected_blob(),
+            {k: v for k, v in self._stored().items() if k != "deferred"},
+        )
+
+    def test_unknown_defer_fields_are_ignored_and_self_heal_on_the_next_write(self):
+        blob = protected_blob()
+        blob["deferred"] = deferred_block(unexpected_field="keep-me")
+        self.protected.update_store(PACKAGE_A, json.dumps(blob))
+
+        self.assertIsNone(self.service.get_package_defer(PACKAGE_A))
+
+        healed = self.service.defer_package(
+            PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
+        )
+
+        self.assertEqual(deferred_block(), healed)
+        self.assertEqual(deferred_block(), self._stored()["deferred"])
+
     def test_clear_package_defer_removes_only_the_deferred_block(self):
         self.service.defer_package(
             PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
@@ -244,6 +317,185 @@ class DeferredPackageMetadataTests(unittest.TestCase):
         self.assertEqual(NOW + 24 * 60 * 60, cooldown["retry_after_epoch"])
         self.assertEqual(1, cooldown["observation_holds"])
         self.assertEqual(NOW, cooldown["since_epoch"])
+
+
+class ProbeStateTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock(NOW)
+        self.shared_state = FakeSharedState()
+        self.protected = self.shared_state.databases["protected"]
+        self.protected.update_store(PACKAGE_A, json.dumps(protected_blob()))
+        self.protected.update_store(PACKAGE_B, json.dumps(protected_blob()))
+        self.service = CrypterCooldownService(self.shared_state, clock=self.clock)
+        self.service.defer_package(
+            PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
+        )
+
+    def _stored(self, package_id=PACKAGE_A):
+        return json.loads(self.protected.rows[package_id])
+
+    def test_request_probe_handles_mixed_ids_and_writes_only_the_flag(self):
+        result = self.service.request_probe(
+            [PACKAGE_A, PACKAGE_B, PACKAGE_C, "not-a-package-id", PACKAGE_A]
+        )
+
+        self.assertEqual(
+            {
+                "requested": [PACKAGE_A],
+                "rejected": [
+                    {"package_id": PACKAGE_B, "reason": "not_deferred"},
+                    {"package_id": PACKAGE_C, "reason": "not_found"},
+                    {
+                        "package_id": "not-a-package-id",
+                        "reason": "invalid_package_id",
+                    },
+                    {"package_id": PACKAGE_A, "reason": "duplicate"},
+                ],
+            },
+            result,
+        )
+        self.assertEqual(
+            deferred_block(probe_requested=True), self._stored()["deferred"]
+        )
+        self.assertEqual(
+            protected_blob(),
+            {k: v for k, v in self._stored().items() if k != "deferred"},
+        )
+        self.assertNotIn("deferred", self._stored(PACKAGE_B))
+        self.assertNotIn(PACKAGE_C, self.protected.rows)
+
+    def test_request_probe_is_idempotent(self):
+        self.service.request_probe([PACKAGE_A])
+        row = self.protected.rows[PACKAGE_A]
+
+        self.assertEqual(
+            {"requested": [PACKAGE_A], "rejected": []},
+            self.service.request_probe([PACKAGE_A]),
+        )
+        self.assertEqual(row, self.protected.rows[PACKAGE_A])
+
+    def test_request_probe_ignores_malformed_metadata(self):
+        blob = protected_blob()
+        blob["deferred"] = deferred_block(observation_holds=2)
+        self.protected.update_store(PACKAGE_A, json.dumps(blob))
+
+        self.assertEqual(
+            {
+                "requested": [],
+                "rejected": [{"package_id": PACKAGE_A, "reason": "not_deferred"}],
+            },
+            self.service.request_probe([PACKAGE_A]),
+        )
+        self.assertEqual(blob, self._stored())
+
+    def test_consume_probe_clears_the_flag_exactly_once(self):
+        self.service.request_probe([PACKAGE_A])
+
+        self.assertTrue(self.service.consume_probe(PACKAGE_A, "filecrypt"))
+        self.assertEqual(deferred_block(), self._stored()["deferred"])
+        self.assertEqual(
+            protected_blob(),
+            {k: v for k, v in self._stored().items() if k != "deferred"},
+        )
+        self.assertFalse(self.service.consume_probe(PACKAGE_A, "filecrypt"))
+
+    def test_consume_probe_is_false_for_missing_nondeferred_and_other_crypters(self):
+        self.service.request_probe([PACKAGE_A])
+
+        self.assertFalse(self.service.consume_probe(PACKAGE_B, "filecrypt"))
+        self.assertFalse(self.service.consume_probe(PACKAGE_C, "filecrypt"))
+        self.assertFalse(self.service.consume_probe(PACKAGE_A, "junkies"))
+        self.assertTrue(self._stored()["deferred"]["probe_requested"])
+
+    def test_consume_probe_loses_a_race_against_a_concurrent_consumer(self):
+        self.service.request_probe([PACKAGE_A])
+
+        def concurrent_consumer(_package_id):
+            self.assertTrue(self.service.consume_probe(PACKAGE_A, "filecrypt"))
+
+        self.protected.before_write = concurrent_consumer
+
+        self.assertFalse(self.service.consume_probe(PACKAGE_A, "filecrypt"))
+        self.assertEqual(deferred_block(), self._stored()["deferred"])
+
+    def test_probe_operations_reject_invalid_arguments_without_writing(self):
+        mutations = self.protected.mutation_count
+
+        with self.assertRaises(ValueError):
+            self.service.consume_probe("not-a-package-id", "filecrypt")
+        with self.assertRaises(ValueError):
+            self.service.consume_probe(PACKAGE_A, "unsupported-crypter")
+
+        self.assertEqual(mutations, self.protected.mutation_count)
+
+
+class ProtectedCreationRaceTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock(NOW)
+        self.shared_state = FakeSharedState()
+        self.protected = self.shared_state.databases["protected"]
+        self.service = CrypterCooldownService(self.shared_state, clock=self.clock)
+
+    def _store(self, title="Stale.Release.Example"):
+        blob = protected_blob(title=title)
+        return store_protected_links(
+            self.shared_state,
+            blob["links"],
+            blob["title"],
+            blob["password"],
+            PACKAGE_A,
+            size_mb=blob["size_mb"],
+            original_url=blob["original_url"],
+            imdb_id=blob["imdb_id"],
+            notifications=blob["notifications"],
+        )
+
+    def _stored(self):
+        return json.loads(self.protected.rows[PACKAGE_A])
+
+    def test_creation_stores_the_full_protected_blob(self):
+        self.assertEqual({"success": True}, self._store(title="Fresh.Release.Example"))
+        self.assertEqual(protected_blob(title="Fresh.Release.Example"), self._stored())
+
+    def test_stale_creation_cannot_erase_a_hold_that_appeared_meanwhile(self):
+        def concurrent_writer(_package_id):
+            self.protected.update_store(PACKAGE_A, json.dumps(protected_blob()))
+            self.service.defer_package(
+                PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
+            )
+
+        self.protected.before_write = concurrent_writer
+
+        self._store()
+
+        stored = self._stored()
+        self.assertEqual(deferred_block(), stored["deferred"])
+        self.assertEqual(
+            protected_blob(), {k: v for k, v in stored.items() if k != "deferred"}
+        )
+
+        # The surviving hold still blocks a second isolated provisional hold.
+        self.clock.now = NOW + PROVISIONAL_WINDOW + 1
+        second = self.service.defer_package(
+            PACKAGE_A, "filecrypt", REASON, self.clock.now + PROVISIONAL_WINDOW, 1
+        )
+        self.assertEqual(NOW + PROVISIONAL_WINDOW, second["retry_after_epoch"])
+
+    def test_stale_creation_adds_only_fields_the_current_row_lacks(self):
+        current = protected_blob()
+        current.pop("imdb_id")
+        self.protected.update_store(PACKAGE_A, json.dumps(current))
+
+        self._store()
+
+        self.assertEqual(protected_blob(), self._stored())
+
+    def test_unreadable_protected_row_is_replaced_by_a_fresh_blob(self):
+        self.protected.update_store(PACKAGE_A, "not-json")
+
+        self._store(title="Fresh.Release.Example")
+
+        self.assertEqual(protected_blob(title="Fresh.Release.Example"), self._stored())
 
 
 class DeferredQueueProjectionTests(unittest.TestCase):
@@ -445,6 +697,77 @@ class DatabasePackageDeletionTests(unittest.TestCase):
             delete_database_packages(self.shared_state, [PACKAGE_A], "failed")
 
         self.assertIn(PACKAGE_A, self.protected.rows)
+
+    def test_batch_delete_keeps_a_replacement_package_that_appeared_meanwhile(self):
+        replacement = json.dumps(protected_blob(title="Replacement.Release.Example"))
+
+        def concurrent_replace(_package_id):
+            self.protected.update_store(PACKAGE_A, replacement)
+
+        self.protected.before_write = concurrent_replace
+
+        result = delete_database_packages(self.shared_state, [PACKAGE_A])
+
+        self.assertEqual(
+            {
+                "deleted": [],
+                "rejected": [{"package_id": PACKAGE_A, "reason": "not_deferred"}],
+            },
+            result,
+        )
+        self.assertEqual(replacement, self.protected.rows[PACKAGE_A])
+        self.assertIn(PACKAGE_A, self.failed.rows)
+        self.assertEqual(0, self.shared_state.device_calls)
+
+    def test_batch_delete_keeps_a_package_whose_hold_was_cleared_meanwhile(self):
+        def concurrent_clear(_package_id):
+            self.service.clear_package_defer(PACKAGE_A)
+
+        self.protected.before_write = concurrent_clear
+
+        result = delete_database_packages(self.shared_state, [PACKAGE_A])
+
+        self.assertEqual(
+            {
+                "deleted": [],
+                "rejected": [{"package_id": PACKAGE_A, "reason": "not_deferred"}],
+            },
+            result,
+        )
+        self.assertEqual(protected_blob(), json.loads(self.protected.rows[PACKAGE_A]))
+
+    def test_batch_delete_reports_a_package_removed_meanwhile_as_not_found(self):
+        def concurrent_delete(_package_id):
+            self.protected.rows.pop(PACKAGE_A, None)
+
+        self.protected.before_write = concurrent_delete
+
+        result = delete_database_packages(self.shared_state, [PACKAGE_A])
+
+        self.assertEqual(
+            {
+                "deleted": [],
+                "rejected": [{"package_id": PACKAGE_A, "reason": "not_found"}],
+            },
+            result,
+        )
+        self.assertIn(PACKAGE_A, self.failed.rows)
+
+    def test_batch_delete_keeps_a_failed_row_that_appeared_meanwhile(self):
+        self.failed.rows.pop(PACKAGE_A, None)
+        fresh_failure = json.dumps({"title": "fresh failure"})
+
+        def concurrent_failure(_package_id):
+            self.failed.update_store(PACKAGE_A, fresh_failure)
+
+        self.protected.before_write = concurrent_failure
+
+        result = delete_database_packages(self.shared_state, [PACKAGE_A])
+
+        self.assertEqual({"deleted": [PACKAGE_A], "rejected": []}, result)
+        self.assertNotIn(PACKAGE_A, self.protected.rows)
+        self.assertEqual(fresh_failure, self.failed.rows[PACKAGE_A])
+        self.assertEqual(0, self.shared_state.device_calls)
 
 
 if __name__ == "__main__":

@@ -525,8 +525,8 @@ class ProtectedReleaseNotificationStorageTests(unittest.TestCase):
         )
 
         self.assertEqual(["protected"], requested_tables)
-        stored_json = protected_db.update_store.call_args.args[1]
-        stored_release = json.loads(stored_json)
+        create_or_merge = protected_db.mutate_value.call_args.args[1]
+        stored_release = json.loads(create_or_merge(None))
         self.assertEqual(reference, stored_release["notifications"])
         self.assertEqual("tt0000001", stored_release["imdb_id"])
 

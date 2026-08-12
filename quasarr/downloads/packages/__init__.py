@@ -1120,11 +1120,52 @@ def delete_package(shared_state, package_id, package_title=None, missing_ok=Fals
         return False
 
 
+def _delete_deferred_package(cooldown_service, protected_db, failed_db, package_id):
+    """Delete one package while it is still deferred; returns a rejection reason."""
+    # Captured before the deletion predicate so a failure recorded afterwards is
+    # recognizably newer than the state this call was allowed to remove.
+    failed_snapshot = failed_db.retrieve(package_id)
+
+    try:
+        outcome = cooldown_service.delete_deferred_package(package_id)
+    except Exception as e:
+        debug(f"delete_database_packages: Protected DB delete exception: {e}")
+        return "delete_failed"
+    if outcome != "deleted":
+        return outcome
+
+    if protected_db.retrieve(package_id):
+        info(
+            f"Verification failed: Package {package_id} still exists in the protected DB"
+        )
+        return "delete_failed"
+
+    if failed_snapshot is None:
+        return None
+
+    try:
+        failed_db.mutate_value(
+            package_id,
+            lambda current_value: (
+                None if current_value == failed_snapshot else current_value
+            ),
+        )
+    except Exception as e:
+        debug(f"delete_database_packages: Failed DB delete exception: {e}")
+        return "delete_failed"
+
+    if failed_db.retrieve(package_id) == failed_snapshot:
+        info(f"Verification failed: Package {package_id} still exists in the failed DB")
+        return "delete_failed"
+    return None
+
+
 def delete_database_packages(shared_state, package_ids, expected_type="protected"):
     """Delete deferred database-only packages without any JDownloader inventory call.
 
-    Every ID is validated against the database first, then each accepted ID is
-    deleted from the protected and failed tables and verified individually.
+    Each ID is deleted through one atomic transaction that re-reads the current
+    protected row, so a package cleared, replaced, or removed after the request
+    was built is reported instead of destroyed.
     """
     if expected_type != "protected":
         raise ValueError(f'Unsupported package type "{expected_type}"')
@@ -1133,42 +1174,28 @@ def delete_database_packages(shared_state, package_ids, expected_type="protected
     failed_db = shared_state.get_db("failed")
     cooldown_service = CrypterCooldownService(shared_state)
 
-    accepted = []
+    candidates = []
     seen = set()
-    deleted = []
-    rejected = []
-
     for package_id in package_ids or []:
         if not isinstance(package_id, str) or not is_quasarr_package(package_id):
-            rejected.append({"package_id": package_id, "reason": "invalid_package_id"})
-            continue
-        if package_id in seen:
-            rejected.append({"package_id": package_id, "reason": "duplicate"})
-            continue
-
-        seen.add(package_id)
-        if protected_db.retrieve(package_id) is None:
-            rejected.append({"package_id": package_id, "reason": "not_found"})
-        elif cooldown_service.get_package_defer(package_id) is None:
-            rejected.append({"package_id": package_id, "reason": "not_deferred"})
+            candidates.append((package_id, "invalid_package_id"))
+        elif package_id in seen:
+            candidates.append((package_id, "duplicate"))
         else:
-            accepted.append(package_id)
+            seen.add(package_id)
+            candidates.append((package_id, None))
 
-    for package_id in accepted:
-        try:
-            protected_db.delete(package_id)
-        except Exception as e:
-            debug(f"delete_database_packages: Protected DB delete exception: {e}")
-        try:
-            failed_db.delete(package_id)
-        except Exception as e:
-            debug(f"delete_database_packages: Failed DB delete exception: {e}")
-
-        if protected_db.retrieve(package_id) or failed_db.retrieve(package_id):
-            info(f"Verification failed: Package {package_id} still exists in the DBs")
-            rejected.append({"package_id": package_id, "reason": "delete_failed"})
-            continue
-        deleted.append(package_id)
+    deleted = []
+    rejected = []
+    for package_id, reason in candidates:
+        if reason is None:
+            reason = _delete_deferred_package(
+                cooldown_service, protected_db, failed_db, package_id
+            )
+        if reason is None:
+            deleted.append(package_id)
+        else:
+            rejected.append({"package_id": package_id, "reason": reason})
 
     if deleted:
         info(f"Deleted <y>{len(deleted)}</y> deferred package(s) from DBs")

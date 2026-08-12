@@ -24,14 +24,17 @@ _RECORD_KEYS = {
 }
 _OBSERVATION_KEYS = {"package_id", "link_fingerprint", "seen_at_epoch"}
 PACKAGE_DEFER_KEY = "deferred"
-_PACKAGE_DEFER_KEYS = {
-    "crypter",
-    "reason_code",
-    "since_epoch",
-    "retry_after_epoch",
-    "probe_requested",
-    "observation_holds",
-}
+MAXIMUM_OBSERVATION_HOLDS = 1
+_PACKAGE_DEFER_KEYS = frozenset(
+    {
+        "crypter",
+        "reason_code",
+        "since_epoch",
+        "retry_after_epoch",
+        "probe_requested",
+        "observation_holds",
+    }
+)
 
 
 def normalize_crypter_key(value):
@@ -66,6 +69,13 @@ def _validate_reason_code(value):
 def _validate_epoch(value, field_name):
     if type(value) is not int or value < 0:
         raise ValueError(f'Invalid persisted linkcrypter field "{field_name}"')
+    return value
+
+
+def _validate_observation_holds(value):
+    """A package owns at most one provisional hold, so only 0 and 1 are legal."""
+    if type(value) is not int or not 0 <= value <= MAXIMUM_OBSERVATION_HOLDS:
+        raise ValueError('Invalid persisted linkcrypter field "observation_holds"')
     return value
 
 
@@ -139,7 +149,7 @@ def decode_package_defer(package_data):
     deferred = package_data.get(PACKAGE_DEFER_KEY)
     if deferred is None:
         return None
-    if not isinstance(deferred, dict) or not _PACKAGE_DEFER_KEYS.issubset(deferred):
+    if not isinstance(deferred, dict) or set(deferred) != _PACKAGE_DEFER_KEYS:
         raise ValueError("Invalid persisted package defer metadata")
     if type(deferred["probe_requested"]) is not bool:
         raise ValueError('Invalid persisted package defer field "probe_requested"')
@@ -151,9 +161,7 @@ def decode_package_defer(package_data):
             deferred["retry_after_epoch"], "retry_after_epoch"
         ),
         "probe_requested": deferred["probe_requested"],
-        "observation_holds": _validate_epoch(
-            deferred["observation_holds"], "observation_holds"
-        ),
+        "observation_holds": _validate_observation_holds(deferred["observation_holds"]),
     }
 
 
@@ -376,7 +384,7 @@ class CrypterCooldownService:
         crypter = normalize_crypter_key(crypter)
         reason_code = _validate_reason_code(reason_code)
         retry_after_epoch = _validate_epoch(retry_after_epoch, "retry_after_epoch")
-        observation_holds = _validate_epoch(observation_holds, "observation_holds")
+        observation_holds = _validate_observation_holds(observation_holds)
         now = int(self._clock())
         stored = {}
         invalid_defer = {"found": False}
@@ -446,6 +454,106 @@ class CrypterCooldownService:
         except ValueError:
             self._warn_invalid_package_defer(package_id)
             return None
+
+    def _mutate_deferred_package(self, package_id, decide):
+        """Run one atomic protected-row transaction gated on live defer metadata.
+
+        `decide(current_value, package, deferred)` runs inside the transaction
+        and only for a readable package that still carries valid defer metadata,
+        so no caller can act on a package state it observed earlier. Returns
+        "not_found", "not_deferred", or "deferred".
+        """
+        outcome = {"status": "not_found", "invalid": False}
+
+        def update_package(current_value):
+            package = _decode_package(current_value)
+            if package is None:
+                return current_value
+            try:
+                deferred = decode_package_defer(package)
+            except ValueError:
+                outcome["invalid"] = True
+                deferred = None
+            if deferred is None:
+                outcome["status"] = "not_deferred"
+                return current_value
+            outcome["status"] = "deferred"
+            return decide(current_value, package, deferred)
+
+        self._shared_state.get_db("protected").mutate_value(package_id, update_package)
+        if outcome["invalid"]:
+            self._warn_invalid_package_defer(package_id)
+        return outcome["status"]
+
+    def request_probe(self, package_ids):
+        """Queue a one-time availability probe on deferred protected packages.
+
+        Requesting an already queued probe is idempotent and rewrites nothing.
+        """
+        requested = []
+        rejected = []
+        seen = set()
+
+        for package_id in package_ids or []:
+            try:
+                normalized = _validate_package_id(package_id)
+            except ValueError:
+                rejected.append(
+                    {"package_id": package_id, "reason": "invalid_package_id"}
+                )
+                continue
+            if normalized in seen:
+                rejected.append({"package_id": normalized, "reason": "duplicate"})
+                continue
+            seen.add(normalized)
+
+            def queue_probe(current_value, package, deferred):
+                if deferred["probe_requested"]:
+                    return current_value
+                deferred["probe_requested"] = True
+                package[PACKAGE_DEFER_KEY] = deferred
+                return json.dumps(package)
+
+            status = self._mutate_deferred_package(normalized, queue_probe)
+            if status == "deferred":
+                requested.append(normalized)
+            else:
+                rejected.append({"package_id": normalized, "reason": status})
+
+        return {"requested": requested, "rejected": rejected}
+
+    def consume_probe(self, package_id, crypter):
+        """Atomically spend a queued probe before the package is handed out.
+
+        Clearing the flag inside the same transaction that reads it means a
+        crashed consumer cannot replay one probe into an unbounded retry loop.
+        """
+        package_id = _validate_package_id(package_id)
+        crypter = normalize_crypter_key(crypter)
+        consumed = {"done": False}
+
+        def spend_probe(current_value, package, deferred):
+            if deferred["crypter"] != crypter or not deferred["probe_requested"]:
+                return current_value
+            deferred["probe_requested"] = False
+            package[PACKAGE_DEFER_KEY] = deferred
+            consumed["done"] = True
+            return json.dumps(package)
+
+        self._mutate_deferred_package(package_id, spend_probe)
+        return consumed["done"]
+
+    def delete_deferred_package(self, package_id):
+        """Delete a protected package only while it is still deferred.
+
+        Returns "deleted", "not_found", or "not_deferred" for the state the row
+        had inside the deleting transaction, never for an earlier observation.
+        """
+        package_id = _validate_package_id(package_id)
+        status = self._mutate_deferred_package(
+            package_id, lambda _current_value, _package, _deferred: None
+        )
+        return "deleted" if status == "deferred" else status
 
     def project_package_defer(self, deferred, snapshot):
         """Merge stored package defer metadata with a live crypter snapshot."""

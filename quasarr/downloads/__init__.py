@@ -333,8 +333,24 @@ def store_protected_links(
     if notifications:
         blob_data["notifications"] = notifications
 
-    shared_state.values["database"]("protected").update_store(
-        package_id, json.dumps(blob_data)
+    def create_or_merge(current_value):
+        """Never let a stale duplicate grab overwrite the live protected row.
+
+        Duplicate detection happens before this call, so a concurrent request
+        can create and defer the package in between. Existing fields therefore
+        win and only genuinely missing ones are added.
+        """
+        try:
+            existing = json.loads(current_value) if current_value is not None else None
+        except (TypeError, json.JSONDecodeError):
+            existing = None
+        if not isinstance(existing, dict):
+            return json.dumps(blob_data)
+        merged = {**blob_data, **existing}
+        return current_value if merged == existing else json.dumps(merged)
+
+    shared_state.values["database"]("protected").mutate_value(
+        package_id, create_or_merge
     )
     info(
         f'CAPTCHA-Solution required for <b>{title}</b> at: "{shared_state.values["external_address"]}/captcha"'
