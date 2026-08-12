@@ -5,6 +5,7 @@
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from urllib.parse import quote_plus, urljoin
 
 import requests
@@ -41,6 +42,11 @@ from quasarr.providers.utils import (
     search_string_in_sanitized_title,
 )
 from quasarr.providers.xem_metadata import get_season_name
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -88,6 +94,8 @@ class Source(AbstractSearchSource):
                 f"https://{host}/?disp=attachments",
                 FEED_REQUEST_TIMEOUT_SECONDS,
             )
+        except SearchBudgetExhausted:
+            return releases
         except Exception as e:
             warn(f"Error loading feed: {e}")
             mark_hostname_issue(self.initials, "feed", str(e) or "Error occurred")
@@ -170,6 +178,7 @@ class Source(AbstractSearchSource):
 
         for variant in _build_search_variants(search_string, imdb_id, season, episode):
             try:
+                checkpoint()
                 query = quote_plus(variant["query"])
                 entries = _load_entries(
                     shared_state,
@@ -177,6 +186,8 @@ class Source(AbstractSearchSource):
                     f"https://{host}/search?q={query}&disp=attachments",
                     SEARCH_REQUEST_TIMEOUT_SECONDS,
                 )
+            except SearchBudgetExhausted:
+                break
             except Exception as e:
                 warn(f"Error loading search for {variant['query']}: {e}")
                 mark_hostname_issue(self.initials, "search", str(e) or "Error occurred")
@@ -237,24 +248,38 @@ def _load_entries(shared_state, listing_url, attachments_url, request_timeout):
     headers = {"User-Agent": shared_state.values["user_agent"]}
 
     def fetch(url):
-        response = requests.get(url, headers=headers, timeout=request_timeout)
+        checkpoint()
+        timeout = clamp_timeout(request_timeout)
+        response = requests.get(url, headers=headers, timeout=timeout)
         response.raise_for_status()
         return response.text
 
     responses = {}
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {
-            executor.submit(fetch, listing_url): "listing",
-            executor.submit(fetch, attachments_url): "attachments",
-        }
+        futures = {}
+        for url, kind in (
+            (listing_url, "listing"),
+            (attachments_url, "attachments"),
+        ):
+            try:
+                checkpoint()
+            except SearchBudgetExhausted:
+                break
+            context = copy_context()
+            futures[executor.submit(context.run, fetch, url)] = kind
         for future in as_completed(futures):
             kind = futures[future]
             try:
                 responses[kind] = future.result()
+            except SearchBudgetExhausted:
+                raise
             except Exception:
                 if kind == "listing":
                     raise
                 responses[kind] = ""
+
+    if "listing" not in responses:
+        return []
 
     entries = _parse_listing_page(responses["listing"], listing_url)
     subtitle_langs_by_source = _parse_attachment_page(

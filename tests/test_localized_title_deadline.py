@@ -1,11 +1,56 @@
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from quasarr.providers import imdb_metadata
+from quasarr.search.sources.helpers.budget import use_search_budget
+
+
+class ManualClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 class LocalizedTitleDeadlineTests(unittest.TestCase):
+    def test_direct_html_timeout_is_clamped_to_the_explicit_deadline(self):
+        response = SimpleNamespace(status_code=200, text="<html></html>")
+        with (
+            patch.object(imdb_metadata.requests, "get", return_value=response) as get,
+            patch.object(
+                imdb_metadata.IMDbHTML,
+                "_parse_localized_title",
+                return_value="Synthetic Title",
+            ),
+            patch.object(imdb_metadata.time, "time", return_value=9.75),
+        ):
+            imdb_metadata.IMDbHTML._request(
+                "https://metadata.invalid/releaseinfo/", "fr", deadline=10.0
+            )
+
+        self.assertEqual(0.25, get.call_args.kwargs["timeout"])
+
+    def test_direct_html_timeout_uses_the_stricter_worker_budget(self):
+        response = SimpleNamespace(status_code=200, text="<html></html>")
+        with (
+            patch.object(imdb_metadata.requests, "get", return_value=response) as get,
+            patch.object(
+                imdb_metadata.IMDbHTML,
+                "_parse_localized_title",
+                return_value="Synthetic Title",
+            ),
+            patch.object(imdb_metadata.time, "time", return_value=0.0),
+            use_search_budget(0.2, clock=ManualClock()),
+        ):
+            imdb_metadata.IMDbHTML._request(
+                "https://metadata.invalid/releaseinfo/", "fr", deadline=10.0
+            )
+
+        self.assertEqual(0.2, get.call_args.kwargs["timeout"])
+
     def test_expired_deadline_skips_the_network_fallbacks(self):
         # The IMDb HTML request allows 30s and the FlareSolverr fallback 70s, so
         # a caller under a wall-clock budget must not enter them once its time

@@ -29,6 +29,11 @@ from quasarr.providers.utils import (
     is_valid_release,
     sanitize_string,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -63,18 +68,25 @@ class Source(AbstractSearchSource):
         days_to_cover = 2
 
         while days_to_cover > 0:
+            try:
+                checkpoint()
+            except SearchBudgetExhausted:
+                break
             days_to_cover -= 1
             formatted_date = date.strftime("%Y-%m-%d")
             date -= timedelta(days=1)
 
             try:
+                timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
                 r = cf_session.get(
                     f"https://{sf}/updates/{formatted_date}#list",
                     headers,
-                    FEED_REQUEST_TIMEOUT_SECONDS,
+                    timeout,
                     request_get=requests.get,
                 )
                 r.raise_for_status()
+            except SearchBudgetExhausted:
+                break
             except Exception as e:
                 warn(f"Error loading feed: {e} for {formatted_date}")
                 mark_hostname_issue(
@@ -205,14 +217,18 @@ class Source(AbstractSearchSource):
         headers = {"User-Agent": shared_state.values["user_agent"]}
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
             r = cf_session.get(
                 url,
                 headers,
-                SEARCH_REQUEST_TIMEOUT_SECONDS,
+                timeout,
                 request_get=requests.get,
             )
             r.raise_for_status()
             feed = r.json()
+        except SearchBudgetExhausted:
+            return releases
         except Exception as e:
             warn(f"Error loading search: {e}")
             mark_hostname_issue(
@@ -222,6 +238,10 @@ class Source(AbstractSearchSource):
 
         results = feed.get("result", [])
         for result in results:
+            try:
+                checkpoint()
+            except SearchBudgetExhausted:
+                break
             sanitized_search_string = sanitize_string(search_string)
             sanitized_title = sanitize_string(result.get("title", ""))
             if not re.search(
@@ -257,10 +277,11 @@ class Source(AbstractSearchSource):
                 # load series page
                 series_url = f"https://{sf}/{series_id}"
                 try:
+                    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                     r = cf_session.get(
                         series_url,
                         headers,
-                        SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout,
                         request_get=requests.get,
                     )
                     r.raise_for_status()
@@ -274,6 +295,8 @@ class Source(AbstractSearchSource):
                         else None
                     )
                     season_id = re.findall(r"initSeason\('(.+?)\',", series_page)[0]
+                except SearchBudgetExhausted:
+                    break
                 except Exception as e:
                     debug(f"Failed to load or parse series page for {series_id}")
                     mark_hostname_issue(self.initials, "search", str(e))
@@ -286,10 +309,12 @@ class Source(AbstractSearchSource):
                 )
                 trace(f"Requesting SF API URL: {api_url}")
                 try:
+                    checkpoint()
+                    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                     r = cf_session.get(
                         api_url,
                         headers,
-                        SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout,
                         request_get=requests.get,
                     )
                     r.raise_for_status()
@@ -300,6 +325,8 @@ class Source(AbstractSearchSource):
                         )
                         continue
                     data_html = resp_json.get("html", "")
+                except SearchBudgetExhausted:
+                    break
                 except Exception as e:
                     warn(f"Error loading SF API for {series_id} at {api_url}: {e}")
                     mark_hostname_issue(

@@ -3,7 +3,7 @@ import unittest
 from contextlib import ExitStack
 from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from quasarr.constants import SEARCH_CAT_MOVIES
 from quasarr.search import SearchCache, SearchExecutor, get_search_results
@@ -37,6 +37,14 @@ class ThreadScopedClock:
         if get_ident() == self._fanout_thread:
             return self._fanout_time
         return self._worker_time
+
+
+class ManualClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 class SearchFanoutDeadlineTests(unittest.TestCase):
@@ -326,6 +334,64 @@ class SearchCacheEligibilityTests(unittest.TestCase):
         # One completed, eligible future - so exactly one write.
         self.assertEqual(1, len(self.cache.writes))
         self.assertEqual(1, len(self.cache.cache))
+
+    def test_dl_partial_page_is_answered_but_never_cached(self):
+        from quasarr.search.sources import dl
+
+        class SharedState:
+            def __init__(self):
+                self.values = {
+                    "config": lambda _section: {"dl": "dl.invalid"},
+                    "user_agent": "UnitTestAgent/1.0",
+                }
+
+        clock = ManualClock()
+        pages = []
+        release = {"details": {"title": "Synthetic.Partial.Release"}}
+        shared_state = SharedState()
+
+        def load_page(
+            _source,
+            _shared_state,
+            _host,
+            _query_string,
+            _match_search_string,
+            _search_id,
+            page_num,
+            *_rest,
+        ):
+            pages.append(page_num)
+            if page_num != 1:
+                raise AssertionError("an unfinished page was claimed")
+            clock.now = 10.0
+            return [release], "search-id", ("page-one",)
+
+        with (
+            patch.object(dl, "retrieve_and_validate_session", return_value=MagicMock()),
+            patch.object(dl.Source, "_search_single_page", load_page),
+            patch.object(dl, "clear_hostname_issue"),
+            patch.object(dl, "mark_hostname_issue") as marked,
+            patch.object(dl, "invalidate_session") as invalidated,
+        ):
+            executor = SearchExecutor(deadline=10.0, clock=clock)
+            executor.add(
+                dl.Source(),
+                (shared_state, 0.0, SEARCH_CAT_MOVIES),
+                {"search_string": "Synthetic"},
+                use_cache=True,
+            )
+            with (
+                patch("quasarr.search.search_runtime", self.runtime),
+                patch("quasarr.search.search_cache", self.cache),
+            ):
+                results, _, _, _ = executor.run_all()
+
+        self.assertEqual([release], results)
+        self.assertEqual([1], pages)
+        self.assertEqual({}, self.cache.cache)
+        self.assertEqual(1, self.runtime.snapshot()["source_budget_exhausted"])
+        marked.assert_not_called()
+        invalidated.assert_not_called()
 
 
 class MetadataWarmingDeadlineTests(unittest.TestCase):

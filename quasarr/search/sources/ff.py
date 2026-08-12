@@ -32,6 +32,11 @@ from quasarr.providers.utils import (
     is_valid_release,
     sanitize_string,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -67,6 +72,10 @@ class Source(AbstractSearchSource):
         days_to_cover = 2
 
         while days_to_cover > 0:
+            try:
+                checkpoint()
+            except SearchBudgetExhausted:
+                break
             days_to_cover -= 1
             if _feed_timed_out(start_time):
                 debug("FF feed stopped before next date because timeout budget expired")
@@ -77,6 +86,7 @@ class Source(AbstractSearchSource):
             timeout = _remaining_feed_timeout(start_time)
             if timeout is None:
                 break
+            timeout = min(timeout, clamp_timeout(timeout))
 
             try:
                 r = cf_session.get(
@@ -86,6 +96,8 @@ class Source(AbstractSearchSource):
                     request_get=requests.get,
                 )
                 r.raise_for_status()
+            except SearchBudgetExhausted:
+                break
             except Exception as e:
                 warn(f"Error loading feed: {e} for {formatted_date}")
                 mark_hostname_issue(
@@ -97,6 +109,10 @@ class Source(AbstractSearchSource):
             items = content.select("div.sra")
 
             for item in items:
+                try:
+                    checkpoint()
+                except SearchBudgetExhausted:
+                    break
                 if _feed_timed_out(start_time):
                     debug("FF feed stopped during movie cross-reference")
                     break
@@ -163,6 +179,8 @@ class Source(AbstractSearchSource):
                                 "type": "protected",
                             }
                         )
+                except SearchBudgetExhausted:
+                    break
                 except Exception as e:
                     warn(f"Error parsing feed: {e}")
                     mark_hostname_issue(
@@ -237,14 +255,18 @@ class Source(AbstractSearchSource):
         url = f"https://{host}/api/v2/search?q={quote_plus(search_string)}&ql=DE"
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
             r = cf_session.get(
                 url,
                 headers,
-                SEARCH_REQUEST_TIMEOUT_SECONDS,
+                timeout,
                 request_get=requests.get,
             )
             r.raise_for_status()
             feed = r.json()
+        except SearchBudgetExhausted:
+            return releases
         except Exception as e:
             warn(f"Error loading search: {e}")
             mark_hostname_issue(
@@ -255,6 +277,10 @@ class Source(AbstractSearchSource):
             return releases
 
         for result in feed.get("result", []):
+            try:
+                checkpoint()
+            except SearchBudgetExhausted:
+                break
             sanitized_search_string = sanitize_string(search_string)
             sanitized_title = sanitize_string(result.get("title", ""))
             if not re.search(
@@ -269,14 +295,17 @@ class Source(AbstractSearchSource):
             if not movie_id:
                 continue
 
-            movie_data = _load_movie_data(
-                self,
-                shared_state,
-                host,
-                movie_id,
-                headers,
-                cf_session,
-            )
+            try:
+                movie_data = _load_movie_data(
+                    self,
+                    shared_state,
+                    host,
+                    movie_id,
+                    headers,
+                    cf_session,
+                )
+            except SearchBudgetExhausted:
+                break
             if not movie_data:
                 continue
 
@@ -356,6 +385,8 @@ def _load_movie_data(
     )
     if timeout is None:
         return None
+    checkpoint()
+    timeout = min(timeout, clamp_timeout(timeout))
 
     movie_url = f"https://{host}/{movie_id}"
     try:
@@ -367,6 +398,8 @@ def _load_movie_data(
         )
         r.raise_for_status()
         movie_page = r.text
+    except SearchBudgetExhausted:
+        raise
     except Exception as e:
         debug(f"Failed to load movie page for {movie_id}: {e}")
         mark_hostname_issue(source.initials, "feed" if feed else "search", str(e))
@@ -387,6 +420,8 @@ def _load_movie_data(
     )
     if timeout is None:
         return None
+    checkpoint()
+    timeout = min(timeout, clamp_timeout(timeout))
 
     try:
         r = cf_session.get(
@@ -397,6 +432,8 @@ def _load_movie_data(
         )
         r.raise_for_status()
         data_html = r.json().get("html", "")
+    except SearchBudgetExhausted:
+        raise
     except Exception as e:
         debug(f"Failed to load movie API for {movie_id}: {e}")
         mark_hostname_issue(source.initials, "feed" if feed else "search", str(e))

@@ -14,6 +14,18 @@ from bs4 import BeautifulSoup
 from quasarr.providers.log import debug, error
 
 
+def checkpoint():
+    from quasarr.search.sources.helpers.budget import checkpoint as budget_checkpoint
+
+    budget_checkpoint()
+
+
+def clamp_timeout(default_seconds):
+    from quasarr.search.sources.helpers.budget import clamp_timeout as budget_clamp
+
+    return budget_clamp(default_seconds)
+
+
 def _get_db(table_name):
     """Lazy import to avoid circular dependency."""
     from quasarr.storage.sqlite_database import DataBase
@@ -108,8 +120,22 @@ class IMDbHTML:
             ),
             "User-Agent": IMDbHTML._HTML_USER_AGENT,
         }
+
+        def request_timeout(default):
+            timeout = default
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None
+                timeout = min(timeout, remaining)
+            checkpoint()
+            return min(timeout, clamp_timeout(timeout))
+
+        direct_timeout = request_timeout(30)
+        if direct_timeout is None:
+            return None
         try:
-            response = requests.get(url, headers=headers, timeout=30)
+            response = requests.get(url, headers=headers, timeout=direct_timeout)
             if response.status_code == 200 and response.text:
                 if IMDbHTML._parse_localized_title(response.text, language):
                     return response.text
@@ -131,18 +157,24 @@ class IMDbHTML:
         if not flaresolverr_url or flaresolverr_skipped:
             return None
 
+        solver_timeout = request_timeout(60)
+        if solver_timeout is None:
+            return None
         try:
             post_data = {
                 "cmd": "request.get",
                 "url": url,
-                "maxTimeout": 60000,
+                "maxTimeout": solver_timeout * 1000,
             }
 
+            post_timeout = request_timeout(solver_timeout + 10)
+            if post_timeout is None:
+                return None
             response = requests.post(
                 flaresolverr_url,
                 json=post_data,
                 headers={"Content-Type": "application/json"},
-                timeout=70,
+                timeout=post_timeout,
             )
             if response.status_code == 200:
                 json_response = response.json()
@@ -601,6 +633,7 @@ def get_localized_title(
         if localized:
             return _normalize_localized_title(localized, language)
     elif not out_of_time():
+        checkpoint()
         imdb_metadata, arr_localized = _refresh_imdb_metadata(
             shared_state, imdb_id, search_category, imdb_metadata
         )
@@ -612,6 +645,7 @@ def get_localized_title(
         debug(f"Skipped localized-title lookup for {imdb_id}: caller out of time")
         return None
 
+    checkpoint()
     title = IMDbHTML.get_localized_title(imdb_id, language, deadline=deadline)
     if title:
         sanitized_title = TitleCleaner.sanitize(title)

@@ -18,6 +18,19 @@ from quasarr.constants import (
 from quasarr.providers.log import debug
 from quasarr.providers.utils import is_flaresolverr_available
 
+
+def checkpoint():
+    from quasarr.search.sources.helpers.budget import checkpoint as budget_checkpoint
+
+    budget_checkpoint()
+
+
+def clamp_timeout(default_seconds):
+    from quasarr.search.sources.helpers.budget import clamp_timeout as budget_clamp
+
+    return budget_clamp(default_seconds)
+
+
 _CLOUDFLARE_GATE_TTL_SECONDS = 24 * 60 * 60
 _cloudflare_gate_expires_at = {}
 _cloudflare_gate_lock = threading.Lock()
@@ -109,7 +122,9 @@ class LazyFlareSolverrSession:
         execute_js=None,
     ):
         if not _is_cloudflare_gated(url):
-            response = request_get(url, headers=headers, timeout=timeout)
+            checkpoint()
+            request_timeout = clamp_timeout(timeout)
+            response = request_get(url, headers=headers, timeout=request_timeout)
             if response.status_code != 403 and not is_cloudflare_challenge(
                 response.text
             ):
@@ -127,6 +142,7 @@ class LazyFlareSolverrSession:
             )
 
         if self.session_id is None:
+            checkpoint()
             requested_session_id = str(uuid.uuid4())
             self.session_id = flaresolverr_create_session(
                 self.shared_state, requested_session_id
@@ -139,7 +155,8 @@ class LazyFlareSolverrSession:
         # Browser solves can take longer than a plain search request. Keep the
         # caller's HTTP budget for the initial request, but never give an
         # actual FlareSolverr solve less than the existing session budget.
-        solver_timeout = max(timeout, SESSION_REQUEST_TIMEOUT_SECONDS)
+        checkpoint()
+        solver_timeout = clamp_timeout(max(timeout, SESSION_REQUEST_TIMEOUT_SECONDS))
         # Only forward the flaresolverr-next JS extras when a caller asked for them,
         # so existing call sites (and their test doubles) keep the original signature.
         extra_js = {}
@@ -195,17 +212,23 @@ def update_session_via_flaresolverr(
         info("Cannot proceed without FlareSolverr. Please configure it in the web UI!")
         return False
 
+    checkpoint()
+    solver_timeout = clamp_timeout(timeout)
     fs_payload = {
         "cmd": "request.get",
         "url": target_url,
-        "maxTimeout": timeout * 1000,
+        "maxTimeout": solver_timeout * 1000,
     }
 
     # Send the JSON request to FlareSolverr
     fs_headers = {"Content-Type": "application/json"}
+    request_timeout = clamp_timeout(solver_timeout + 10)
     try:
         resp = requests.post(
-            flaresolverr_url, headers=fs_headers, json=fs_payload, timeout=timeout + 10
+            flaresolverr_url,
+            headers=fs_headers,
+            json=fs_payload,
+            timeout=request_timeout,
         )
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
@@ -256,8 +279,10 @@ def ensure_session_cf_bypassed(
     if timeout is None:
         timeout = DOWNLOAD_REQUEST_TIMEOUT_SECONDS
 
+    checkpoint()
+    request_timeout = clamp_timeout(timeout)
     try:
-        resp = session.get(url, headers=headers, timeout=timeout)
+        resp = session.get(url, headers=headers, timeout=request_timeout)
     except requests.RequestException as e:
         info(f"Initial GET failed: {e}")
         return None, None, None
@@ -291,8 +316,10 @@ def ensure_session_cf_bypassed(
             headers = {"User-Agent": shared_state.values["user_agent"]}
 
         # re-fetch using the new session/headers
+        checkpoint()
+        request_timeout = clamp_timeout(timeout)
         try:
-            resp = session.get(url, headers=headers, timeout=timeout)
+            resp = session.get(url, headers=headers, timeout=request_timeout)
         except requests.RequestException as e:
             info(f"GET after FlareSolverr failed: {e}")
             return None, None, None
@@ -368,7 +395,13 @@ def flaresolverr_get(
     if not flaresolverr_url:
         raise RuntimeError("FlareSolverr URL not configured in shared_state.")
 
-    payload = {"cmd": "request.get", "url": url, "maxTimeout": timeout * 1000}
+    checkpoint()
+    solver_timeout = clamp_timeout(timeout)
+    payload = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": solver_timeout * 1000,
+    }
     if session_id:
         payload["session"] = session_id
     if document_start_js:
@@ -376,12 +409,13 @@ def flaresolverr_get(
     if execute_js:
         payload["executeJs"] = execute_js
 
+    request_timeout = clamp_timeout(solver_timeout + 10)
     try:
         resp = requests.post(
             flaresolverr_url,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=timeout + 10,
+            timeout=request_timeout,
         )
         resp.raise_for_status()
     except Exception as e:
@@ -442,11 +476,13 @@ def flaresolverr_post(
     else:
         post_data = data or ""
 
+    checkpoint()
+    solver_timeout = clamp_timeout(timeout)
     payload = {
         "cmd": "request.post",
         "url": url,
         "postData": post_data,
-        "maxTimeout": timeout * 1000,
+        "maxTimeout": solver_timeout * 1000,
     }
     if session_id:
         payload["session"] = session_id
@@ -454,12 +490,13 @@ def flaresolverr_post(
     if headers:
         payload["headers"] = headers
 
+    request_timeout = clamp_timeout(solver_timeout + 10)
     try:
         resp = requests.post(
             flaresolverr_url,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=timeout + 10,
+            timeout=request_timeout,
         )
         resp.raise_for_status()
     except Exception as e:
@@ -495,12 +532,14 @@ def flaresolverr_create_session(shared_state, session_id=None):
     if session_id:
         payload["session"] = session_id
 
+    checkpoint()
+    request_timeout = clamp_timeout(SESSION_REQUEST_TIMEOUT_SECONDS)
     try:
         resp = requests.post(
             flaresolverr_url,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=SESSION_REQUEST_TIMEOUT_SECONDS,
+            timeout=request_timeout,
         )
         resp.raise_for_status()
         data = resp.json()

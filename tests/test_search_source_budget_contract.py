@@ -1,11 +1,15 @@
 import ast
 import pathlib
 import unittest
+from threading import get_ident
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from quasarr.constants import SEARCH_CAT_MOVIES
-from quasarr.search.sources.helpers.budget import use_search_budget
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    use_search_budget,
+)
 
 SOURCES_DIR = (
     pathlib.Path(__file__).resolve().parents[1] / "quasarr" / "search" / "sources"
@@ -15,17 +19,27 @@ SOURCES_DIR = (
 # timeout constant and own no session, browser, or nested pool. Task 7 extends
 # this tuple with the remaining sources instead of forking the contract.
 BUDGETED_MODULES = (
+    "al",
+    "at",
     "by",
+    "dd",
     "dj",
+    "dl",
     "dt",
     "dw",
+    "ff",
     "fx",
     "he",
     "hs",
     "mb",
+    "mx",
     "nk",
     "nx",
+    "rm",
+    "sf",
     "sj",
+    "sl",
+    "wd",
     "wx",
 )
 
@@ -142,6 +156,21 @@ class ManualClock:
         return self.now
 
 
+class ThreadScopedClock:
+    def __init__(self, main_times, worker_time):
+        self._main_thread = get_ident()
+        self._main_times = list(main_times)
+        self._worker_time = worker_time
+        self._main_index = 0
+
+    def __call__(self):
+        if get_ident() != self._main_thread:
+            return self._worker_time
+        index = min(self._main_index, len(self._main_times) - 1)
+        self._main_index += 1
+        return self._main_times[index]
+
+
 class FakeResponse:
     status_code = 200
 
@@ -197,6 +226,120 @@ def shared_state_for(initials):
 
 
 class SourceBudgetBehaviorTests(unittest.TestCase):
+    def test_at_nested_workers_receive_the_parent_budget(self):
+        from quasarr.search.sources import at
+
+        fake = RecordingRequests()
+        clock = ThreadScopedClock([0.0], worker_time=10.0)
+        with (
+            patch.object(at, "requests", fake),
+            use_search_budget(10.0, clock=clock),
+        ):
+            with self.assertRaises(SearchBudgetExhausted):
+                at._load_entries(
+                    shared_state_for("at"),
+                    "https://at.invalid/listing",
+                    "https://at.invalid/attachments",
+                    15,
+                )
+
+        self.assertEqual([], fake.calls)
+
+    def test_at_stops_before_submitting_the_next_nested_request(self):
+        from quasarr.search.sources import at
+
+        fake = RecordingRequests([FakeResponse(content=b"<html></html>")])
+        clock = ThreadScopedClock([0.0, 10.0], worker_time=0.0)
+        with (
+            patch.object(at, "requests", fake),
+            use_search_budget(10.0, clock=clock),
+        ):
+            entries = at._load_entries(
+                shared_state_for("at"),
+                "https://at.invalid/listing",
+                "https://at.invalid/attachments",
+                15,
+            )
+
+        self.assertEqual([], entries)
+        self.assertEqual(
+            ["https://at.invalid/listing"], [call.url for call in fake.calls]
+        )
+
+    def test_sl_nested_workers_receive_the_parent_budget(self):
+        from quasarr.search.sources import sl
+
+        sessions = []
+
+        def make_session():
+            session = MagicMock()
+            sessions.append(session)
+            return session
+
+        clock = ThreadScopedClock([0.0], worker_time=10.0)
+        with (
+            patch.object(sl.requests, "Session", side_effect=make_session),
+            patch.object(
+                sl,
+                "ensure_session_cf_bypassed",
+                side_effect=lambda _info, _state, session, _url, headers, timeout=None: (
+                    session,
+                    headers,
+                    FakeResponse(content=b"<html></html>"),
+                ),
+            ) as ensure,
+            patch.object(sl, "mark_hostname_issue") as marked,
+            patch.object(sl, "clear_hostname_issue"),
+            use_search_budget(10.0, clock=clock),
+        ):
+            releases = sl.Source().search(
+                shared_state_for("sl"),
+                0.0,
+                5000,
+                "Synthetic Show",
+            )
+
+        self.assertEqual([], releases)
+        self.assertEqual([], sessions)
+        ensure.assert_not_called()
+        marked.assert_not_called()
+
+    def test_sl_stops_before_submitting_the_next_nested_request(self):
+        from quasarr.search.sources import sl
+
+        sessions = []
+        requested_urls = []
+
+        def make_session():
+            session = MagicMock()
+            sessions.append(session)
+            return session
+
+        def ensure(_info, _state, session, url, headers, timeout=None):
+            requested_urls.append(url)
+            return session, headers, FakeResponse(content=b"<html></html>")
+
+        clock = ThreadScopedClock([0.0, 10.0], worker_time=0.0)
+        with (
+            patch.object(sl.requests, "Session", side_effect=make_session),
+            patch.object(sl, "ensure_session_cf_bypassed", side_effect=ensure),
+            patch.object(sl, "mark_hostname_issue") as marked,
+            patch.object(sl, "clear_hostname_issue"),
+            use_search_budget(10.0, clock=clock),
+        ):
+            releases = sl.Source().search(
+                shared_state_for("sl"),
+                0.0,
+                5000,
+                "Synthetic Show",
+            )
+
+        self.assertEqual([], releases)
+        self.assertEqual(1, len(requested_urls))
+        self.assertEqual(1, len(sessions))
+        sessions[0].close.assert_called_once()
+        marked.assert_not_called()
+
     def test_single_page_source_starts_no_request_after_exhaustion(self):
         from quasarr.search.sources import hs
 
@@ -330,6 +473,50 @@ class SourceBudgetBehaviorTests(unittest.TestCase):
 
         self.assertEqual([], search_requests.calls)
         search_marked.assert_not_called()
+
+
+class SharedProviderBudgetTests(unittest.TestCase):
+    def test_arr_clients_clamp_requests_to_the_worker_budget(self):
+        from quasarr.providers import radarr_api, sonarr_api
+
+        for module, client_type in (
+            (radarr_api, radarr_api.RadarrAPIClient),
+            (sonarr_api, sonarr_api.SonarrAPIClient),
+        ):
+            with self.subTest(module=module.__name__):
+                fake = RecordingRequests([FakeResponse(payload={})])
+                with (
+                    patch.object(module, "requests", fake),
+                    use_search_budget(0.25, clock=ManualClock()),
+                ):
+                    client_type("https://arr.invalid", "api-key")._get("/test")
+
+                self.assertEqual([0.25], fake.timeouts)
+
+    def test_arr_wanted_pagination_stops_before_the_next_page(self):
+        from quasarr.providers import radarr_api, sonarr_api
+
+        cases = (
+            (radarr_api, "radarr_client", radarr_api.get_wanted_imdb_ids),
+            (sonarr_api, "sonarr_client", sonarr_api.get_wanted_episodes),
+        )
+        for _module, state_key, wanted in cases:
+            with self.subTest(state_key=state_key):
+                clock = ManualClock()
+                client = MagicMock()
+
+                def first_page(*_args, page_clock=clock, **_kwargs):
+                    page_clock.now = 10.0
+                    return {"records": []}
+
+                client.wanted.side_effect = first_page
+                state = SimpleNamespace(values={state_key: client})
+                status = {}
+                with use_search_budget(10.0, clock=clock):
+                    self.assertEqual([], wanted(state, status=status))
+
+                self.assertEqual(1, client.wanted.call_count)
+                self.assertEqual({"complete": False}, status)
 
 
 if __name__ == "__main__":

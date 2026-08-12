@@ -9,6 +9,19 @@ import requests
 
 from quasarr.providers.log import error, trace, warn
 
+
+def checkpoint():
+    from quasarr.search.sources.helpers.budget import checkpoint as budget_checkpoint
+
+    budget_checkpoint()
+
+
+def clamp_timeout(default_seconds):
+    from quasarr.search.sources.helpers.budget import clamp_timeout as budget_clamp
+
+    return budget_clamp(default_seconds)
+
+
 _SHARED_STATE_KEY = "sonarr_client"
 
 
@@ -41,6 +54,8 @@ class SonarrAPIClient:
         # A caller timeout only ever tightens the client's own: it says how much
         # of its budget is left, not that this request may take longer.
         timeout = min(self._timeout, timeout) if timeout else self._timeout
+        checkpoint()
+        timeout = min(timeout, clamp_timeout(timeout))
         url = f"{self._base_url}/api/v3{path}"
         headers = {
             "X-Api-Key": self._api_key,
@@ -182,6 +197,8 @@ def get_wanted_episodes(shared_state, limit=50, deadline=None, status=None):
         # the whole wanted list or as far as paging got.
         status["complete"] = False
 
+    from quasarr.search.sources.helpers.budget import SearchBudgetExhausted
+
     client = get_client(shared_state)
     if client is None:
         return []
@@ -191,6 +208,10 @@ def get_wanted_episodes(shared_state, limit=50, deadline=None, status=None):
     seen = set()
     for kind in ("missing", "cutoff"):
         for page in range(1, _WANTED_MAX_PAGES + 1):
+            try:
+                checkpoint()
+            except SearchBudgetExhausted:
+                return episodes
             if len(episodes) >= limit:
                 return episodes
             # Every page is its own Sonarr request, so a slow instance must not
@@ -201,9 +222,12 @@ def get_wanted_episodes(shared_state, limit=50, deadline=None, status=None):
                 page_timeout = deadline - time.time()
                 if page_timeout <= 0:
                     return episodes
-            page_data = client.wanted(
-                kind, page=page, page_size=limit, timeout=page_timeout
-            )
+            try:
+                page_data = client.wanted(
+                    kind, page=page, page_size=limit, timeout=page_timeout
+                )
+            except SearchBudgetExhausted:
+                return episodes
             if page_data is None:
                 return episodes  # request failed: what we have is partial
             records = page_data.get("records", [])

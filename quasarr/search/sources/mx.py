@@ -40,6 +40,11 @@ from quasarr.providers.utils import (
     get_base_search_category_id,
     is_imdb_id,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -89,6 +94,8 @@ class Source(AbstractSearchSource):
             if timeout is None:
                 raise FeedBudgetSpent()
 
+        checkpoint()
+        timeout = clamp_timeout(timeout)
         headers = {
             "User-Agent": shared_state.values["user_agent"],
             "Referer": f"https://{host}/",
@@ -199,9 +206,13 @@ class Source(AbstractSearchSource):
         imdb_id = result.get("imdb_id")
 
         for link in links:
-            real_url = self._decode_link(
-                api_base, host, link.get("id"), media_id, shared_state, timeout
-            )
+            try:
+                checkpoint()
+                real_url = self._decode_link(
+                    api_base, host, link.get("id"), media_id, shared_state, timeout
+                )
+            except SearchBudgetExhausted:
+                break
             if not real_url:
                 debug(f"[mx] decode failed for link {link.get('id')}")
                 continue
@@ -397,6 +408,10 @@ class Source(AbstractSearchSource):
                     f"skipping {len(seeds) - processed} remaining seeds"
                 )
                 break
+            try:
+                checkpoint()
+            except SearchBudgetExhausted:
+                break
             processed += 1
             try:
                 releases.extend(
@@ -412,7 +427,7 @@ class Source(AbstractSearchSource):
                         title_deadline=deadline,
                     )
                 )
-            except FeedBudgetSpent:
+            except (FeedBudgetSpent, SearchBudgetExhausted):
                 # This seed produced nothing, so leave it for the next run.
                 processed -= 1
                 debug(
@@ -478,6 +493,8 @@ class Source(AbstractSearchSource):
             )
             if releases:
                 clear_hostname_issue(self.initials)
+        except SearchBudgetExhausted:
+            pass
         except Exception as e:
             mark_hostname_issue(self.initials, "search", str(e))
             warn(f"[mx] search error: {e}")
