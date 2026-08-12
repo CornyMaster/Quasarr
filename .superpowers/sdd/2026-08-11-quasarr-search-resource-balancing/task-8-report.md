@@ -9,6 +9,7 @@ Commits:
 - `3022da25c56af19930c061fc3f2c00263cf0d404` "Reclaim expired search memory after idle periods"
 - `848ba66d3b0e35a696cbc68fd9ed627d79b43121` "Rate-limit failed search reclamation attempts"
 - `422246d` "Harden idle memory reclamation"
+- `b235c8e59ebdd6cece7849a7842432557bb6ee82` "Fix idle reclaimer liveness races"
 
 Status: **DONE**
 
@@ -32,7 +33,7 @@ No worker process, Playwright, Selenium, Linkcrypter, source module, category pl
 | `quasarr/search/runtime.py` | Idle-state query and optional request/source/overdue callbacks, now invoked after releasing a non-reentrant transition lock. Existing snapshot keys are unchanged. |
 | `quasarr/search/cache.py` | Documented that `sweep()` releases its lock before returning; behavior is unchanged. |
 | `quasarr/search/__init__.py` | Explicitly re-exported `IdleMemoryReclaimer` and `trim_native_heap`; no singleton is constructed. |
-| `tests/test_search_memory_reclaim.py` | 30-test hermetic scheduler/platform/ordering/locking/failure/metrics suite using injected clocks, timers, GC, native trim, libc loader, and memory reader. |
+| `tests/test_search_memory_reclaim.py` | 34-test hermetic scheduler/platform/ordering/locking/failure/metrics suite using injected clocks, timers, GC, native trim, libc loader, and memory reader. |
 | `quasarr/search/AGENTS.md` | Recorded ownership, activation gate, quiet/rate limits, platform behavior, lock boundary, and identifier-free summary contract. |
 
 ## Strict TDD Evidence
@@ -248,3 +249,80 @@ Focused Ruff lint passed, focused Ruff format reported all three touched Python 
 `quasarr/search/AGENTS.md` now owns the arm-generation claim, non-reentrant runtime lock, post-lock callback/start boundary, fixed failure diagnostics, and permanent native no-op contract. Root/package/tests DOX were reviewed and intentionally left unchanged because structure and test workflow did not change.
 
 No blocking concern remains. Production activation is still intentionally absent and remains a later canary decision.
+
+## Review Fix Round 3/5
+
+Independent review found an Important liveness race introduced by the round 2 lock-free timer start. A timer reservation was published before `Timer.start()`: activity could begin, the owner could reserve after the activity-start cancellation, and the activity-end scheduler could observe that unstarted timer and return before the owner discarded it after a busy recheck. The process then remained fully idle with no timer. The same owned-token dormancy existed when a callback collided with public collection or consumed its token while the 300-second limiter still applied.
+
+Commit `b235c8e59ebdd6cece7849a7842432557bb6ee82` resolves the finding without changing runtime counters, cache policy, public direct-collection semantics, or the production activation gate.
+
+### Strict RED
+
+The exact reserved-but-unstarted interleaving was added first with two bounded threads and event handoffs. No sleeps are used; every wait and join has a five-second bound. Against `9de3fc3`, the regression reached the final idle state and failed because only the discarded timer existed:
+
+```text
+test_discarded_unstarted_timer_rearms_after_activity_end_race ... FAIL
+AssertionError: 2 != 1
+Ran 1 test
+FAILED (failures=1)
+```
+
+Two more tests then drove the timer callback against an in-progress public collection and against a still-active 300-second limiter. Both consumed their token without producing a successor:
+
+```text
+test_timer_callback_during_public_collection_rearms_at_rate_limit ... FAIL
+test_rate_limited_timer_callback_rearms_for_remaining_interval ... FAIL
+AssertionError: 2 != 1
+Ran 2 tests
+FAILED (failures=2)
+```
+
+Finally, the direct-public-collect rearm and timer-start failure tests required one explicit deferred schedule after a contained factory/start failure. Both failed on the missing marker:
+
+```text
+test_public_collect_rearm_factory_failure_is_contained ... FAIL
+test_timer_start_failure_records_one_deferred_schedule ... FAIL
+AssertionError: False is not true
+Ran 2 tests
+FAILED (failures=2)
+```
+
+### Implementation
+
+- A published timer is marked provisional until `start()` returns. A concurrent quiet schedule that sees that provisional arm records pending work instead of treating it as a live timer.
+- The reservation owner identity-checks cleanup. If it discards the current provisional arm after the activity-end scheduler returned, it cancels the old timer and schedules exactly one fresh arm outside both runtime and reclaimer locks. That arm receives the full 30-second quiet delay.
+- A callback that owns and consumes its token now has exactly three outcomes: atomically claim collection, defer scheduling to the public collector already in progress, or schedule a rate-limited/generation-safe successor after releasing the reclaimer lock.
+- Timer construction and start failures clear the published token and record one pending schedule. They do not recursively retry or start any thread under a runtime/reclaimer lock; a later quiet scheduling call consumes the pending state. A standalone successful `collect_and_trim()` still does not arm a timer unless activity or a callback deferred one.
+- Activity cancellation clears provisional and pending state because the matching transition back to idle owns a fresh schedule. Token checks still prevent a stale callback from clearing a replacement timer.
+
+### Strengthened Coverage
+
+- The stale callback is now invoked after overdue activity has resolved and the runtime is fully idle. It independently proves that the old token cannot clear, cancel, replace, or collect through the live replacement arm.
+- The hidden handoff-activity test explicitly proves the arm generation advanced, no sweep/GC/trim ran after start-and-finish activity, and a full 30-second replacement was armed.
+- Collector and native-trimmer probes now prove another thread can acquire the cache lock, runtime lock, and reclaimer's own lock during both GC and trim.
+- Public collection tests distinguish ordinary direct collection (no timer) from activity-deferred rearm, and distinguish contained factory failure (pending state retained) from a later successful one-timer retry.
+
+### GREEN And Final Gates
+
+```text
+Exact interleaving regression: 1 test / OK
+Callback collision + limiter regressions: 2 tests / OK
+Factory/start deferred scheduling: 2 tests / OK
+Complete reclaimer module: 34 tests / OK
+Reclaimer + runtime + cache: 83 tests / OK
+Focused Ruff lint: All checks passed!
+Focused Ruff format: 2 files already formatted
+Linux full suite: Ran 487 tests in 14.912s / OK
+Repository Ruff lint: All checks passed!
+Repository Ruff format: 185 files already formatted
+Linux aggregate status: GATE_EXIT=0
+Editor diagnostics: no errors in either changed Python file
+Production constructor search: only the search DOX activation example
+git diff --cached --check: silent
+```
+
+The authoritative Linux gate used the existing read-only worktree mount, frozen dependency sync, Python 3.12 uv image, and `quasarr-venv-rb` volume. The callback and exact-race tests are hermetic and bounded; no timer thread or synchronization wait is left running.
+
+### Remaining Concerns
+
+No blocking concern remains. A timer factory/start failure deliberately records pending work rather than self-spawning a retry loop; the next quiet transition or explicit schedule retries it. Production still constructs no reclaimer, so canary activation remains a later rollout decision.
