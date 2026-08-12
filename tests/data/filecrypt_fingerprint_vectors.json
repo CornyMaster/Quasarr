@@ -1,0 +1,51 @@
+[
+  {
+    "name": "credentials_default_https_fragment",
+    "crypter": " FileCrypt ",
+    "url": " HTTPS://alice:example@FileCrypt.Invalid:443/Container/AbC?b=2&a=1#fragment ",
+    "normalized_url": "https://filecrypt.invalid/Container/AbC?a=1&b=2",
+    "fingerprint": "5e38380ecc14f243238801d7272e99c2fb7789676f3f53fd1e963f1f5150ff55"
+  },
+  {
+    "name": "default_http_port",
+    "crypter": "filecrypt",
+    "url": "http://FILECRYPT.INVALID:80/container/http?z=last&a=first",
+    "normalized_url": "http://filecrypt.invalid/container/http?a=first&z=last",
+    "fingerprint": "456a81c04c492d7aed253e6825ba5329ea8a49feaa861178649b8e7391c0d862"
+  },
+  {
+    "name": "nondefault_port_path_unchanged",
+    "crypter": "FILECRYPT",
+    "url": "https://WWW.FileCrypt.Invalid:8443/Container/MiXeD%2fPath?utm_source=x&b=2",
+    "normalized_url": "https://www.filecrypt.invalid:8443/Container/MiXeD%2fPath?b=2&utm_source=x",
+    "fingerprint": "baaaa917b89d1f15f5e9e6d619993351fcfbcf5563e806226de057bba34958ca"
+  },
+  {
+    "name": "duplicates_and_blank_values",
+    "crypter": "filecrypt",
+    "url": "https://Edge.FileCrypt.Invalid/Container/Dup?z=&a=2&a=&a=1&blank",
+    "normalized_url": "https://edge.filecrypt.invalid/Container/Dup?a=&a=1&a=2&blank=&z=",
+    "fingerprint": "9c237027bca43100daf425cb786e3a80e3af6d415062f2a6ade5f7d5e47743de"
+  },
+  {
+    "name": "percent_encoding",
+    "crypter": "filecrypt",
+    "url": "https://filecrypt.invalid/Container/Percent?slash=%2Fpath%2Bvalue&space=a%20b&literal=a+b&tilde=%7E&encoded_key%2F=x",
+    "normalized_url": "https://filecrypt.invalid/Container/Percent?encoded_key%2F=x&literal=a+b&slash=%2Fpath%2Bvalue&space=a+b&tilde=~",
+    "fingerprint": "b92e167912b2ac44b71506c0bd46241bb51db122cd2d4944d6e8b82701250337"
+  },
+  {
+    "name": "malformed_port",
+    "crypter": "filecrypt",
+    "url": "https://user:example@ALT.FileCrypt.Invalid:notaport/Container/BadPort?b=2&a=1#fragment",
+    "normalized_url": "https://alt.filecrypt.invalid/Container/BadPort?a=1&b=2",
+    "fingerprint": "b679835a846ae5d00445d9badfb5f240308919a1351518e6777b07c6cd10d2f5"
+  },
+  {
+    "name": "alternate_filecrypt_domain",
+    "crypter": "filecrypt",
+    "url": "https://mirror.filecrypt.invalid/Container/Alternate?empty=&duplicate=b&duplicate=a",
+    "normalized_url": "https://mirror.filecrypt.invalid/Container/Alternate?duplicate=a&duplicate=b&empty=",
+    "fingerprint": "17534f9cee1cb980c833192eca7d9888de94a1cb58eccd1aa1fb04b1e5d78e6c"
+  }
+]
