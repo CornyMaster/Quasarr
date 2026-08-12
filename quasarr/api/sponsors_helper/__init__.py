@@ -8,6 +8,17 @@ from functools import wraps
 
 from bottle import HTTPResponse, abort, request
 
+from quasarr.api.sponsors_helper.cohort_protocol import (
+    COHORT_CRYPTER,
+    helper_supports_cohort,
+    helper_supports_defer,
+    normalize_access_report,
+    normalize_blocked_report,
+    render_access_response,
+    render_crypter_offer,
+    render_defer_response,
+    terminal_operation_id,
+)
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.downloads import (
     fail,
@@ -16,10 +27,20 @@ from quasarr.downloads import (
 )
 from quasarr.providers import shared_state
 from quasarr.providers.auth import require_api_key
+from quasarr.providers.crypter_candidates import (
+    enumerate_filecrypt_candidates,
+    link_fingerprint,
+)
 from quasarr.providers.crypter_cooldowns import (
     CrypterCooldownService,
     crypter_blocks_deferred,
+    decode_package_defer,
     normalize_crypter_key,
+    package_defer_covers_fingerprint,
+)
+from quasarr.providers.crypter_sweeps import (
+    bypass_decision,
+    helper_package_is_candidate,
 )
 from quasarr.providers.log import debug, info, warn
 from quasarr.providers.notifications import update_release_notification
@@ -31,7 +52,6 @@ from quasarr.storage.categories import (
 )
 from quasarr.storage.config import Config
 
-CRYPTER_DEFER_CAPABILITY = "crypter_defer_v1"
 MAXIMUM_EXCLUDED_PACKAGE_IDS = 100
 
 
@@ -161,6 +181,24 @@ def _log_safe_package_id(package_id):
     return sanitized or "<empty>"
 
 
+def _link_fingerprint(crypter, link):
+    return link_fingerprint(crypter, extract_helper_candidate_url(link))
+
+
+def _withhold_other_cohort_links(links, offered_fingerprint):
+    """Every Filecrypt link of a cohort handout except the offered occurrence."""
+    kept = []
+    for link in links:
+        crypter = resolve_protected_crypter_key(link)
+        if (
+            crypter == COHORT_CRYPTER
+            and _link_fingerprint(crypter, link) != offered_fingerprint
+        ):
+            continue
+        kept.append(link)
+    return kept
+
+
 def select_helper_package(
     protected_packages,
     supported_url_patterns,
@@ -168,6 +206,7 @@ def select_helper_package(
     cooldown_service=None,
     excluded_package_ids=None,
     enforce_package_contract=False,
+    offered_occurrence=None,
 ):
     """Pick the next protected package to hand out.
 
@@ -176,18 +215,30 @@ def select_helper_package(
     canonical ID, so a non-canonical row it can never name must never be
     selected - in any block mode - or it starves every later package.
 
+    `offered_occurrence` is the live occurrence one leased cohort offer was
+    mapped to. It restricts the handout to that package and to that exact
+    Filecrypt link, so the offered container is first and no second Filecrypt
+    URL travels with it; the package is skipped entirely when its offered link
+    is not eligible, which lets the caller fall back to ordinary work rather
+    than claim an offer it did not hand out.
+
     Spending a queued probe and handing the package out is one decision: the
     probe is counted by the transaction that spends it, and nothing between
     that transaction and this return may reject the package.
     """
     excluded_package_ids = normalize_excluded_package_ids(excluded_package_ids)
-    cooldown_snapshots = {}
+    crypter_projections = {}
 
     for package in protected_packages:
         if not isinstance(package, (list, tuple)) or len(package) < 2:
             continue
         package_id = package[0]
         if not isinstance(package_id, str):
+            continue
+        if (
+            offered_occurrence is not None
+            and package_id != offered_occurrence.package_id
+        ):
             continue
         if enforce_package_contract and not PACKAGE_ID_PATTERN.fullmatch(package_id):
             debug(
@@ -202,14 +253,10 @@ def select_helper_package(
             data = json.loads(package[1])
         except (TypeError, json.JSONDecodeError):
             continue
-        if not isinstance(data, dict) or not {"title", "password"}.issubset(data):
-            continue
-        if "disabled" in data:
+        if not helper_package_is_candidate(data):
             continue
 
-        raw_links = data.get("links")
-        if not isinstance(raw_links, list) or not raw_links:
-            continue
+        raw_links = data["links"]
 
         # Order links by the category's mirror-whitelist: the whitelist order is
         # the priority ranking. Without an explicit whitelist, fall back to the
@@ -246,6 +293,13 @@ def select_helper_package(
             supported_url_patterns,
             supported_mirrors,
         )
+        if offered_occurrence is not None:
+            prioritized_links = _withhold_other_cohort_links(
+                prioritized_links, offered_occurrence.fingerprint
+            )
+            supported_links = _withhold_other_cohort_links(
+                supported_links, offered_occurrence.fingerprint
+            )
         if (supported_url_patterns or supported_mirrors) and not supported_links:
             continue
 
@@ -263,23 +317,34 @@ def select_helper_package(
                 eligible_supported_links.append(link)
                 continue
 
-            if crypter not in cooldown_snapshots:
-                cooldown_snapshots[crypter] = cooldown_service.snapshot(crypter)
-            snapshot = cooldown_snapshots[crypter]
+            if crypter not in crypter_projections:
+                crypter_projections[crypter] = cooldown_service.crypter_projection(
+                    crypter
+                )
+            snapshot, decision = crypter_projections[crypter]
             matching_defer = (
                 package_defer
                 if package_defer and package_defer["crypter"] == crypter
                 else None
             )
             projected_defer = (
-                cooldown_service.project_package_defer(matching_defer, snapshot)
+                cooldown_service.project_package_defer(
+                    matching_defer, snapshot, decision
+                )
                 if matching_defer
                 else None
             )
             probe_requested = bool(matching_defer and matching_defer["probe_requested"])
-            blocked = snapshot["state"] == "cooldown" or bool(
-                projected_defer and projected_defer["active"]
+            # A hold speaks only for the links a report already tested, so a
+            # never tested container of the same package is still eligible.
+            held = bool(
+                projected_defer
+                and projected_defer["active"]
+                and package_defer_covers_fingerprint(
+                    matching_defer, _link_fingerprint(crypter, link)
+                )
             )
+            blocked = snapshot["state"] == "cooldown" or held
 
             if blocked and not probe_requested:
                 continue
@@ -301,6 +366,19 @@ def select_helper_package(
             if not eligible_supported_links:
                 continue
 
+        if offered_occurrence is not None:
+            offered = [
+                link
+                for link in eligible_supported_links
+                if _link_fingerprint(COHORT_CRYPTER, link)
+                == offered_occurrence.fingerprint
+            ]
+            if not offered:
+                continue
+            eligible_supported_links = offered + [
+                link for link in eligible_supported_links if link not in offered
+            ]
+
         unsupported_links = prioritized_links[len(supported_links) :]
         return package_id, data, eligible_supported_links + unsupported_links
 
@@ -308,6 +386,87 @@ def select_helper_package(
 
 
 def setup_sponsors_helper_routes(app):
+    def filecrypt_inventory(protected_rows=None):
+        """The bounded Filecrypt inventory, or None when it cannot be proven.
+
+        Always resolved before a mutation opens, so no transaction callback ever
+        enumerates storage, and an inventory this cannot read is passed on as an
+        explicit failure that the transition layer refuses to cool on.
+        """
+        try:
+            if protected_rows is None:
+                protected_rows = shared_state.get_db("protected").retrieve_all_titles()
+            return enumerate_filecrypt_candidates(protected_rows)
+        except Exception:
+            warn("Filecrypt candidate inventory unavailable; cohort work is suspended")
+            return None
+
+    def json_response(body, status):
+        if status == 200:
+            return body
+        return HTTPResponse(
+            body=json.dumps(body),
+            status=status,
+            content_type="application/json",
+        )
+
+    def filecrypt_probe_is_queued(protected_rows):
+        """Whether an operator queued `Check now` on a held Filecrypt package.
+
+        Read from the rows this request already enumerated, so proving it costs
+        no extra storage access.
+        """
+        for row in protected_rows or ():
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            try:
+                deferred = decode_package_defer(json.loads(row[1]))
+            except (TypeError, ValueError, RecursionError):
+                continue
+            if (
+                deferred
+                and deferred["crypter"] == COHORT_CRYPTER
+                and deferred["probe_requested"]
+            ):
+                return True
+        return False
+
+    def lease_cohort_offer(cooldown_service, inventory, protected_rows):
+        """Advance the decision and lease at most one Filecrypt offer.
+
+        A manual probe is only requested while a cohort cooldown could issue
+        one; asking for it in any other state would suppress the ordinary offer
+        that state does issue.
+        """
+        decision = cooldown_service.crypter_decision(COHORT_CRYPTER)
+        mode = None
+        if (
+            decision is not None
+            and decision["state"] == "cooldown"
+            and not decision["legacy_cooldown"]
+            and filecrypt_probe_is_queued(protected_rows)
+        ):
+            mode = "probe"
+        return cooldown_service.prepare_offer(COHORT_CRYPTER, inventory, mode=mode)
+
+    def cohort_occurrence(inventory, offer, excluded_package_ids):
+        """Map a leased fingerprint onto its deterministic live occurrence.
+
+        The inventory is ordered by package ID and stored link index, so the
+        first occurrence the helper can still be handed is the one this returns.
+        """
+        if inventory is None or not offer:
+            return None
+        excluded = normalize_excluded_package_ids(excluded_package_ids)
+        for candidate in inventory.candidates:
+            if candidate.fingerprint != offer["link_fingerprint"]:
+                continue
+            for occurrence in candidate.occurrences:
+                if occurrence.package_id not in excluded:
+                    return occurrence
+            return None
+        return None
+
     def get_protected_release(package_id):
         try:
             raw_data = shared_state.get_db("protected").retrieve(package_id)
@@ -397,6 +556,34 @@ def setup_sponsors_helper_routes(app):
         if not required_fields.issubset(data):
             return abort(400, "Missing defer report fields")
 
+        # A report is a cohort report only when it names a strictly valid offer
+        # identity. Anything else - including a malformed or partial offer from
+        # a cohort-capable helper - stays on the version-one route, which can
+        # never delete or overwrite a version-two decision.
+        cohort_report = normalize_blocked_report(data)
+        if cohort_report is not None:
+            if not crypter_blocks_deferred(shared_state):
+                return render_defer_response(bypass_decision())
+            service = CrypterCooldownService(shared_state)
+            inventory = filecrypt_inventory()
+            try:
+                decision = service.record_cohort_blocked(
+                    cohort_report["crypter"],
+                    cohort_report["package_id"],
+                    cohort_report["link_fingerprint"],
+                    cohort_report["sweep_id"],
+                    cohort_report["offer_id"],
+                    cohort_report["reason_code"],
+                    inventory,
+                )
+            except ValueError as error:
+                return abort(400, str(error))
+            except HTTPResponse:
+                raise
+            except Exception as error:
+                return abort(500, str(error))
+            return render_defer_response(decision)
+
         if not crypter_blocks_deferred(shared_state):
             return {
                 "success": True,
@@ -415,6 +602,10 @@ def setup_sponsors_helper_routes(app):
 
         try:
             existing_defer = service.get_package_defer(package_id)
+            # A live version-two decision has precedence over the version-one
+            # accumulator, so the answer follows that decision instead of the
+            # stored package hold, and only a cohort cooldown still writes one.
+            cohort_decision = service.crypter_decision(crypter)
             decision = service.observe(
                 crypter,
                 package_id,
@@ -427,6 +618,11 @@ def setup_sponsors_helper_routes(app):
                 hold_type = "crypter_cooldown"
                 observation_holds = 0
                 retry_after_epoch = decision["package_retry_after_epoch"]
+            elif cohort_decision is not None:
+                instruction = "legacy_failure"
+                hold_type = "none"
+                observation_holds = None
+                retry_after_epoch = 0
             elif existing_defer and existing_defer["observation_holds"]:
                 instruction = "legacy_failure"
                 hold_type = "none"
@@ -438,15 +634,16 @@ def setup_sponsors_helper_routes(app):
                 observation_holds = 1
                 retry_after_epoch = decision["package_retry_after_epoch"]
 
-            stored_defer = service.defer_package(
-                package_id,
-                crypter,
-                reason_code,
-                decision["package_retry_after_epoch"],
-                observation_holds,
-            )
-            if stored_defer is None:
-                return abort(404, "Protected package not found")
+            if observation_holds is not None:
+                stored_defer = service.defer_package(
+                    package_id,
+                    crypter,
+                    reason_code,
+                    decision["package_retry_after_epoch"],
+                    observation_holds,
+                )
+                if stored_defer is None:
+                    return abort(404, "Protected package not found")
         except ValueError as error:
             return abort(400, str(error))
         except HTTPResponse:
@@ -471,8 +668,43 @@ def setup_sponsors_helper_routes(app):
             return abort(400, "Missing or invalid JSON object")
         if not {"package_id", "crypter", "access"}.issubset(data):
             return abort(400, "Missing linkcrypter access report fields")
+
+        cohort_report = normalize_access_report(data)
+        if cohort_report is not None:
+            offer_id = cohort_report["offer_id"]
+            if not crypter_blocks_deferred(shared_state):
+                # A pure bypass still has to answer, and the only answer that
+                # implies nothing about a decision is the stale one.
+                return json_response(
+                    *render_access_response(bypass_decision(), offer_id=offer_id)
+                )
+            service = CrypterCooldownService(shared_state)
+            inventory = filecrypt_inventory()
+            try:
+                decision = service.record_cohort_access(
+                    cohort_report["crypter"],
+                    cohort_report["package_id"],
+                    cohort_report["link_fingerprint"],
+                    cohort_report["sweep_id"],
+                    offer_id,
+                    cohort_report["access"],
+                    inventory,
+                )
+            except ValueError as error:
+                return abort(400, str(error))
+            except HTTPResponse:
+                raise
+            except Exception as error:
+                return abort(500, str(error))
+            return json_response(*render_access_response(decision, offer_id=offer_id))
+
         if data["access"] != "clear":
             return abort(400, "Unsupported linkcrypter access value")
+
+        if not crypter_blocks_deferred(shared_state):
+            # `fail` mode is a pure bypass on this route too: the compatibility
+            # body is returned before any package or linkcrypter state is read.
+            return {"success": True, "state": "available", "cleared": True}
 
         package_id = data["package_id"]
         if not isinstance(package_id, str) or not PACKAGE_ID_PATTERN.fullmatch(
@@ -496,11 +728,22 @@ def setup_sponsors_helper_routes(app):
         service = CrypterCooldownService(shared_state)
         try:
             service.clear_package_defer(package_id)
-            service.record_success(crypter)
+            sweep_id = service.record_legacy_success(crypter)
         except ValueError as error:
             return abort(400, str(error))
         except Exception as error:
             return abort(500, str(error))
+
+        # The committed health window already invalidated every hold of that
+        # generation, so this only drops metadata that is logically dead and its
+        # failure can never change the acknowledgement.
+        try:
+            service.clear_crypter_generation_holds(crypter, sweep_id=sweep_id)
+        except Exception:
+            warn(
+                "Deferred package cleanup after a legacy linkcrypter access "
+                f'report failed for "{crypter}"; those holds are already inactive'
+            )
 
         return {"success": True, "state": "available", "cleared": True}
 
@@ -529,11 +772,8 @@ def setup_sponsors_helper_routes(app):
 
             # Issue #350: only hand SponsorsHelper packages where at least one URL
             # matches the helper's advertised support, and move that URL to the front.
-            capabilities = payload.get("capabilities")
-            defer_capable = (
-                isinstance(capabilities, (list, tuple, set))
-                and CRYPTER_DEFER_CAPABILITY in capabilities
-            )
+            defer_capable = helper_supports_defer(payload)
+            cohort_capable = helper_supports_cohort(payload)
             # Legacy block mode selects exactly like an incapable helper: no
             # cooldown service is built, so no hold can gate this handout. The
             # package ID contract still applies, because it is what makes the
@@ -543,15 +783,37 @@ def setup_sponsors_helper_routes(app):
                 if defer_capable and crypter_blocks_deferred(shared_state)
                 else None
             )
+            excluded_package_ids = payload.get("excluded_package_ids")
+            offer = None
+            occurrence = None
+            if cohort_capable and cooldown_service is not None:
+                inventory = filecrypt_inventory(protected)
+                offer = lease_cohort_offer(cooldown_service, inventory, protected)
+                occurrence = cohort_occurrence(inventory, offer, excluded_package_ids)
+
             if defer_capable:
                 selected_package = select_helper_package(
                     protected,
                     supported_url_patterns,
                     supported_mirrors,
                     cooldown_service=cooldown_service,
-                    excluded_package_ids=payload.get("excluded_package_ids"),
+                    excluded_package_ids=excluded_package_ids,
                     enforce_package_contract=True,
+                    offered_occurrence=occurrence,
                 )
+                if selected_package is None and occurrence is not None:
+                    # The offered occurrence is not handable right now, so this
+                    # request falls back to ordinary work and the unanswered
+                    # lease simply expires.
+                    occurrence = None
+                    selected_package = select_helper_package(
+                        protected,
+                        supported_url_patterns,
+                        supported_mirrors,
+                        cooldown_service=cooldown_service,
+                        excluded_package_ids=excluded_package_ids,
+                        enforce_package_contract=True,
+                    )
             else:
                 selected_package = select_helper_package(
                     protected, supported_url_patterns, supported_mirrors
@@ -570,16 +832,21 @@ def setup_sponsors_helper_routes(app):
             mirror = None if mirror == "None" else mirror
             password = data["password"]
 
-            return {
-                "to_decrypt": {
-                    "name": title,
-                    "id": package_id,
-                    "url": prioritized_links,
-                    "mirror": mirror,
-                    "password": password,
-                    "max_attempts": 3,
-                }
+            to_decrypt = {
+                "name": title,
+                "id": package_id,
+                "url": prioritized_links,
+                "mirror": mirror,
+                "password": password,
+                "max_attempts": 3,
             }
+            if cohort_capable:
+                # Output only: Task 6 owns the terminal endpoints that verify it.
+                to_decrypt["terminal_operation_id"] = terminal_operation_id(package_id)
+                crypter_offer = render_crypter_offer(offer, occurrence)
+                if crypter_offer is not None:
+                    to_decrypt["crypter_offer"] = crypter_offer
+            return {"to_decrypt": to_decrypt}
         except HTTPResponse:
             raise
         except Exception as e:

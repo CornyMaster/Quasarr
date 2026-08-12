@@ -18,6 +18,7 @@ from quasarr.providers.crypter_sweeps import (
     decision_snapshot,
     decode_decision_record,
     encode_decision_record,
+    healthy_from_legacy_success,
     is_decision_record,
     lease_next_offer,
     migrate_legacy_record,
@@ -252,7 +253,7 @@ def decode_package_defer(package_data):
     """Project the deferred block out of an already-parsed protected package.
 
     Two shapes are legal: the legacy six-key block and the version-two block,
-    which adds exactly `schema_version`, `sweep_id`, and `link_fingerprint`.
+    which adds exactly `schema_version`, `sweep_id`, and `link_fingerprints`.
     Both are exact key sets, so a partial, hybrid, or future shape is malformed
     rather than silently half-understood, and no shape can carry a raw link.
     """
@@ -1065,6 +1066,32 @@ class CrypterCooldownService:
         self._shared_state.get_db("crypter_cooldowns").mutate_value(
             crypter, lambda _current_value: None
         )
+
+    def record_legacy_success(self, crypter):
+        """Apply a validated version-one CLEAR as the global healthy transition.
+
+        The version-one route has no offer identity to validate, so this is the
+        one safe path it may take into version-two state: it only ever replaces
+        the decision with a health window, which logically invalidates every
+        generation-bound hold at once and can never resurrect or extend a
+        cooldown. Returns the generation the committed window owns, so the
+        caller can run best-effort physical cleanup for it after the commit.
+        """
+        crypter = normalize_crypter_key(crypter)
+        now = int(self._clock())
+        committed = {}
+
+        def advance(current_value):
+            record = healthy_from_legacy_success(
+                self._current_decision(current_value, now),
+                now=now,
+                generation_id_factory=self._new_identifier,
+            )
+            committed.update(record)
+            return encode_decision_record(record)
+
+        self._shared_state.get_db("crypter_cooldowns").mutate_value(crypter, advance)
+        return committed["sweep_id"]
 
     def defer_package(
         self, package_id, crypter, reason_code, retry_after_epoch, observation_holds

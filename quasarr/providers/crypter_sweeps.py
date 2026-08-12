@@ -1513,6 +1513,46 @@ def _legacy_decision(state, evidence_count, retry_after_epoch, *, recorded=False
     }
 
 
+def healthy_from_legacy_success(record, *, now, generation_id_factory):
+    """The health window one validated version-one CLEAR proves.
+
+    A version-one report carries no offer identity, so it can never be replayed
+    against a lease - but a proven container is global evidence all the same, so
+    it always enters or refreshes `healthy` and queues every fingerprint the
+    ending decision still held for an exact re-test. A generation the record
+    already owns is kept, which keeps its retained replay history addressable; a
+    migrated legacy cooldown owns none and starts a fresh one with no history.
+    """
+    record = expire_decision(record, now=now)
+    generation = _generation_id(record) if isinstance(record, dict) else ""
+    queued = set()
+    accepted, used = (), ()
+    if isinstance(record, dict):
+        queued.update(
+            entry["link_fingerprint"]
+            for entry in record.get("members", ())
+            if entry["result"] == "blocked"
+        )
+        if record["state"] == "healthy":
+            queued.update(record["retest_members"])
+        elif record["state"] == "individual":
+            queued.update(record["hold_fingerprints"])
+    if generation:
+        accepted, used = record["accepted_offers"], record["used_offer_ids"]
+    else:
+        generation = _identifier(generation_id_factory(), "generation_id")
+    return {
+        "schema_version": SWEEP_SCHEMA_VERSION,
+        "state": "healthy",
+        "sweep_id": generation,
+        "until_epoch": now + HEALTHY_SUPPRESSION_SECONDS,
+        "retest_members": sorted(queued),
+        "live_offer": None,
+        "accepted_offers": list(accepted),
+        "used_offer_ids": list(used),
+    }
+
+
 def record_legacy_report(record, *, now, generation_id_factory):
     """Apply one version-one block report to a version-two decision.
 

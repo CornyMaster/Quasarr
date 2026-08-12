@@ -486,13 +486,16 @@ class DeferredPackageGaugeTests(CrypterStatisticsTestCase):
             self.report_clear(PACKAGE_A),
         )
 
-        # Clearing the linkcrypter leaves the other packages on their own
-        # provisional deadlines instead of the crypter-wide one.
-        self.assertEqual(2, self.counters()[DEFERRED_KEY])
+        # A proven container disproves the linkcrypter-wide block, so the health
+        # window logically releases every Filecrypt hold at once.
+        self.assertEqual(0, self.counters()[DEFERRED_KEY])
         self.assertEqual(1, self.counters()[PROBES_KEY])
 
         self.clock.now = NOW + OBSERVATION_WINDOW + 1
 
+        # Once that window ends, the untouched legacy rows fall back to their
+        # own stored deadlines, and only the confirmed cooldown one is still
+        # in the future.
         self.assertEqual(1, self.counters()[DEFERRED_KEY])
 
     def test_deleting_a_deferred_package_drops_the_gauge(self):
@@ -705,13 +708,14 @@ class CrypterEventLedgerTests(CrypterStatisticsTestCase):
             self.report_clear(PACKAGE_A)
             self.assertEqual("deleted", self.service.delete_deferred_package(PACKAGE_B))
 
-        self.assertIsNone(self.state.get_db("crypter_cooldowns").retrieve(CRYPTER))
+        stored = json.loads(self.state.get_db("crypter_cooldowns").retrieve(CRYPTER))
+        self.assertEqual("healthy", stored["state"])
         self.assertEqual(
             {
                 OBSERVATIONS_KEY: 3,
                 COOLDOWNS_KEY: 1,
                 PROBES_KEY: 0,
-                DEFERRED_KEY: 1,
+                DEFERRED_KEY: 0,
             },
             self.counters(),
         )

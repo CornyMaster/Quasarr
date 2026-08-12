@@ -12,9 +12,10 @@ from bottle import Bottle
 
 from quasarr.api import get_api
 from quasarr.api.config import setup_config
-from quasarr.api.sponsors_helper import (
+from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
+from quasarr.api.sponsors_helper.cohort_protocol import (
     CRYPTER_DEFER_CAPABILITY,
-    setup_sponsors_helper_routes,
+    FILECRYPT_COHORT_CAPABILITY,
 )
 from quasarr.constants import CRYPTER_BLOCK_SETTINGS_TABLE
 from quasarr.downloads.packages import get_packages
@@ -350,6 +351,103 @@ class CrypterBlockRouteTests(unittest.TestCase):
             result,
         )
         shared_state.get_db.assert_not_called()
+
+
+class CohortBlockModeTests(unittest.TestCase):
+    """`fail` must stay a pure bypass for the cohort path as well: no offer,
+    no decision row, and no cooldown read at all."""
+
+    COHORT_CAPABILITIES = [CRYPTER_DEFER_CAPABILITY, FILECRYPT_COHORT_CAPABILITY]
+
+    def setUp(self):
+        self.clock = lambda: NOW
+        self.state = BlockModeSharedState(mode="fail")
+        protected = self.state.databases["protected"]
+        for index, package_id in enumerate((PACKAGE_ID, ALTERNATIVE_PACKAGE_ID)):
+            protected.update_store(
+                package_id,
+                protected_blob(
+                    f"Cohort.Member.{index}",
+                    [[f"https://filecrypt.invalid/container/{index}", "filecrypt"]],
+                ),
+            )
+
+    def call(self, rule, payload):
+        app = Bottle()
+        setup_sponsors_helper_routes(app)
+        route = next(route for route in app.routes if route.rule == rule)
+        built = []
+
+        def build_service(shared_state):
+            built.append(shared_state)
+            return CrypterCooldownService(shared_state, clock=self.clock)
+
+        with (
+            mock.patch("quasarr.api.sponsors_helper.shared_state", self.state),
+            mock.patch("quasarr.api.sponsors_helper.request", mock.Mock(json=payload)),
+            mock.patch(
+                "quasarr.api.sponsors_helper.CrypterCooldownService", build_service
+            ),
+        ):
+            return route.callback(), built
+
+    def test_the_cohort_path_only_opens_a_sweep_in_defer_mode(self):
+        payload = {
+            "supported_urls": list(HELPER_URLS),
+            "capabilities": self.COHORT_CAPABILITIES,
+        }
+
+        bypassed, built = self.call("/sponsors_helper/api/to_decrypt/", payload)
+
+        self.assertNotIn("crypter_offer", bypassed["to_decrypt"])
+        self.assertIn("terminal_operation_id", bypassed["to_decrypt"])
+        self.assertEqual([], built)
+        self.assertEqual({}, self.state.databases["crypter_cooldowns"].rows)
+
+        self.state.values["crypter_block_mode"] = "defer"
+        offered, _ = self.call("/sponsors_helper/api/to_decrypt/", payload)
+
+        self.assertEqual(
+            FILECRYPT_COHORT_CAPABILITY,
+            offered["to_decrypt"]["crypter_offer"]["capability"],
+        )
+        self.assertEqual("sweep", offered["to_decrypt"]["crypter_offer"]["mode"])
+        self.assertIn("filecrypt", self.state.databases["crypter_cooldowns"].rows)
+
+    def test_a_cohort_defer_report_in_fail_mode_reads_no_state(self):
+        self.state.get_db = mock.Mock(
+            side_effect=AssertionError("fail mode must not access cooldown state")
+        )
+
+        response, built = self.call(
+            "/sponsors_helper/api/defer/",
+            {
+                "package_id": PACKAGE_ID,
+                "crypter": "filecrypt",
+                "reason_code": REASON,
+                "link_fingerprint": "b" * 64,
+                "sweep_id": "a" * 32,
+                "offer_id": "c" * 32,
+            },
+        )
+
+        self.assertEqual(
+            {
+                "success": True,
+                "instruction": "legacy_failure",
+                "state": "available",
+                "hold_type": "none",
+                "evidence_count": 0,
+                "retry_after_epoch": 0,
+                "sweep_id": "",
+                "sweep_tested": 0,
+                "sweep_total": 0,
+                "sweep_deadline_epoch": 0,
+            },
+            response,
+        )
+        self.assertEqual([], built)
+        self.state.get_db.assert_not_called()
 
 
 class CapturingServer:

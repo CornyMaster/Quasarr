@@ -13,7 +13,14 @@ from quasarr.api.sponsors_helper import (
     setup_sponsors_helper_routes,
 )
 from quasarr.providers.auth import audit_route_auth_modes
-from quasarr.providers.crypter_cooldowns import CrypterCooldownService
+from quasarr.providers.crypter_candidates import (
+    enumerate_filecrypt_candidates,
+    link_fingerprint,
+)
+from quasarr.providers.crypter_cooldowns import (
+    CrypterCooldownService,
+    CrypterProjection,
+)
 
 PACKAGE_A = "Quasarr_movies_00000000000000000000000000000000"
 PACKAGE_B = "Quasarr_movies_11111111111111111111111111111111"
@@ -58,6 +65,8 @@ class FakeCooldownService:
         self.package_defers = package_defers or {}
         self.failed_probe_consumptions = set(failed_probe_consumptions)
         self.probe_consumptions = []
+        self.projections = []
+        self.projected_decisions = []
 
     def snapshot(self, crypter):
         cooling = crypter in self.cooling_crypters
@@ -74,10 +83,15 @@ class FakeCooldownService:
     def is_cooling(self, crypter):
         return crypter in self.cooling_crypters
 
+    def crypter_projection(self, crypter):
+        self.projections.append(crypter)
+        return CrypterProjection(self.snapshot(crypter), None)
+
     def get_package_defer(self, package_id):
         return self.package_defers.get(package_id)
 
-    def project_package_defer(self, deferred, snapshot):
+    def project_package_defer(self, deferred, snapshot, decision_snapshot=None):
+        self.projected_decisions.append(decision_snapshot)
         crypter_retry_after = (
             snapshot["retry_after_epoch"] if snapshot["state"] == "cooldown" else 0
         )
@@ -618,6 +632,7 @@ class SponsorsHelperApiTests(unittest.TestCase):
         original = state.databases["protected"].rows[PACKAGE_A]
         service = mock.Mock()
         service.get_package_defer.return_value = None
+        service.crypter_decision.return_value = None
         service.observe.return_value = {
             "state": "observing",
             "evidence_count": 1,
@@ -1680,6 +1695,106 @@ class SponsorsHelperApiTests(unittest.TestCase):
             },
             result,
         )
+
+
+class CoherentDeferProjectionTests(unittest.TestCase):
+    """Capable selection must read the live decision, not a stored timestamp."""
+
+    FILECRYPT_URLS = tuple(
+        f"https://filecrypt.invalid/container/{index}" for index in range(1, 6)
+    )
+
+    def setUp(self):
+        rows = {
+            f"Quasarr_movies_{index:032x}": json.dumps(
+                {
+                    "title": f"Cohort.Member.{index}",
+                    "password": "",
+                    "links": [[self.FILECRYPT_URLS[index - 1], "filecrypt"]],
+                }
+            )
+            for index in range(1, 6)
+        }
+        self.state = AtomicSharedState(rows)
+        self.state.values["crypter_block_mode"] = "defer"
+        self.service = CrypterCooldownService(self.state, clock=lambda: NOW)
+        self.identities = iter(f"{index:032x}" for index in range(1, 500))
+        patcher = mock.patch.object(
+            CrypterCooldownService,
+            "_new_identifier",
+            lambda _self: next(self.identities),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.rows = [[key, value] for key, value in sorted(rows.items())]
+
+    def hold_one_member(self):
+        inventory = enumerate_filecrypt_candidates(self.rows)
+        offer = self.service.prepare_offer("filecrypt", inventory)
+        owner = next(
+            candidate.occurrences[0].package_id
+            for candidate in inventory.candidates
+            if candidate.fingerprint == offer["link_fingerprint"]
+        )
+        self.service.record_cohort_blocked(
+            "filecrypt",
+            owner,
+            offer["link_fingerprint"],
+            offer["sweep_id"],
+            offer["offer_id"],
+            "ip_block_suspected",
+            inventory,
+        )
+        return owner, offer["link_fingerprint"]
+
+    def test_a_generation_hold_suppresses_its_link_at_the_helper_boundary(self):
+        owner, held = self.hold_one_member()
+        others = [row[0] for row in self.rows if row[0] != owner]
+
+        selected = select_helper_package(
+            self.rows,
+            ["filecrypt."],
+            cooldown_service=self.service,
+            excluded_package_ids=others,
+            enforce_package_contract=True,
+        )
+
+        self.assertIsNone(selected)
+        self.assertNotEqual([], self.rows)
+        self.assertEqual(
+            [held],
+            [
+                link_fingerprint("filecrypt", link[0])
+                for link in json.loads(self.state.databases["protected"].rows[owner])[
+                    "links"
+                ]
+            ],
+        )
+
+    def test_the_held_package_is_skipped_only_for_the_tested_fingerprint(self):
+        owner, _held = self.hold_one_member()
+        alternative = ["https://tolink.invalid/alternative", "tolink"]
+        package = json.loads(self.state.databases["protected"].rows[owner])
+        package["links"].append(alternative)
+        self.state.databases["protected"].rows[owner] = json.dumps(package)
+        rows = [
+            [key, value]
+            for key, value in sorted(self.state.databases["protected"].rows.items())
+        ]
+        others = [row[0] for row in rows if row[0] != owner]
+
+        selected = select_helper_package(
+            rows,
+            ["filecrypt.", "tolink."],
+            cooldown_service=self.service,
+            excluded_package_ids=others,
+            enforce_package_contract=True,
+        )
+
+        self.assertIsNotNone(selected)
+        package_id, _data, links = selected
+        self.assertEqual(owner, package_id)
+        self.assertEqual([alternative], links)
 
 
 if __name__ == "__main__":
