@@ -239,6 +239,12 @@ def javascript_function_body(source, name):
     raise AssertionError(f"unbalanced braces in {name}")
 
 
+def javascript_function_source(source, name):
+    start = source.index(f"function {name}(")
+    body = javascript_function_body(source, name)
+    return source[start : source.index(body, start) + len(body) + 1]
+
+
 REFRESH_SELECTION_STEPS = (
     ("snapshot", re.compile(r"const (\w+) = selectedDeferredPackageIds\(\);")),
     ("replace", re.compile(r"container\.innerHTML = (html);")),
@@ -255,6 +261,211 @@ def refresh_selection_steps(body):
         found.append((match.start(), name, match.group(1)))
     found.sort()
     return [(name, argument) for _, name, argument in found]
+
+
+JS_STRING_LITERAL = re.compile(r"""^('[^']*'|"[^"]*")$""")
+QUERY_SELECTOR_CALL = re.compile(r"\bquerySelector(All)?\s*\(")
+
+
+def _call_argument(source, opening):
+    depth = 0
+    quote = None
+    index = opening
+    while index < len(source):
+        character = source[index]
+        if quote is not None:
+            if character == "\\":
+                index += 1
+            elif character == quote:
+                quote = None
+        elif character in "'\"`":
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return source[opening + 1 : index]
+        index += 1
+    raise AssertionError("unbalanced call around offset {0}".format(opening))
+
+
+def query_selector_calls(source):
+    """Every `querySelector` and `querySelectorAll` argument in `source`.
+
+    Arguments are read with quote and paren awareness so a literal such as
+    `':not(#id)'` is captured whole instead of being truncated into a false
+    positive.
+    """
+    calls = []
+    for match in QUERY_SELECTOR_CALL.finditer(source):
+        name = "querySelectorAll" if match.group(1) else "querySelector"
+        calls.append((name, _call_argument(source, match.end() - 1).strip()))
+    return calls
+
+
+def built_selector_arguments(source):
+    return [
+        (name, argument)
+        for name, argument in query_selector_calls(source)
+        if not JS_STRING_LITERAL.match(argument)
+    ]
+
+
+RESTORE_SIGNATURE = re.compile(r"function restoreDeferredSelection\(([^)]*)\)")
+SET_FROM_IDENTIFIER = re.compile(
+    r"const\s+(\w+)\s*=\s*new\s+Set\(\s*([A-Za-z_$][\w$]*)\s*\)\s*;"
+)
+RESTORE_ITERATION = re.compile(
+    r"document\.querySelector(?:All)?\((.*?)\)\.forEach\("
+    r"\s*\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>"
+)
+GUARDED_CHECK = re.compile(
+    r"if\s*\(\s*(\w+)\.has\(\s*([A-Za-z_$][\w$]*)\.(\w+)\s*\)\s*\)\s*"
+    r"([A-Za-z_$][\w$]*)\.checked\s*=\s*(\w+)\s*;"
+)
+CHECKED_ASSIGNMENT = re.compile(r"\.checked\s*=")
+SNAPSHOT_PROPERTY = re.compile(r"=>\s*([A-Za-z_$][\w$]*)\.(\w+)")
+
+
+def selection_snapshot_property(page):
+    body = javascript_function_body(page, "selectedDeferredPackageIds")
+    match = SNAPSHOT_PROPERTY.search(body)
+    if match is None:
+        raise AssertionError("selectedDeferredPackageIds reads no checkbox property")
+    return match.group(2)
+
+
+def restore_selection_contract(source, package_id_property):
+    """Structure of the shipped `restoreDeferredSelection` helper.
+
+    Raises `AssertionError` for any helper that would not re-check exactly the
+    snapshotted values, so a mutated copy of the shipped source can be asserted
+    to be rejected. This is static analysis of the shipped text; it does not
+    execute JavaScript.
+    """
+    signature = RESTORE_SIGNATURE.search(source)
+    if signature is None:
+        raise AssertionError("no restoreDeferredSelection(...) helper is shipped")
+    parameters = [
+        name.strip() for name in signature.group(1).split(",") if name.strip()
+    ]
+    if len(parameters) != 1:
+        raise AssertionError(
+            f"restoreDeferredSelection takes {parameters}, want exactly one parameter"
+        )
+    body = javascript_function_body(source, "restoreDeferredSelection")
+
+    membership = SET_FROM_IDENTIFIER.search(body)
+    if membership is None:
+        raise AssertionError("the helper builds no `const <name> = new Set(<name>);`")
+    if membership.group(2) != parameters[0]:
+        raise AssertionError(
+            f"the membership set is built from {membership.group(2)!r}, "
+            f"not from the parameter {parameters[0]!r}"
+        )
+
+    iteration = RESTORE_ITERATION.search(body)
+    if iteration is None:
+        raise AssertionError(
+            "the helper iterates no document.querySelector(All) result"
+        )
+    selector = iteration.group(1).strip()
+    if not JS_STRING_LITERAL.match(selector):
+        raise AssertionError(f"selector {selector!r} is not a quoted literal")
+
+    guard = GUARDED_CHECK.search(body)
+    if guard is None:
+        raise AssertionError(
+            "the helper has no `if (<set>.has(<checkbox>.<property>)) "
+            "<checkbox>.checked = <value>;`"
+        )
+    set_name, tested, property_name, assigned, value = guard.groups()
+    if set_name != membership.group(1):
+        raise AssertionError(
+            f"membership is tested on {set_name!r}, not on the set built from the "
+            f"parameter ({membership.group(1)!r})"
+        )
+    if tested != iteration.group(2) or assigned != iteration.group(2):
+        raise AssertionError(
+            "the guard and the assignment must both use the iterated checkbox "
+            f"({iteration.group(2)!r})"
+        )
+    if property_name != package_id_property:
+        raise AssertionError(
+            f"membership is tested on {property_name!r}, not on the property the "
+            f"snapshot reads ({package_id_property!r})"
+        )
+    if value != "true":
+        raise AssertionError(f"the restore assigns {value!r} instead of true")
+    if len(CHECKED_ASSIGNMENT.findall(body)) != 1:
+        raise AssertionError("the helper writes `checked` outside the membership guard")
+    if not membership.start() < iteration.start() < guard.start():
+        raise AssertionError("the set must be built before the checkboxes are visited")
+
+    return SimpleNamespace(
+        parameter=parameters[0],
+        set_name=set_name,
+        selector=selector[1:-1],
+        checkbox=iteration.group(2),
+        property_name=property_name,
+    )
+
+
+# Each entry mutates the *shipped* helper text, so the contract above is proven
+# to reject the weakenings that the outcome replay alone stays green for.
+RESTORE_MUTATIONS = (
+    ("set ignores the parameter", "new Set(packageIds)", "new Set()"),
+    ("set built from a constant", "new Set(packageIds)", "new Set(['x'])"),
+    (
+        "parameter renamed away from the set",
+        "restoreDeferredSelection(packageIds)",
+        "restoreDeferredSelection(ignored)",
+    ),
+    (
+        "membership tested on the whole list",
+        "selected.has(checkbox.value)",
+        "selected.has(packageIds)",
+    ),
+    ("membership tested on the wrong property", "checkbox.value", "checkbox.name"),
+    (
+        "selector built from a package value",
+        "'.deferred-package-select'",
+        "'[value=\"' + packageIds[0] + '\"]'",
+    ),
+    (
+        "restore no longer guarded",
+        "if (selected.has(checkbox.value)) checkbox.checked = true;",
+        "checkbox.checked = true;",
+    ),
+    (
+        "extra unguarded restore",
+        "checkbox.checked = true;",
+        "checkbox.checked = true; if (checkbox) checkbox.checked = true;",
+    ),
+)
+
+SELECTOR_AUDIT_FIXTURES = (
+    ("singular literal", "document.querySelector('.status-message');", True),
+    ("plural literal", 'document.querySelectorAll(".deferred-package-select");', True),
+    ("literal with parentheses", "form.querySelectorAll('input:not(#url)');", True),
+    (
+        "singular concatenation",
+        "document.querySelector('[value=\"' + packageId + '\"]');",
+        False,
+    ),
+    (
+        "plural concatenation",
+        "document.querySelectorAll('[value=' + packageId + ']');",
+        False,
+    ),
+    (
+        "singular template literal",
+        'document.querySelector(`[value="${packageId}"]`);',
+        False,
+    ),
+    ("plural variable", "document.querySelectorAll(selector);", False),
+)
 
 
 class DeferredPackagesRenderingTests(unittest.TestCase):
@@ -476,20 +687,54 @@ class DeferredSelectionRefreshTests(unittest.TestCase):
 
     def test_selection_restore_matches_values_without_building_selectors(self):
         page = render_packages_page()
-        restore = javascript_function_body(page, "restoreDeferredSelection")
+        snapshot_property = selection_snapshot_property(page)
+        contract = restore_selection_contract(page, snapshot_property)
 
-        self.assertIn("new Set(", restore)
-        self.assertIn("'.deferred-package-select'", restore)
-        self.assertLess(
-            restore.index("selected.has(checkbox.value)"),
-            restore.index("checkbox.checked = true"),
+        self.assertEqual("value", snapshot_property)
+        self.assertEqual(".deferred-package-select", contract.selector)
+        # The pinned literal is the class the server actually renders, so the
+        # restore cannot silently drift away from the markup it must match.
+        self.assertIn(
+            f'class="{contract.selector.lstrip(".")}"',
+            render_deferred_fragment([PACKAGE_A]),
         )
 
-        for argument in re.findall(r"querySelectorAll?\(([^)]*)\)", page):
-            with self.subTest(selector=argument):
-                # A quoted literal cannot carry a concatenation or a template
-                # placeholder, so no package value can reach a query.
-                self.assertRegex(argument.strip(), r"""^('[^']*'|"[^"]*")$""")
+        calls = query_selector_calls(page)
+        self.assertEqual([], built_selector_arguments(page))
+        # A quoted literal cannot carry a concatenation or a template
+        # placeholder, so no package value can reach a query — and the audit
+        # must cover the singular call form too, which this page also ships.
+        self.assertIn("querySelector", {name for name, _ in calls})
+        self.assertIn("querySelectorAll", {name for name, _ in calls})
+
+    def test_restore_helper_contract_rejects_weakened_variants(self):
+        page = render_packages_page()
+        snapshot_property = selection_snapshot_property(page)
+        helper = javascript_function_source(page, "restoreDeferredSelection")
+        restore_selection_contract(helper, snapshot_property)
+
+        for label, original, replacement in RESTORE_MUTATIONS:
+            with self.subTest(mutation=label):
+                self.assertIn(original, helper)
+                with self.assertRaises(AssertionError):
+                    restore_selection_contract(
+                        helper.replace(original, replacement), snapshot_property
+                    )
+
+    def test_selector_audit_reads_both_call_forms_and_rejects_built_selectors(self):
+        for label, snippet, is_literal in SELECTOR_AUDIT_FIXTURES:
+            with self.subTest(fixture=label):
+                self.assertEqual(1, len(query_selector_calls(snippet)))
+                self.assertEqual(is_literal, not built_selector_arguments(snippet))
+
+        self.assertEqual(
+            {"querySelector", "querySelectorAll"},
+            {
+                name
+                for _, snippet, _ in SELECTOR_AUDIT_FIXTURES
+                for name, _ in query_selector_calls(snippet)
+            },
+        )
 
 
 class DeferredPackagesRouteTests(unittest.TestCase):
