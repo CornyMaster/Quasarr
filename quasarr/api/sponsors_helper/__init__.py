@@ -23,7 +23,12 @@ from quasarr.api.sponsors_helper.cohort_protocol import (
 )
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.downloads import (
+    SUBMIT_PHASE_SUBMIT,
     fail,
+    failed_package_present,
+    finalize_protected_removal,
+    jdownloader_holds_package,
+    project_final_download_urls,
     resolve_protected_crypter_key,
     submit_final_download_urls,
 )
@@ -48,6 +53,12 @@ from quasarr.providers.log import debug, info, warn
 from quasarr.providers.notifications import update_release_notification
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
 from quasarr.providers.statistics import StatsHelper
+from quasarr.providers.terminal_operations import (
+    CAPACITY,
+    CONFLICT,
+    OPENED,
+    TerminalOperationService,
+)
 from quasarr.storage.categories import (
     get_download_category_from_package_id,
     get_download_category_mirrors,
@@ -414,6 +425,37 @@ def select_helper_package(
 
 
 def setup_sponsors_helper_routes(app):
+    def begin_terminal_operation(data, terminal_state):
+        carries_version = "protocol_version" in data
+        carries_operation = "terminal_operation_id" in data
+        if not carries_version and not carries_operation:
+            return None
+        if type(data.get("protocol_version")) is not int:
+            return abort(400, "Invalid terminal protocol version")
+        if data["protocol_version"] != 2:
+            return abort(400, "Invalid terminal protocol version")
+
+        package_id = data.get("package_id")
+        if not isinstance(package_id, str) or not package_id:
+            return abort(400, "Missing or invalid 'package_id'")
+
+        operation_id = data.get("terminal_operation_id")
+        service = TerminalOperationService(shared_state)
+        try:
+            opened = service.begin(operation_id, package_id, terminal_state)
+        except ValueError:
+            return abort(400, "Invalid terminal operation identity")
+        if opened["outcome"] == CONFLICT:
+            return abort(409, "Terminal operation identity conflict")
+        if opened["outcome"] == CAPACITY:
+            return abort(503, "Terminal operation capacity exhausted")
+        return {
+            "service": service,
+            "operation_id": operation_id,
+            "outcome": opened["outcome"],
+            "record": opened["record"],
+        }
+
     def filecrypt_inventory(protected_rows=None):
         """The bounded Filecrypt inventory, or None when it cannot be proven.
 
@@ -569,6 +611,213 @@ def setup_sponsors_helper_routes(app):
             "failed": True,
             "reason": reason,
         }
+
+    def terminal_response(record):
+        terminal_state = record["terminal_state"]
+        package_removed = record["package_removed"]
+        package_terminal = record["package_terminal"]
+        return {
+            "success": package_terminal
+            and (package_removed or terminal_state == "disabled"),
+            "terminal_state": terminal_state,
+            "package_removed": package_removed,
+            "package_terminal": package_terminal,
+            "package_id": record["package_id"],
+        }
+
+    def unconfirmed_terminal_response(context):
+        return terminal_response(
+            {
+                **context["record"],
+                "package_removed": False,
+                "package_terminal": False,
+            }
+        )
+
+    def mark_terminal_submitted(context):
+        result = context["service"].mark_submitted(
+            context["operation_id"],
+            context["record"]["package_id"],
+            context["record"]["terminal_state"],
+        )
+        if result["outcome"] == CONFLICT:
+            return abort(409, "Terminal operation identity conflict")
+        context["record"] = result["record"]
+
+    def complete_terminal(context, *, package_removed, package_terminal):
+        result = context["service"].mark_complete(
+            context["operation_id"],
+            context["record"]["package_id"],
+            context["record"]["terminal_state"],
+            package_removed=package_removed,
+            package_terminal=package_terminal,
+        )
+        if result["outcome"] == CONFLICT:
+            return abort(409, "Terminal operation identity conflict")
+        context["record"] = result["record"]
+        return terminal_response(context["record"])
+
+    def record_helper_terminal_failure(package_id, title, reason):
+        persisted = failed_package_present(shared_state, package_id)
+        if persisted is None:
+            return False
+        if not persisted:
+            StatsHelper(shared_state).increment_failed_decryptions_automatic()
+            mark_helper_package_failed(package_id, title, reason)
+            persisted = failed_package_present(shared_state, package_id)
+        return persisted is True
+
+    def projected_final_download_links(download_links, package_id):
+        return project_final_download_urls(download_links, package_id)[2]["urls"]
+
+    def confirm_terminal_download(
+        context, title, package_id, download_links, password, notification
+    ):
+        if context["record"]["state"] == "complete":
+            return terminal_response(context["record"])
+
+        final_links = None
+        if context["record"]["state"] == "prepared":
+            persisted_failure = failed_package_present(shared_state, package_id)
+            if persisted_failure is None:
+                return unconfirmed_terminal_response(context)
+
+            submit = context["outcome"] == OPENED
+            if persisted_failure:
+                mark_terminal_submitted(context)
+            else:
+                if not submit:
+                    already_submitted = jdownloader_holds_package(
+                        shared_state, package_id
+                    )
+                    if already_submitted is None:
+                        return unconfirmed_terminal_response(context)
+                    submit = not already_submitted
+
+                if submit and (
+                    not isinstance(download_links, list) or not download_links
+                ):
+                    reason = (
+                        "SponsorsHelper returned an invalid download payload."
+                        if not isinstance(download_links, list)
+                        else "SponsorsHelper returned no final download links."
+                    )
+                    if not record_helper_terminal_failure(package_id, title, reason):
+                        return unconfirmed_terminal_response(context)
+                    mark_terminal_submitted(context)
+                elif submit:
+                    submit_result = submit_final_download_urls(
+                        shared_state,
+                        download_links,
+                        title,
+                        password,
+                        package_id,
+                        remove_protected=True,
+                        notification_details=notification,
+                        phase=SUBMIT_PHASE_SUBMIT,
+                    )
+                    if submit_result["success"]:
+                        final_links = submit_result["links"]
+                        mark_terminal_submitted(context)
+                    elif submit_result.get("persisted_failure"):
+                        StatsHelper(
+                            shared_state
+                        ).increment_failed_decryptions_automatic()
+                        if failed_package_present(shared_state, package_id) is not True:
+                            return unconfirmed_terminal_response(context)
+                        mark_terminal_submitted(context)
+                    else:
+                        return unconfirmed_terminal_response(context)
+                else:
+                    mark_terminal_submitted(context)
+
+        persisted_failure = failed_package_present(shared_state, package_id)
+        if persisted_failure is None:
+            return unconfirmed_terminal_response(context)
+        removal = finalize_protected_removal(
+            shared_state,
+            package_id,
+            notification,
+            notify_solved=not persisted_failure,
+        )
+        if not removal["package_removed"]:
+            return unconfirmed_terminal_response(context)
+
+        if not persisted_failure and removal["removed_now"]:
+            if final_links is None:
+                final_links = projected_final_download_links(download_links, package_id)
+            StatsHelper(shared_state).increment_package_with_links(final_links)
+            StatsHelper(shared_state).increment_captcha_decryptions_automatic()
+        return complete_terminal(context, package_removed=True, package_terminal=True)
+
+    def confirm_terminal_failure(context, package_id, title, reason):
+        if context["record"]["state"] == "complete":
+            return terminal_response(context["record"])
+
+        if context["record"]["state"] == "prepared":
+            if not record_helper_terminal_failure(package_id, title, reason):
+                return unconfirmed_terminal_response(context)
+            mark_terminal_submitted(context)
+
+        removal = finalize_protected_removal(
+            shared_state, package_id, notify_solved=False
+        )
+        if not removal["package_removed"]:
+            return unconfirmed_terminal_response(context)
+        return complete_terminal(context, package_removed=True, package_terminal=True)
+
+    def read_protected_package(package_id):
+        try:
+            raw = shared_state.get_db("protected").retrieve(package_id)
+        except Exception:
+            return None, None
+        if raw is None:
+            return False, None
+        try:
+            package_data = json.loads(raw)
+        except (TypeError, ValueError, RecursionError):
+            package_data = None
+        return True, package_data
+
+    def confirm_terminal_disable(context, package_id, reason):
+        if context["record"]["state"] == "complete":
+            return terminal_response(context["record"])
+
+        if context["record"]["state"] == "prepared":
+            present, package_data = read_protected_package(package_id)
+            if present is None:
+                return unconfirmed_terminal_response(context)
+            if present and not (
+                isinstance(package_data, dict) and package_data.get("disabled") is True
+            ):
+                if not isinstance(package_data, dict):
+                    return unconfirmed_terminal_response(context)
+                package_data["disabled"] = True
+                shared_state.get_db("protected").update_store(
+                    package_id, json.dumps(package_data)
+                )
+                StatsHelper(shared_state).increment_failed_decryptions_automatic()
+                StatsHelper(shared_state).increment_captcha_decryptions_automatic()
+                update_release_notification(
+                    shared_state,
+                    package_data,
+                    NotificationType.DISABLED,
+                    details={"reason": reason} if reason else None,
+                )
+            mark_terminal_submitted(context)
+
+        present, package_data = read_protected_package(package_id)
+        if present is None:
+            return unconfirmed_terminal_response(context)
+        if present is False:
+            return complete_terminal(
+                context, package_removed=True, package_terminal=True
+            )
+        if isinstance(package_data, dict) and package_data.get("disabled") is True:
+            return complete_terminal(
+                context, package_removed=False, package_terminal=True
+            )
+        return unconfirmed_terminal_response(context)
 
     @app.get("/sponsors_helper/api/ping/")
     @require_api_key
@@ -884,6 +1133,7 @@ def setup_sponsors_helper_routes(app):
     @require_api_key
     @require_helper_active
     def download_api():
+        terminal = None
         try:
             data = request.json or {}
             if not isinstance(data, dict):
@@ -900,8 +1150,18 @@ def setup_sponsors_helper_routes(app):
                 return abort(400, "Missing or invalid 'notification.solvers' list")
             if not package_id:
                 return abort(400, "Missing or invalid 'package_id'")
+            terminal = begin_terminal_operation(data, "downloaded")
             if not title:
                 title = "Unknown"
+            if terminal is not None:
+                return confirm_terminal_download(
+                    terminal,
+                    title,
+                    package_id,
+                    download_links,
+                    password,
+                    notification,
+                )
             if not isinstance(download_links, list):
                 StatsHelper(shared_state).increment_failed_decryptions_automatic()
                 return mark_helper_package_failed(
@@ -965,8 +1225,12 @@ def setup_sponsors_helper_routes(app):
                     "SponsorsHelper returned no final download links.",
                 )
 
+        except HTTPResponse:
+            raise
         except Exception as e:
             info(f"Error decrypting: {e}")
+            if terminal is not None:
+                return abort(500, "Failed")
 
         StatsHelper(shared_state).increment_failed_decryptions_automatic()
         return abort(500, "Failed")
@@ -975,6 +1239,7 @@ def setup_sponsors_helper_routes(app):
     @require_api_key
     @require_helper_active
     def disable_api():
+        terminal = None
         try:
             data = request.json or {}
             if not isinstance(data, dict):
@@ -985,6 +1250,9 @@ def setup_sponsors_helper_routes(app):
             if not package_id:
                 return {"error": "Missing package_id"}, 400
 
+            terminal = begin_terminal_operation(data, "disabled")
+            if terminal is not None:
+                return confirm_terminal_disable(terminal, package_id, reason)
             StatsHelper(shared_state).increment_failed_decryptions_automatic()
 
             blob = shared_state.get_db("protected").retrieve(package_id)
@@ -1011,18 +1279,24 @@ def setup_sponsors_helper_routes(app):
 
             return f"Package <y>{title}</y> disabled"
 
+        except HTTPResponse:
+            raise
         except Exception as e:
             info(f"Error handling disable: {e}")
+            if terminal is not None:
+                return abort(500, "Failed")
             return {"error": str(e)}, 500
 
     @app.delete("/sponsors_helper/api/fail/")
     @require_api_key
     @require_helper_active
     def fail_api():
+        terminal = None
         try:
-            StatsHelper(shared_state).increment_failed_decryptions_automatic()
-
             data = request.json or {}
+            if not isinstance(data, dict):
+                return abort(400, "Missing or invalid JSON object")
+            terminal = begin_terminal_operation(data, "failed")
             package_id = data.get("package_id")
             # SponsorsHelper might send 'name' or 'title'
             title = data.get("name") or data.get("title")
@@ -1030,6 +1304,12 @@ def setup_sponsors_helper_routes(app):
                 data,
                 default_reason="Too many failed attempts by SponsorsHelper",
             )
+            if terminal is not None:
+                return confirm_terminal_failure(
+                    terminal, package_id, title or "Unknown", reason
+                )
+
+            StatsHelper(shared_state).increment_failed_decryptions_automatic()
 
             # 1. Try to find package in Protected DB if ID is missing but Title exists
             if not package_id and title:
@@ -1107,8 +1387,12 @@ def setup_sponsors_helper_routes(app):
                     return f"Package <y>{title}</y> processed."
             else:
                 return abort(400, "Missing package_id")
+        except HTTPResponse:
+            raise
         except Exception as e:
             info(f"Error moving to failed: {e}")
+            if terminal is not None:
+                return abort(500, "Failed")
 
         return abort(500, "Failed")
 

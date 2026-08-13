@@ -2,6 +2,8 @@
 # Quasarr
 # Project by https://github.com/rix1337
 
+from html import escape
+
 import quasarr.providers.html_images as images
 from quasarr.providers.html_templates import render_button, render_centered_html
 from quasarr.providers.statistics import StatsHelper
@@ -12,6 +14,8 @@ def setup_statistics(app, shared_state):
     def statistics():
         stats_helper = StatsHelper(shared_state)
         stats = stats_helper.get_stats()
+        cohort_state = escape(str(stats["crypter_sweep_state"]))
+        individual_mode = escape(str(stats["crypter_individual_mode"] or "None"))
 
         stats_html = f"""
         <h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
@@ -91,6 +95,50 @@ def setup_statistics(app, shared_state):
                     <h3>🕒 Deferred Packages</h3>
                     <div class="stat-value">{stats["deferred_packages"]:,}</div>
                     <div class="stat-subtitle">Currently waiting</div>
+                </div>
+            </div>
+
+            <h3>Filecrypt cohort</h3>
+            <div class="stats-grid compact">
+                <div class="stat-card">
+                    <h3>State</h3>
+                    <div class="stat-value">{cohort_state}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Tested</h3>
+                    <div class="stat-value">{stats["crypter_sweep_tested"]:,} / {stats["crypter_sweep_total"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Deadline</h3>
+                    <div class="stat-value">{stats["crypter_sweep_deadline_epoch"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Cooldowns</h3>
+                    <div class="stat-value">{stats["crypter_cooldown_count"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Retest queue</h3>
+                    <div class="stat-value">{stats["crypter_retest_depth"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Individual mode</h3>
+                    <div class="stat-value">{individual_mode}</div>
+                </div>
+            </div>
+
+            <h3>Terminal operations</h3>
+            <div class="stats-grid compact">
+                <div class="stat-card">
+                    <h3>Prepared</h3>
+                    <div class="stat-value">{stats["terminal_operations_prepared"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Submitted</h3>
+                    <div class="stat-value">{stats["terminal_operations_submitted"]:,}</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Complete</h3>
+                    <div class="stat-value">{stats["terminal_operations_complete"]:,}</div>
                 </div>
             </div>
 

@@ -1758,8 +1758,37 @@ class CrypterCooldownService:
                 "evidence_count": snapshot["evidence_count"],
                 "hold_type": hold_type,
                 "active": hold_type != "none",
+                "cohort_tested": 0,
+                "cohort_total": 0,
+                "cohort_deadline_epoch": 0,
+                "cohort_retest_depth": 0,
             }
         )
+        if deferred.get("schema_version") == 2 and isinstance(decision_snapshot, dict):
+            generation = deferred.get("sweep_id")
+            if generation in {
+                decision_snapshot.get("sweep_id"),
+                decision_snapshot.get("generation_id"),
+            }:
+                state = decision_snapshot.get("state")
+                if state == "sweeping":
+                    deadline = decision_snapshot.get("sweep_deadline_epoch", 0)
+                elif state == "cooldown":
+                    deadline = decision_snapshot.get("retry_after_epoch", 0)
+                elif state in {"healthy", "individual"}:
+                    deadline = decision_snapshot.get("until_epoch", 0)
+                else:
+                    deadline = 0
+                projected.update(
+                    {
+                        "cohort_tested": decision_snapshot.get("sweep_tested", 0),
+                        "cohort_total": decision_snapshot.get("sweep_total", 0),
+                        "cohort_deadline_epoch": deadline,
+                        "cohort_retest_depth": len(
+                            decision_snapshot.get("retest_members", ())
+                        ),
+                    }
+                )
         return projected
 
     def count_active_deferred_packages(self):

@@ -32,6 +32,10 @@ def deferred_block(
     reason_code="ip_block_suspected",
     active=True,
     generation=False,
+    cohort_tested=0,
+    cohort_total=0,
+    cohort_deadline_epoch=0,
+    cohort_retest_depth=0,
 ):
     block = {
         "crypter": crypter,
@@ -44,6 +48,10 @@ def deferred_block(
         "evidence_count": evidence_count,
         "hold_type": hold_type,
         "active": active,
+        "cohort_tested": cohort_tested,
+        "cohort_total": cohort_total,
+        "cohort_deadline_epoch": cohort_deadline_epoch,
+        "cohort_retest_depth": cohort_retest_depth,
     }
     if generation:
         block.update(
@@ -630,6 +638,76 @@ class DeferredPackagesRenderingTests(unittest.TestCase):
         self.assertIn("Generation package", rendered)
         self.assertNotIn(SWEEP_ID, rendered)
         self.assertNotIn(LINK_FINGERPRINT, rendered)
+
+    def test_cohort_cards_show_progress_and_retest_depth_but_no_identifier(self):
+        downloads = {
+            "queue": [
+                queue_item(
+                    PACKAGE_A,
+                    "[Waiting for linkcrypter retry] Cohort package",
+                    deferred_block(
+                        generation=True,
+                        cohort_tested=3,
+                        cohort_total=7,
+                        cohort_deadline_epoch=RETRY_AFTER,
+                        cohort_retest_depth=2,
+                    ),
+                ),
+            ],
+            "history": [],
+        }
+
+        with mock.patch.object(packages_api, "get_packages", return_value=downloads):
+            rendered = packages_api._render_packages_content()
+
+        self.assertIn("<strong>Tested:</strong> 3 / 7", rendered)
+        self.assertIn("<strong>Retest queue:</strong> 2", rendered)
+        self.assertIn(f'data-cohort-deadline-epoch="{RETRY_AFTER}"', rendered)
+        self.assertNotIn(SWEEP_ID, rendered)
+        self.assertNotIn(LINK_FINGERPRINT, rendered)
+
+    def test_a_package_without_cohort_progress_renders_no_progress_row(self):
+        downloads = {
+            "queue": [
+                queue_item(
+                    PACKAGE_A,
+                    "[Waiting for linkcrypter retry] Legacy package",
+                    deferred_block(),
+                ),
+            ],
+            "history": [],
+        }
+
+        with mock.patch.object(packages_api, "get_packages", return_value=downloads):
+            rendered = packages_api._render_packages_content()
+
+        self.assertIn("Deferred linkcrypter checks", rendered)
+        self.assertNotIn("<strong>Tested:</strong>", rendered)
+        self.assertNotIn("data-cohort-deadline-epoch", rendered)
+
+    def test_hostile_cohort_progress_values_never_reach_the_page(self):
+        downloads = {
+            "queue": [
+                queue_item(
+                    PACKAGE_A,
+                    "[Waiting for linkcrypter retry] Hostile package",
+                    deferred_block(
+                        cohort_tested="<script>alert(4)</script>",
+                        cohort_total='"><img src=x>',
+                        cohort_deadline_epoch='" onload="alert(5)',
+                        cohort_retest_depth=None,
+                    ),
+                ),
+            ],
+            "history": [],
+        }
+
+        with mock.patch.object(packages_api, "get_packages", return_value=downloads):
+            rendered = packages_api._render_packages_content()
+
+        self.assertNotIn("<script>alert(4)", rendered)
+        self.assertNotIn("<img src=x", rendered)
+        self.assertNotIn('onload="alert(5)', rendered)
 
     def test_inactive_or_unprojected_packages_use_the_normal_queue(self):
         downloads = {

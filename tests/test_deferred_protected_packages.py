@@ -650,6 +650,10 @@ class DeferredQueueProjectionTests(unittest.TestCase):
                 "evidence_count": 0,
                 "hold_type": "provisional",
                 "active": True,
+                "cohort_tested": 0,
+                "cohort_total": 0,
+                "cohort_deadline_epoch": 0,
+                "cohort_retest_depth": 0,
             },
             item["deferred"],
         )

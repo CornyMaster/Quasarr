@@ -121,6 +121,26 @@ def _render_deferred_queue_item(item):
         retry_after_epoch = max(0, int(deferred.get("retry_after_epoch", 0)))
     except (TypeError, ValueError):
         retry_after_epoch = 0
+    cohort_values = []
+    for field in (
+        "cohort_tested",
+        "cohort_total",
+        "cohort_deadline_epoch",
+        "cohort_retest_depth",
+    ):
+        value = deferred.get(field, 0)
+        cohort_values.append(value if type(value) is int and value >= 0 else 0)
+    cohort_tested, cohort_total, cohort_deadline_epoch, cohort_retest_depth = (
+        cohort_values
+    )
+    cohort_progress = ""
+    cohort_deadline = ""
+    if cohort_total > 0:
+        cohort_progress = f"""
+                <span><strong>Tested:</strong> {cohort_tested} / {cohort_total}</span>
+                <span><strong>Retest queue:</strong> {cohort_retest_depth}</span>"""
+        cohort_deadline = f"""
+                <span>Cohort deadline <strong class="deferred-countdown" data-cohort-deadline-epoch="{cohort_deadline_epoch}">{_format_deferred_countdown(cohort_deadline_epoch)}</strong></span>"""
     probe_label = (
         "Probe queued"
         if deferred.get("probe_requested") is True
@@ -140,10 +160,12 @@ def _render_deferred_queue_item(item):
                 <span><strong>Reason:</strong> {_html(reason_label)}</span>
                 <span><strong>Evidence:</strong> {evidence_count}</span>
                 <span><strong>Package ID:</strong> <code>{package_id_attr}</code></span>
+                {cohort_progress}
             </div>
             <div class="deferred-retry">
                 <span>Retry in <strong class="deferred-countdown" data-retry-after-epoch="{retry_after_epoch}">{_format_deferred_countdown(retry_after_epoch)}</strong></span>
                 <span class="deferred-probe-state">{probe_label}</span>
+                {cohort_deadline}
             </div>
             <div class="package-actions">
                 <a class="btn-small primary-thin" href="/captcha?package_id={package_url_id}">🔓 Solve CAPTCHA</a>

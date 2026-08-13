@@ -4,7 +4,9 @@
 
 """Pure parsing and rendering of the Filecrypt cohort protocol.
 
-Nothing here reads storage, settings, or a clock. A report is classified by
+Nothing here reads storage, settings, or a clock; the terminal operation digest
+is owned by `providers/terminal_operations.py` and only re-exported. A report is
+classified by
 what it carries, not by what the helper claims, and that classification is
 tri-state: a body with no cohort identity field at all is ordinary version-one
 work, a body carrying the complete exact identity is a cohort report, and a
@@ -13,13 +15,18 @@ is its own answer because falling back to the state-changing version-one route
 would let a typo mutate a package hold the helper never meant to touch.
 """
 
-import hashlib
 import re
+
+from quasarr.providers.terminal_operations import (
+    TERMINAL_OPERATION_DOMAIN as TERMINAL_OPERATION_DOMAIN,  # explicit re-export
+)
+from quasarr.providers.terminal_operations import (
+    terminal_operation_id as terminal_operation_id,  # explicit re-export
+)
 
 FILECRYPT_COHORT_CAPABILITY = "filecrypt_cohort_sweep_v1"
 CRYPTER_DEFER_CAPABILITY = "crypter_defer_v1"
 COHORT_CRYPTER = "filecrypt"
-TERMINAL_OPERATION_DOMAIN = "sponsors-helper-terminal-v2"
 
 COHORT_ACCESS_VALUES = frozenset({"clear", "unknown"})
 
@@ -50,17 +57,6 @@ def helper_supports_cohort(payload):
     """Cohort behavior needs both capabilities; the sweep one alone is not enough."""
     advertised = _capabilities(payload)
     return {CRYPTER_DEFER_CAPABILITY, FILECRYPT_COHORT_CAPABILITY} <= advertised
-
-
-def terminal_operation_id(package_id):
-    """The stable terminal operation identity of one package.
-
-    Derived rather than stored so it survives a restart on either side and
-    carries no URL or title. Task 6 owns the terminal endpoints; this is only
-    the value they will later verify.
-    """
-    material = f"{TERMINAL_OPERATION_DOMAIN}\n{package_id}"
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def render_crypter_offer(offer, occurrence):

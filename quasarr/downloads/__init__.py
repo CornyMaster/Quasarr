@@ -37,6 +37,12 @@ from quasarr.storage.categories import (
 
 _PROTECTED_MIRROR_KEYS = frozenset({"junkies"})
 
+# The whole funnel, or only the half that ends at the JDownloader submission.
+# Splitting it lets a caller that has to confirm a terminal package state put a
+# durable marker between the one irreversible step and the cleanup after it.
+SUBMIT_PHASE_ALL = "all"
+SUBMIT_PHASE_SUBMIT = "submit"
+
 # =============================================================================
 # DETERMINISTIC PACKAGE ID GENERATION
 # =============================================================================
@@ -205,6 +211,103 @@ def _format_mirror_token_list(tokens):
     return ", ".join(cleaned) if cleaned else "unknown"
 
 
+def project_final_download_urls(urls, package_id):
+    """Apply the package category's final mirror policy without side effects."""
+    category = get_download_category_from_package_id(package_id)
+    mirrors = get_download_category_mirrors(category, lowercase=True)
+    return category, mirrors, filter_final_download_urls(urls, mirrors)
+
+
+def _protected_package_present(shared_state, package_id):
+    """Whether the protected row exists, or None when that cannot be read."""
+    try:
+        return shared_state.get_db("protected").retrieve(package_id) is not None
+    except Exception as e:
+        info(f'Error reading protected package "{package_id}": {e}')
+        return None
+
+
+def failed_package_present(shared_state, package_id):
+    """Whether failed history exists, or None when that cannot be proven."""
+    try:
+        return shared_state.get_db("failed").retrieve(package_id) is not None
+    except Exception as e:
+        info(f'Error reading failed package "{package_id}": {e}')
+        return None
+
+
+def finalize_protected_removal(
+    shared_state, package_id, notification_details=None, *, notify_solved=True
+):
+    """Remove and verify one protected row, reporting whether this call removed it."""
+    present = _protected_package_present(shared_state, package_id)
+    if present is None:
+        return {"package_removed": False, "removed_now": False}
+    if not present:
+        return {"package_removed": True, "removed_now": False}
+
+    protected_release = _get_protected_release(shared_state, package_id)
+    _delete_protected_package(shared_state, package_id)
+    if _protected_package_present(shared_state, package_id) is not False:
+        return {"package_removed": False, "removed_now": False}
+    if notify_solved and protected_release:
+        update_release_notification(
+            shared_state,
+            protected_release,
+            NotificationType.SOLVED,
+            details=notification_details,
+        )
+    return {"package_removed": True, "removed_now": True}
+
+
+def confirm_protected_removal(shared_state, package_id, notification_details=None):
+    """Prove the protected row of a submitted package is gone, removing it once.
+
+    A delete call is not a proof, so the row is read back and an unreadable
+    store never reports success. Safe to repeat: a package that is already
+    absent counts as removed and sends no second solved notification, because
+    only the call that actually removed the row notifies.
+    """
+    return finalize_protected_removal(shared_state, package_id, notification_details)[
+        "package_removed"
+    ]
+
+
+def jdownloader_holds_package(shared_state, package_id):
+    """Whether JDownloader already carries this package, or None if unprovable.
+
+    An earlier HTTP 200 never proved that a submission was recorded here, so a
+    resumed operation asks JDownloader itself before it may submit again. The
+    package comment is the ID Quasarr submits with; both JDownloader lists are
+    consulted because a package can already have left the linkgrabber. `None`
+    means the answer could not be obtained and never authorizes a second
+    submission.
+    """
+    unknown = object()
+
+    def carries(entries):
+        for entry in entries or ():
+            if isinstance(entry, dict) and entry.get("comment") == package_id:
+                return True
+        return False
+
+    def query(device):
+        if carries(device.linkgrabber.query_packages()):
+            return True
+        if carries(device.linkgrabber.query_links()):
+            return True
+        if carries(device.downloads.query_packages()):
+            return True
+        return carries(device.downloads.query_links())
+
+    held = shared_state.run_device_request(
+        "check whether a package was already submitted",
+        query,
+        default=unknown,
+    )
+    return None if held is unknown else bool(held)
+
+
 def submit_final_download_urls(
     shared_state,
     urls,
@@ -213,6 +316,7 @@ def submit_final_download_urls(
     package_id,
     remove_protected=False,
     notification_details=None,
+    phase=SUBMIT_PHASE_ALL,
 ):
     """
     Final mirror whitelist check before sending direct HTTP links to JDownloader.
@@ -222,9 +326,7 @@ def submit_final_download_urls(
         protected_release = _get_protected_release(shared_state, package_id) or {
             "title": title
         }
-    category = get_download_category_from_package_id(package_id)
-    mirrors = get_download_category_mirrors(category, lowercase=True)
-    filtered = filter_final_download_urls(urls, mirrors)
+    category, mirrors, filtered = project_final_download_urls(urls, package_id)
     final_urls = filtered["urls"]
     dropped = filtered["dropped"]
 
@@ -260,7 +362,7 @@ def submit_final_download_urls(
 
     info(f"Sending {len(final_urls)} direct download links for {title}")
     if download_package(final_urls, title, password, package_id, shared_state):
-        if remove_protected:
+        if remove_protected and phase != SUBMIT_PHASE_SUBMIT:
             _delete_protected_package(shared_state, package_id)
             if protected_release:
                 update_release_notification(

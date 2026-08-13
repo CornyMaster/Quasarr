@@ -11,6 +11,7 @@ from unittest import mock
 from bottle import Bottle, HTTPError
 
 from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
+from quasarr.api.statistics import setup_statistics
 from quasarr.providers import shared_state as provider_shared_state
 from quasarr.providers.crypter_candidates import enumerate_filecrypt_candidates
 from quasarr.providers.crypter_cooldowns import (
@@ -19,6 +20,10 @@ from quasarr.providers.crypter_cooldowns import (
 )
 from quasarr.providers.notifications.helpers.common import build_solved_data
 from quasarr.providers.statistics import StatsHelper
+from quasarr.providers.terminal_operations import (
+    TERMINAL_OPERATION_TABLE,
+    terminal_operation_id,
+)
 from quasarr.storage.sqlite_database import DataBase
 
 PACKAGE_A = "Quasarr_movies_00000000000000000000000000000000"
@@ -29,11 +34,24 @@ CRYPTER = "filecrypt"
 REASON = "ip_block_suspected"
 NOW = 1_700_000_000
 OBSERVATION_WINDOW = 15 * 60
+SWEEP_WINDOW = 15 * 60
 COOLDOWN_SECONDS = 24 * 60 * 60
 OBSERVATIONS_KEY = "crypter_block_observations"
 COOLDOWNS_KEY = "crypter_cooldowns"
 PROBES_KEY = "crypter_probes"
 DEFERRED_KEY = "deferred_packages"
+PROJECTION_KEYS = (
+    "crypter_sweep_state",
+    "crypter_sweep_tested",
+    "crypter_sweep_total",
+    "crypter_sweep_deadline_epoch",
+    "crypter_cooldown_count",
+    "crypter_retest_depth",
+    "crypter_individual_mode",
+    "terminal_operations_prepared",
+    "terminal_operations_submitted",
+    "terminal_operations_complete",
+)
 EVENT_TABLE = "crypter_events"
 EVENT_KEY = "pending"
 NO_EVENTS = {"observations": 0, "cooldowns": 0, "probes": 0}
@@ -1372,6 +1390,202 @@ class CohortSweepCounterTests(CrypterStatisticsTestCase):
             "deferred",
             json.loads(self.state.get_db("protected").retrieve(self.cohort_package(1))),
         )
+
+
+class OperatorProjectionTests(CohortSweepCounterTests):
+    """The operator projection stays fixed-cardinality and identifier-free."""
+
+    def projection(self):
+        stats = self.stats.get_stats()
+        return {key: stats[key] for key in sorted(PROJECTION_KEYS)}
+
+    def identifiers(self):
+        record = self.state.get_db("crypter_cooldowns").retrieve(CRYPTER)
+        if record is None:
+            return set()
+        decoded = json.loads(record)
+        found = {decoded.get("sweep_id"), decoded.get("generation_id")}
+        for member in decoded.get("members") or ():
+            found.add(member.get("link_fingerprint"))
+        return {value for value in found if value}
+
+    def assert_identifier_free(self, stats):
+        rendered = json.dumps(stats)
+        for identifier in self.identifiers():
+            self.assertNotIn(identifier, rendered)
+
+    def open_terminal_operations(self, states):
+        table = self.state.get_db(TERMINAL_OPERATION_TABLE)
+        for index, state in enumerate(states):
+            package_id = self.cohort_package(900 + index)
+            table.update_store(
+                terminal_operation_id(package_id),
+                json.dumps(
+                    {
+                        "state": state,
+                        "terminal_state": "downloaded",
+                        "package_id": package_id,
+                        "created_epoch": NOW,
+                        "updated_epoch": NOW,
+                        "package_removed": state == "complete",
+                        "package_terminal": state == "complete",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+
+    def test_an_untouched_linkcrypter_projects_the_available_baseline(self):
+        self.assertEqual(
+            {
+                "crypter_sweep_state": "available",
+                "crypter_sweep_tested": 0,
+                "crypter_sweep_total": 0,
+                "crypter_sweep_deadline_epoch": 0,
+                "crypter_cooldown_count": 0,
+                "crypter_retest_depth": 0,
+                "crypter_individual_mode": "",
+                "terminal_operations_prepared": 0,
+                "terminal_operations_submitted": 0,
+                "terminal_operations_complete": 0,
+            },
+            self.projection(),
+        )
+
+    def test_an_open_sweep_projects_tested_total_and_its_deadline(self):
+        self.store_cohort(5)
+        offer = self.lease()
+        self.report_blocked(offer, self.package_for(offer))
+
+        projection = self.projection()
+
+        self.assertEqual("sweeping", projection["crypter_sweep_state"])
+        self.assertEqual(1, projection["crypter_sweep_tested"])
+        self.assertEqual(5, projection["crypter_sweep_total"])
+        self.assertEqual(NOW + SWEEP_WINDOW, projection["crypter_sweep_deadline_epoch"])
+        self.assertEqual(0, projection["crypter_cooldown_count"])
+        self.assert_identifier_free(self.stats.get_stats())
+
+    def test_a_cohort_cooldown_projects_one_cooldown_and_its_retry_deadline(self):
+        self.drive_cohort()
+
+        projection = self.projection()
+
+        self.assertEqual("cooldown", projection["crypter_sweep_state"])
+        self.assertEqual(5, projection["crypter_sweep_tested"])
+        self.assertEqual(5, projection["crypter_sweep_total"])
+        self.assertEqual(1, projection["crypter_cooldown_count"])
+        self.assertEqual(
+            NOW + COOLDOWN_SECONDS, projection["crypter_sweep_deadline_epoch"]
+        )
+        self.assert_identifier_free(self.stats.get_stats())
+
+    def test_a_healthy_window_projects_its_retest_depth(self):
+        self.drive_cohort()
+        probe = self.lease_probe()
+        self.report_access(probe, self.package_for(probe), "clear")
+
+        projection = self.projection()
+
+        self.assertEqual("healthy", projection["crypter_sweep_state"])
+        self.assertEqual(4, projection["crypter_retest_depth"])
+        self.assertEqual(0, projection["crypter_cooldown_count"])
+        self.assertEqual(
+            NOW + OBSERVATION_WINDOW, projection["crypter_sweep_deadline_epoch"]
+        )
+
+    def test_an_individual_decision_projects_its_fixed_reason(self):
+        self.drive_cohort(4)
+
+        projection = self.projection()
+
+        self.assertEqual("individual", projection["crypter_sweep_state"])
+        self.assertEqual("cohort_too_small", projection["crypter_individual_mode"])
+        self.assertEqual(0, projection["crypter_cooldown_count"])
+
+    def test_a_cohort_hold_projects_progress_onto_its_package(self):
+        self.drive_cohort()
+        package_id = self.cohort_package(1)
+        deferred = self.service.get_package_defer(package_id)
+        projection = self.service.crypter_projection(CRYPTER)
+
+        projected = self.service.project_package_defer(
+            deferred, projection.snapshot, projection.decision
+        )
+
+        self.assertTrue(projected["active"])
+        self.assertEqual(5, projected["cohort_tested"])
+        self.assertEqual(5, projected["cohort_total"])
+        self.assertEqual(NOW + COOLDOWN_SECONDS, projected["cohort_deadline_epoch"])
+        self.assertEqual(0, projected["cohort_retest_depth"])
+
+    def test_a_legacy_hold_projects_zeroed_cohort_progress(self):
+        self.enter_cooldown()
+        deferred = self.service.get_package_defer(PACKAGE_A)
+        projection = self.service.crypter_projection(CRYPTER)
+
+        projected = self.service.project_package_defer(
+            deferred, projection.snapshot, projection.decision
+        )
+
+        self.assertEqual(0, projected["cohort_tested"])
+        self.assertEqual(0, projected["cohort_total"])
+        self.assertEqual(0, projected["cohort_deadline_epoch"])
+        self.assertEqual(0, projected["cohort_retest_depth"])
+
+    def test_terminal_operations_are_projected_by_state_only(self):
+        self.open_terminal_operations(("prepared", "prepared", "submitted", "complete"))
+        self.state.get_db(TERMINAL_OPERATION_TABLE).update_store(
+            "corrupted", "{not json"
+        )
+
+        stats = self.stats.get_stats()
+
+        self.assertEqual(2, stats["terminal_operations_prepared"])
+        self.assertEqual(1, stats["terminal_operations_submitted"])
+        self.assertEqual(1, stats["terminal_operations_complete"])
+        rendered = json.dumps(stats)
+        self.assertNotIn(self.cohort_package(900), rendered)
+        self.assertNotIn(terminal_operation_id(self.cohort_package(900)), rendered)
+
+    def test_fail_block_mode_projects_the_baseline_without_reading_a_decision(self):
+        self.drive_cohort()
+        self.state.values["crypter_block_mode"] = "fail"
+        before = self.state.get_db("crypter_cooldowns").retrieve(CRYPTER)
+
+        projection = self.projection()
+
+        self.assertEqual("available", projection["crypter_sweep_state"])
+        self.assertEqual(0, projection["crypter_sweep_total"])
+        self.assertEqual(0, projection["crypter_cooldown_count"])
+        self.assertEqual(
+            before, self.state.get_db("crypter_cooldowns").retrieve(CRYPTER)
+        )
+
+    def test_a_storage_outage_never_fails_the_projection(self):
+        self.drive_cohort()
+
+        with mock.patch.object(
+            DataBase, "retrieve_all_titles", side_effect=RuntimeError("unavailable")
+        ):
+            projection = self.projection()
+
+        self.assertEqual(0, projection["terminal_operations_prepared"])
+
+    def test_the_statistics_page_renders_the_projection_without_identifiers(self):
+        self.drive_cohort()
+        self.open_terminal_operations(("prepared", "complete"))
+        app = Bottle()
+        setup_statistics(app, self.state)
+        route = next(route for route in app.routes if route.rule == "/statistics")
+
+        page = route.callback()
+
+        self.assertIn("Filecrypt cohort", page)
+        self.assertIn("Terminal operations", page)
+        for identifier in self.identifiers():
+            self.assertNotIn(identifier, page)
+        self.assertNotIn(self.cohort_package(1), page)
 
 
 if __name__ == "__main__":

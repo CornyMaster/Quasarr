@@ -16,6 +16,7 @@ from quasarr.providers.crypter_cooldowns import (
     decode_pending_crypter_events,
 )
 from quasarr.providers.log import debug, warn
+from quasarr.providers.terminal_operations import TerminalOperationService
 
 # The linkcrypter services record their transitions in one durable ledger row;
 # these are the cumulative counters that row is drained into.
@@ -324,6 +325,58 @@ class StatsHelper:
         except Exception:
             return {"deferred_packages": 0}
 
+    def get_operator_projection(self) -> Dict[str, Any]:
+        """Fixed-cardinality Filecrypt and terminal-operation state for operators."""
+        projection = {
+            "crypter_sweep_state": "available",
+            "crypter_sweep_tested": 0,
+            "crypter_sweep_total": 0,
+            "crypter_sweep_deadline_epoch": 0,
+            "crypter_cooldown_count": 0,
+            "crypter_retest_depth": 0,
+            "crypter_individual_mode": "",
+            "terminal_operations_prepared": 0,
+            "terminal_operations_submitted": 0,
+            "terminal_operations_complete": 0,
+        }
+        if crypter_blocks_deferred(self.shared_state):
+            try:
+                decision = CrypterCooldownService(
+                    self.shared_state, clock=self._clock
+                ).crypter_decision("filecrypt")
+                if decision is not None:
+                    state = decision["state"]
+                    if state == "sweeping":
+                        deadline = decision["sweep_deadline_epoch"]
+                    elif state == "cooldown":
+                        deadline = decision["retry_after_epoch"]
+                    else:
+                        deadline = decision["until_epoch"]
+                    projection.update(
+                        {
+                            "crypter_sweep_state": state,
+                            "crypter_sweep_tested": decision["sweep_tested"],
+                            "crypter_sweep_total": decision["sweep_total"],
+                            "crypter_sweep_deadline_epoch": deadline,
+                            "crypter_cooldown_count": int(state == "cooldown"),
+                            "crypter_retest_depth": len(decision["retest_members"]),
+                            "crypter_individual_mode": (
+                                decision["reason_code"] if state == "individual" else ""
+                            ),
+                        }
+                    )
+            except Exception as error:
+                debug(f"Reading the Filecrypt operator projection failed: {error}")
+        try:
+            terminal_counts = TerminalOperationService(
+                self.shared_state, clock=self._clock
+            ).count_by_state()
+            for state, count in terminal_counts.items():
+                projection[f"terminal_operations_{state}"] = count
+        except Exception as error:
+            debug(f"Reading the terminal-operation projection failed: {error}")
+        return projection
+
     def get_stats(self) -> Dict[str, Any]:
         """Get all current statistics"""
         crypter_totals = self.crypter_transition_totals()
@@ -409,6 +462,7 @@ class StatsHelper:
         stats.update(self.get_imdb_cache_stats())
         stats.update(self.get_xem_cache_stats())
         stats.update(self.get_crypter_defer_stats())
+        stats.update(self.get_operator_projection())
         stats["metadata_total_cached"] = (
             stats["imdb_total_cached"] + stats["xem_total_cached"]
         )
