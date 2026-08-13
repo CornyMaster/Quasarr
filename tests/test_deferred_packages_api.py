@@ -18,6 +18,7 @@ PACKAGE_C = "Quasarr_movies_" + "c" * 32
 PACKAGE_D = "Quasarr_movies_" + "d" * 32
 SELECTOR_HOSTILE_PACKAGE_ID = PACKAGE_A + '"][data-selected="unexpected'
 RETRY_AFTER = 4_000_000_000
+COHORT_DEADLINE = RETRY_AFTER + 5 * 86400
 SWEEP_ID = "5e" * 16
 LINK_FINGERPRINT = "7f" * 32
 
@@ -551,6 +552,166 @@ SELECTOR_AUDIT_FIXTURES = (
     ("plural variable", "document.querySelectorAll(selector);", False),
 )
 
+FUNCTION_SIGNATURE = re.compile(r"function (\w+)\(([^)]*)\)")
+DATASET_READ = re.compile(r"\.dataset\.(\w+)")
+COUNTDOWN_EPOCH_FALLBACK = re.compile(
+    r"([A-Za-z_$][\w$]*)\.dataset\.cohortDeadlineEpoch\s*\?\?\s*"
+    r"\1\.dataset\.retryAfterEpoch"
+)
+
+
+def _function_owning(source, fragment):
+    """The innermost shipped function whose body contains `fragment`."""
+    owner = None
+    for match in FUNCTION_SIGNATURE.finditer(source):
+        name = match.group(1)
+        try:
+            body = javascript_function_body(source, name)
+        except ValueError:
+            continue
+        if fragment not in body:
+            continue
+        parameters = [
+            parameter.strip()
+            for parameter in match.group(2).split(",")
+            if parameter.strip()
+        ]
+        if owner is None or len(body) < len(owner[1]):
+            owner = (name, body, parameters)
+    return owner
+
+
+def countdown_epoch_contract(page):
+    """Structure of the shipped deferred countdown epoch read.
+
+    Raises `AssertionError` for any page whose countdown would stop following
+    the deadline the server rendered onto the element it updates, so a mutated
+    copy of the shipped source can be asserted to be rejected.
+    """
+    fallbacks = list(COUNTDOWN_EPOCH_FALLBACK.finditer(page))
+    if len(fallbacks) != 1:
+        raise AssertionError(
+            f"{len(fallbacks)} `<element>.dataset.cohortDeadlineEpoch ?? "
+            "<element>.dataset.retryAfterEpoch` reads are shipped, want exactly one"
+        )
+    binding = fallbacks[0].group(1)
+
+    epochs = sorted(
+        name for name in DATASET_READ.findall(page) if name.endswith("Epoch")
+    )
+    if epochs != ["cohortDeadlineEpoch", "retryAfterEpoch"]:
+        raise AssertionError(
+            f"the page reads countdown epochs {epochs}, want exactly the shared "
+            "cohort and retry pair"
+        )
+
+    owner = _function_owning(page, fallbacks[0].group(0))
+    if owner is None:
+        raise AssertionError("the epoch fallback belongs to no shipped helper")
+    name, _body, parameters = owner
+    if parameters != [binding]:
+        raise AssertionError(
+            f"{name} takes {parameters} but the fallback reads {binding!r}"
+        )
+
+    updater = javascript_function_body(page, "updateDeferredCountdowns")
+    if f"{name}(" not in updater:
+        raise AssertionError(f"updateDeferredCountdowns never calls {name}")
+    if ".dataset." in updater:
+        raise AssertionError("updateDeferredCountdowns resolves an epoch of its own")
+    return SimpleNamespace(helper=name, parameter=binding)
+
+
+COUNTDOWN_MUTATIONS = (
+    (
+        "cohort deadline ignored",
+        "element.dataset.cohortDeadlineEpoch ?? element.dataset.retryAfterEpoch",
+        "element.dataset.retryAfterEpoch",
+    ),
+    (
+        "fallback order reversed",
+        "element.dataset.cohortDeadlineEpoch ?? element.dataset.retryAfterEpoch",
+        "element.dataset.retryAfterEpoch ?? element.dataset.cohortDeadlineEpoch",
+    ),
+    (
+        "fallback reads a foreign element",
+        "element.dataset.cohortDeadlineEpoch ?? element.dataset.retryAfterEpoch",
+        "element.dataset.cohortDeadlineEpoch ?? other.dataset.retryAfterEpoch",
+    ),
+    (
+        "cohort deadline renamed",
+        "element.dataset.cohortDeadlineEpoch",
+        "element.dataset.cohortDeadline",
+    ),
+    (
+        "helper reads something it was not given",
+        "function deferredCountdownEpoch(element)",
+        "function deferredCountdownEpoch(node)",
+    ),
+)
+
+
+def dataset_key(attribute):
+    parts = attribute[len("data-") :].split("-")
+    return parts[0] + "".join(part.capitalize() for part in parts[1:])
+
+
+class CountdownParser(HTMLParser):
+    """Every rendered `.deferred-countdown` element as dataset plus text."""
+
+    def __init__(self):
+        super().__init__()
+        self.elements = []
+        self._current = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if "deferred-countdown" not in (attributes.get("class") or "").split():
+            self._current = None
+            return
+        self._current = {
+            "dataset": {
+                dataset_key(name): value
+                for name, value in attributes.items()
+                if name.startswith("data-")
+            },
+            "text": "",
+        }
+        self.elements.append(self._current)
+
+    def handle_data(self, data):
+        if self._current is not None:
+            self._current["text"] += data
+
+    def handle_endtag(self, tag):
+        self._current = None
+
+
+def countdown_elements(fragment):
+    parser = CountdownParser()
+    parser.feed(fragment)
+    return parser.elements
+
+
+def replay_countdown_epoch(dataset):
+    """The Python twin of the shipped `??` epoch read."""
+    value = dataset.get("cohortDeadlineEpoch")
+    if value is None:
+        value = dataset.get("retryAfterEpoch")
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def replay_countdown_text(dataset, now):
+    remaining = max(0, replay_countdown_epoch(dataset) - now)
+    days, rest = divmod(remaining, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, seconds = divmod(rest, 60)
+    clock = f"{hours:02}:{minutes:02}:{seconds:02}"
+    return f"{days}d {clock}" if days else clock
+
 
 class DeferredPackagesRenderingTests(unittest.TestCase):
     def test_active_deferred_cards_render_separately_without_sensitive_links(self):
@@ -955,6 +1116,104 @@ class DeferredSelectionRefreshTests(unittest.TestCase):
                 for name, _ in query_selector_calls(snippet)
             },
         )
+
+
+class DeferredCountdownTests(unittest.TestCase):
+    """The ticking countdown must follow the deadline the server rendered."""
+
+    def cohort_fragment(self):
+        downloads = {
+            "queue": [
+                queue_item(
+                    PACKAGE_A,
+                    "[Waiting for linkcrypter retry] Cohort package",
+                    deferred_block(
+                        generation=True,
+                        cohort_tested=3,
+                        cohort_total=7,
+                        cohort_deadline_epoch=COHORT_DEADLINE,
+                        cohort_retest_depth=2,
+                    ),
+                ),
+                queue_item(
+                    PACKAGE_B,
+                    "[Waiting for linkcrypter retry] Ordinary package",
+                    deferred_block(),
+                ),
+            ],
+            "history": [],
+        }
+
+        with mock.patch.object(packages_api, "get_packages", return_value=downloads):
+            return packages_api._render_packages_content()
+
+    def test_the_countdown_resolves_one_shared_epoch_per_element(self):
+        page = render_packages_page()
+
+        contract = countdown_epoch_contract(page)
+
+        self.assertEqual("deferredCountdownEpoch", contract.helper)
+        # No package value may become part of a query while this is added.
+        self.assertEqual([], built_selector_arguments(page))
+
+    def test_the_countdown_contract_rejects_weakened_variants(self):
+        page = render_packages_page()
+
+        for label, original, replacement in COUNTDOWN_MUTATIONS:
+            with self.subTest(mutation=label):
+                self.assertIn(original, page)
+                with self.assertRaises(AssertionError):
+                    countdown_epoch_contract(page.replace(original, replacement))
+
+    def test_a_cohort_card_carries_only_its_own_deadline(self):
+        elements = countdown_elements(self.cohort_fragment())
+
+        datasets = [element["dataset"] for element in elements]
+        self.assertEqual(3, len(datasets))
+        cohort = [data for data in datasets if "cohortDeadlineEpoch" in data]
+        retry = [data for data in datasets if "cohortDeadlineEpoch" not in data]
+        self.assertEqual(1, len(cohort))
+        self.assertEqual(str(COHORT_DEADLINE), cohort[0]["cohortDeadlineEpoch"])
+        # A retry-only read would resolve `undefined` here and collapse the
+        # cohort deadline to zero on the very first tick.
+        self.assertNotIn("retryAfterEpoch", cohort[0])
+        self.assertEqual(2, len(retry))
+        for data in retry:
+            self.assertEqual(str(RETRY_AFTER), data["retryAfterEpoch"])
+
+    def test_every_tick_keeps_the_server_rendered_deadlines_apart(self):
+        elements = countdown_elements(self.cohort_fragment())
+        cohort = next(
+            element
+            for element in elements
+            if "cohortDeadlineEpoch" in element["dataset"]
+        )
+        retry = next(
+            element
+            for element in elements
+            if "cohortDeadlineEpoch" not in element["dataset"]
+        )
+
+        self.assertEqual(COHORT_DEADLINE, replay_countdown_epoch(cohort["dataset"]))
+        self.assertEqual(RETRY_AFTER, replay_countdown_epoch(retry["dataset"]))
+
+        rendered_days = [
+            int(element["text"].strip().split("d ")[0]) for element in (cohort, retry)
+        ]
+        self.assertEqual(5, rendered_days[0] - rendered_days[1])
+
+        for tick in (0, 1, 59, 3600, 86400):
+            with self.subTest(tick=tick):
+                now = RETRY_AFTER - 2 * 86400 + tick
+                cohort_text = replay_countdown_text(cohort["dataset"], now)
+                retry_text = replay_countdown_text(retry["dataset"], now)
+                self.assertNotEqual("00:00:00", cohort_text)
+                self.assertNotEqual(cohort_text, retry_text)
+                self.assertEqual(
+                    5,
+                    int(cohort_text.split("d ")[0]) - int(retry_text.split("d ")[0]),
+                )
+                self.assertEqual(cohort_text.split("d ")[1], retry_text.split("d ")[1])
 
 
 class DeferredPackagesRouteTests(unittest.TestCase):

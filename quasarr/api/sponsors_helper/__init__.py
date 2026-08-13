@@ -4,6 +4,7 @@
 
 import json
 import time
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 
 from bottle import HTTPResponse, abort, request
@@ -425,11 +426,21 @@ def select_helper_package(
 
 
 def setup_sponsors_helper_routes(app):
-    def begin_terminal_operation(data, terminal_state):
+    @contextmanager
+    def terminal_operation(data, terminal_state):
+        """Yield the admitted version-two context, or None for a legacy body.
+
+        The context is yielded while this operation's lock is held, and the
+        caller must decide and apply its whole transition inside the block: an
+        answer that was lost on the way to the helper is retried, and two
+        retries that arrive together would otherwise both read the same phase
+        and both submit, fail or disable the package.
+        """
         carries_version = "protocol_version" in data
         carries_operation = "terminal_operation_id" in data
         if not carries_version and not carries_operation:
-            return None
+            yield None
+            return
         if type(data.get("protocol_version")) is not int:
             return abort(400, "Invalid terminal protocol version")
         if data["protocol_version"] != 2:
@@ -441,20 +452,23 @@ def setup_sponsors_helper_routes(app):
 
         operation_id = data.get("terminal_operation_id")
         service = TerminalOperationService(shared_state)
-        try:
-            opened = service.begin(operation_id, package_id, terminal_state)
-        except ValueError:
-            return abort(400, "Invalid terminal operation identity")
-        if opened["outcome"] == CONFLICT:
-            return abort(409, "Terminal operation identity conflict")
-        if opened["outcome"] == CAPACITY:
-            return abort(503, "Terminal operation capacity exhausted")
-        return {
-            "service": service,
-            "operation_id": operation_id,
-            "outcome": opened["outcome"],
-            "record": opened["record"],
-        }
+        with ExitStack() as admission:
+            try:
+                opened = admission.enter_context(
+                    service.exclusive(operation_id, package_id, terminal_state)
+                )
+            except ValueError:
+                return abort(400, "Invalid terminal operation identity")
+            if opened["outcome"] == CONFLICT:
+                return abort(409, "Terminal operation identity conflict")
+            if opened["outcome"] == CAPACITY:
+                return abort(503, "Terminal operation capacity exhausted")
+            yield {
+                "service": service,
+                "operation_id": operation_id,
+                "outcome": opened["outcome"],
+                "record": opened["record"],
+            }
 
     def filecrypt_inventory(protected_rows=None):
         """The bounded Filecrypt inventory, or None when it cannot be proven.
@@ -657,10 +671,20 @@ def setup_sponsors_helper_routes(app):
         context["record"] = result["record"]
         return terminal_response(context["record"])
 
-    def record_helper_terminal_failure(package_id, title, reason):
-        persisted = failed_package_present(shared_state, package_id)
-        if persisted is None:
-            return False
+    def record_helper_terminal_failure(context, package_id, title, reason):
+        """Persist this operation's failure once, resuming an interrupted one.
+
+        Existing failed history only proves anything for an operation that ran
+        before: package IDs are derived from the release, so a package that
+        failed once and was added again still carries that row while it is
+        protected, and a freshly opened operation would otherwise report its
+        own failure as already done without recording it.
+        """
+        persisted = False
+        if context["outcome"] != OPENED:
+            persisted = failed_package_present(shared_state, package_id)
+            if persisted is None:
+                return False
         if not persisted:
             StatsHelper(shared_state).increment_failed_decryptions_automatic()
             mark_helper_package_failed(package_id, title, reason)
@@ -677,13 +701,20 @@ def setup_sponsors_helper_routes(app):
             return terminal_response(context["record"])
 
         final_links = None
+        # None until this request knows whether the operation ends in a failure.
+        # A freshly opened operation has provably run nothing yet, so a failed
+        # row of an earlier lifecycle is not an answer it may read.
+        failed_now = None
         if context["record"]["state"] == "prepared":
-            persisted_failure = failed_package_present(shared_state, package_id)
-            if persisted_failure is None:
-                return unconfirmed_terminal_response(context)
+            resumed = context["outcome"] != OPENED
+            failed_now = False
+            if resumed:
+                failed_now = failed_package_present(shared_state, package_id)
+                if failed_now is None:
+                    return unconfirmed_terminal_response(context)
 
-            submit = context["outcome"] == OPENED
-            if persisted_failure:
+            submit = not resumed
+            if failed_now:
                 mark_terminal_submitted(context)
             else:
                 if not submit:
@@ -702,8 +733,11 @@ def setup_sponsors_helper_routes(app):
                         if not isinstance(download_links, list)
                         else "SponsorsHelper returned no final download links."
                     )
-                    if not record_helper_terminal_failure(package_id, title, reason):
+                    if not record_helper_terminal_failure(
+                        context, package_id, title, reason
+                    ):
                         return unconfirmed_terminal_response(context)
+                    failed_now = True
                     mark_terminal_submitted(context)
                 elif submit:
                     submit_result = submit_final_download_urls(
@@ -725,25 +759,29 @@ def setup_sponsors_helper_routes(app):
                         ).increment_failed_decryptions_automatic()
                         if failed_package_present(shared_state, package_id) is not True:
                             return unconfirmed_terminal_response(context)
+                        failed_now = True
                         mark_terminal_submitted(context)
                     else:
                         return unconfirmed_terminal_response(context)
                 else:
                     mark_terminal_submitted(context)
 
-        persisted_failure = failed_package_present(shared_state, package_id)
-        if persisted_failure is None:
-            return unconfirmed_terminal_response(context)
+        if failed_now is None:
+            # Resumed after the submitted phase: history is the only durable
+            # record left of how that phase ended.
+            failed_now = failed_package_present(shared_state, package_id)
+            if failed_now is None:
+                return unconfirmed_terminal_response(context)
         removal = finalize_protected_removal(
             shared_state,
             package_id,
             notification,
-            notify_solved=not persisted_failure,
+            notify_solved=not failed_now,
         )
         if not removal["package_removed"]:
             return unconfirmed_terminal_response(context)
 
-        if not persisted_failure and removal["removed_now"]:
+        if not failed_now and removal["removed_now"]:
             if final_links is None:
                 final_links = projected_final_download_links(download_links, package_id)
             StatsHelper(shared_state).increment_package_with_links(final_links)
@@ -755,7 +793,7 @@ def setup_sponsors_helper_routes(app):
             return terminal_response(context["record"])
 
         if context["record"]["state"] == "prepared":
-            if not record_helper_terminal_failure(package_id, title, reason):
+            if not record_helper_terminal_failure(context, package_id, title, reason):
                 return unconfirmed_terminal_response(context)
             mark_terminal_submitted(context)
 
@@ -1150,18 +1188,18 @@ def setup_sponsors_helper_routes(app):
                 return abort(400, "Missing or invalid 'notification.solvers' list")
             if not package_id:
                 return abort(400, "Missing or invalid 'package_id'")
-            terminal = begin_terminal_operation(data, "downloaded")
-            if not title:
-                title = "Unknown"
-            if terminal is not None:
-                return confirm_terminal_download(
-                    terminal,
-                    title,
-                    package_id,
-                    download_links,
-                    password,
-                    notification,
-                )
+            with terminal_operation(data, "downloaded") as terminal:
+                if not title:
+                    title = "Unknown"
+                if terminal is not None:
+                    return confirm_terminal_download(
+                        terminal,
+                        title,
+                        package_id,
+                        download_links,
+                        password,
+                        notification,
+                    )
             if not isinstance(download_links, list):
                 StatsHelper(shared_state).increment_failed_decryptions_automatic()
                 return mark_helper_package_failed(
@@ -1250,9 +1288,9 @@ def setup_sponsors_helper_routes(app):
             if not package_id:
                 return {"error": "Missing package_id"}, 400
 
-            terminal = begin_terminal_operation(data, "disabled")
-            if terminal is not None:
-                return confirm_terminal_disable(terminal, package_id, reason)
+            with terminal_operation(data, "disabled") as terminal:
+                if terminal is not None:
+                    return confirm_terminal_disable(terminal, package_id, reason)
             StatsHelper(shared_state).increment_failed_decryptions_automatic()
 
             blob = shared_state.get_db("protected").retrieve(package_id)
@@ -1296,18 +1334,18 @@ def setup_sponsors_helper_routes(app):
             data = request.json or {}
             if not isinstance(data, dict):
                 return abort(400, "Missing or invalid JSON object")
-            terminal = begin_terminal_operation(data, "failed")
-            package_id = data.get("package_id")
-            # SponsorsHelper might send 'name' or 'title'
-            title = data.get("name") or data.get("title")
-            reason = extract_failure_reason(
-                data,
-                default_reason="Too many failed attempts by SponsorsHelper",
-            )
-            if terminal is not None:
-                return confirm_terminal_failure(
-                    terminal, package_id, title or "Unknown", reason
+            with terminal_operation(data, "failed") as terminal:
+                package_id = data.get("package_id")
+                # SponsorsHelper might send 'name' or 'title'
+                title = data.get("name") or data.get("title")
+                reason = extract_failure_reason(
+                    data,
+                    default_reason="Too many failed attempts by SponsorsHelper",
                 )
+                if terminal is not None:
+                    return confirm_terminal_failure(
+                        terminal, package_id, title or "Unknown", reason
+                    )
 
             StatsHelper(shared_state).increment_failed_decryptions_automatic()
 

@@ -87,6 +87,14 @@ def _format_deferred_countdown(retry_after_epoch):
     return f"{days}d {clock}" if days else clock
 
 
+def _deferred_countdown(attribute, epoch):
+    """One ticking countdown element carrying the deadline it counts down to."""
+    return (
+        f'<strong class="deferred-countdown" {attribute}="{epoch}">'
+        f"{_format_deferred_countdown(epoch)}</strong>"
+    )
+
+
 def _render_deferred_queue_item(item):
     deferred = item.get("deferred", {})
     filename = str(item.get("filename", "Unknown"))
@@ -140,7 +148,7 @@ def _render_deferred_queue_item(item):
                 <span><strong>Tested:</strong> {cohort_tested} / {cohort_total}</span>
                 <span><strong>Retest queue:</strong> {cohort_retest_depth}</span>"""
         cohort_deadline = f"""
-                <span>Cohort deadline <strong class="deferred-countdown" data-cohort-deadline-epoch="{cohort_deadline_epoch}">{_format_deferred_countdown(cohort_deadline_epoch)}</strong></span>"""
+                <span>Cohort deadline {_deferred_countdown("data-cohort-deadline-epoch", cohort_deadline_epoch)}</span>"""
     probe_label = (
         "Probe queued"
         if deferred.get("probe_requested") is True
@@ -163,7 +171,7 @@ def _render_deferred_queue_item(item):
                 {cohort_progress}
             </div>
             <div class="deferred-retry">
-                <span>Retry in <strong class="deferred-countdown" data-retry-after-epoch="{retry_after_epoch}">{_format_deferred_countdown(retry_after_epoch)}</strong></span>
+                <span>Retry in {_deferred_countdown("data-retry-after-epoch", retry_after_epoch)}</span>
                 <span class="deferred-probe-state">{probe_label}</span>
                 {cohort_deadline}
             </div>
@@ -874,11 +882,15 @@ def setup_packages_routes(app):
                     return days ? days + 'd ' + clock : clock;
                 }}
 
+                function deferredCountdownEpoch(element) {{
+                    const epoch = Number.parseInt(element.dataset.cohortDeadlineEpoch ?? element.dataset.retryAfterEpoch ?? '0', 10);
+                    return Number.isFinite(epoch) ? epoch : 0;
+                }}
+
                 function updateDeferredCountdowns() {{
                     const now = Math.floor(Date.now() / 1000);
                     document.querySelectorAll('.deferred-countdown').forEach(element => {{
-                        const retryAfter = Number.parseInt(element.dataset.retryAfterEpoch || '0', 10);
-                        const remaining = Number.isFinite(retryAfter) ? Math.max(0, retryAfter - now) : 0;
+                        const remaining = Math.max(0, deferredCountdownEpoch(element) - now);
                         element.textContent = formatDeferredCountdown(remaining);
                     }});
                 }}

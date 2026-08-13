@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 
+import contextlib
 import json
+import threading
 import unittest
 from unittest import mock
 
 from bottle import Bottle, HTTPError
 
+import quasarr.api.sponsors_helper as sponsors_helper_api
 from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
 from quasarr.providers.terminal_operations import (
     TERMINAL_OPERATION_TABLE,
@@ -93,6 +96,8 @@ class FakeLinkgrabber:
 
     def add_links(self, params=None):
         self.device.add_links_calls.append(params)
+        if self.device.before_add_links is not None:
+            self.device.before_add_links()
         if not self.device.add_links_succeeds:
             return False
         entry = params[0]
@@ -131,6 +136,7 @@ class FakeDevice:
         self.downloader_links = []
         self.add_links_calls = []
         self.add_links_succeeds = True
+        self.before_add_links = None
         self.queries = 0
         self.linkgrabber = FakeLinkgrabber(self)
         self.downloads = FakeDownloads(self)
@@ -172,6 +178,36 @@ def route_for(rule):
     return next(route for route in app.routes if route.rule == rule)
 
 
+class SideEffectGate:
+    """Parks callers inside one side effect until the test releases them.
+
+    The first arrival is the request under observation. A second arrival can
+    only happen if the route let two requests into the same side effect, so the
+    event it sets is the direct evidence of a duplicated transition.
+    """
+
+    def __init__(self):
+        self.first = threading.Event()
+        self.second = threading.Event()
+        self.release = threading.Event()
+        self.arrivals = 0
+        self._guard = threading.Lock()
+
+    def arrive(self):
+        with self._guard:
+            self.arrivals += 1
+            first = self.arrivals == 1
+        (self.first if first else self.second).set()
+        self.release.wait(timeout=10)
+
+    def wrap(self, function):
+        def gated(*args, **kwargs):
+            self.arrive()
+            return function(*args, **kwargs)
+
+        return gated
+
+
 class TerminalConfirmationTestCase(unittest.TestCase):
     def setUp(self):
         self.state = MemorySharedState()
@@ -210,6 +246,11 @@ class TerminalConfirmationTestCase(unittest.TestCase):
 
     def call(self, rule, payload):
         route = route_for(rule)
+        with self.patched(payload):
+            return route.callback()
+
+    @contextlib.contextmanager
+    def patched(self, payload):
         with (
             mock.patch("quasarr.api.sponsors_helper.shared_state", self.state),
             mock.patch("quasarr.api.sponsors_helper.request", mock.Mock(json=payload)),
@@ -228,7 +269,45 @@ class TerminalConfirmationTestCase(unittest.TestCase):
                 "quasarr.downloads.get_download_category_mirrors", return_value=[]
             ),
         ):
-            return route.callback()
+            yield
+
+    def concurrently(self, rule, payload, gate):
+        """Two identical requests, the second arriving while the first works."""
+        callbacks = [route_for(rule).callback, route_for(rule).callback]
+        answers = {}
+        failures = {}
+
+        def send(name, callback):
+            try:
+                answers[name] = callback()
+            except BaseException as e:  # noqa: BLE001 - reported as the failure
+                failures[name] = e
+
+        with self.patched(payload):
+            first = threading.Thread(
+                target=send, args=("first", callbacks[0]), name="first"
+            )
+            first.start()
+            self.assertTrue(
+                gate.first.wait(timeout=10),
+                msg="the first request never reached its side effect",
+            )
+            second = threading.Thread(
+                target=send, args=("second", callbacks[1]), name="second"
+            )
+            second.start()
+            # A serialized request can never reach the parked side effect; one
+            # that races into it does, and this window is what exposes it.
+            gate.second.wait(timeout=0.5)
+            gate.release.set()
+            for thread in (first, second):
+                thread.join(timeout=15)
+
+        self.assertEqual(
+            [], [thread.name for thread in (first, second) if thread.is_alive()]
+        )
+        self.assertEqual({}, failures)
+        return answers["first"], answers["second"]
 
     def download_payload(self, package_id=None, urls=None, **extra):
         package_id = package_id or package()
@@ -837,6 +916,115 @@ class DisableTerminalConfirmationTests(TerminalConfirmationTestCase):
             result,
         )
         self.assertEqual([], self.notification_cases())
+
+
+class ConcurrentTerminalRequestTests(TerminalConfirmationTestCase):
+    """Two helper retries of one operation may never both apply it.
+
+    Each case parks the first request inside the exact irreversible step and
+    lets a second identical request in behind it, so anything that decides to
+    submit, fail or disable from a stale read is recorded twice.
+    """
+
+    def test_two_concurrent_downloads_submit_the_package_exactly_once(self):
+        gate = SideEffectGate()
+        self.state.device.before_add_links = gate.arrive
+
+        first, second = self.concurrently(
+            DOWNLOAD_RULE, self.version_two(self.download_payload()), gate
+        )
+
+        self.assertFalse(gate.second.is_set())
+        self.assertEqual(1, len(self.state.device.add_links_calls))
+        self.assertEqual(first, second)
+        self.assertTrue(first["success"])
+        self.assertTrue(first["package_removed"])
+        self.assertEqual("complete", self.operation_row()["state"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["solved"], self.notification_cases())
+        self.assertEqual(1, self.statistic("packages_downloaded"))
+        self.assertEqual(1, self.statistic("captcha_decryptions_automatic"))
+
+    def test_two_concurrent_failures_record_one_history_row_and_counter(self):
+        gate = SideEffectGate()
+
+        with mock.patch(
+            "quasarr.api.sponsors_helper.fail",
+            gate.wrap(sponsors_helper_api.fail),
+        ):
+            first, second = self.concurrently(
+                FAIL_RULE, self.version_two({"package_id": package()}), gate
+            )
+
+        self.assertFalse(gate.second.is_set())
+        self.assertEqual(1, gate.arrivals)
+        self.assertEqual(first, second)
+        self.assertTrue(first["success"])
+        self.assertIsNotNone(self.failed_row())
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_two_concurrent_disables_transition_the_package_exactly_once(self):
+        gate = SideEffectGate()
+        protected = self.state.get_db("protected")
+
+        with mock.patch.object(
+            protected, "update_store", gate.wrap(protected.update_store)
+        ):
+            first, second = self.concurrently(
+                DISABLE_RULE, self.version_two({"package_id": package()}), gate
+            )
+
+        self.assertFalse(gate.second.is_set())
+        self.assertEqual(1, gate.arrivals)
+        self.assertEqual(first, second)
+        self.assertTrue(first["success"])
+        self.assertTrue(first["package_terminal"])
+        self.assertFalse(first["package_removed"])
+        self.assertTrue(self.protected_row()["disabled"])
+        self.assertEqual(["disabled"], self.notification_cases())
+        self.assertEqual(1, self.statistic("captcha_decryptions_automatic"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+
+class StaleFailedHistoryTests(TerminalConfirmationTestCase):
+    """A failed row of an older lifecycle is not this operation's outcome.
+
+    Package IDs are derived from the release, so a package that once failed and
+    was added again carries that history while it is protected. Only the
+    operation's own state may dedupe a terminal side effect.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.state.get_db("failed").update_store(
+            package(), json.dumps(json.dumps({"title": TITLE, "error": "last time"}))
+        )
+
+    def test_a_stale_failed_row_never_reports_success_without_submitting(self):
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assertEqual(1, len(self.state.device.add_links_calls))
+        self.assertTrue(result["success"])
+        self.assertTrue(result["package_removed"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["solved"], self.notification_cases())
+        self.assertEqual(1, self.statistic("packages_downloaded"))
+        self.assertEqual(1, self.statistic("captcha_decryptions_automatic"))
+
+    def test_a_stale_failed_row_never_skips_the_current_failure(self):
+        result = self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
 
 
 if __name__ == "__main__":

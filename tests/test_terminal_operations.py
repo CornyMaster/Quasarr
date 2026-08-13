@@ -8,6 +8,8 @@ import threading
 import unittest
 from unittest import mock
 
+from filelock import Timeout
+
 from quasarr.providers import shared_state as provider_shared_state
 from quasarr.providers.terminal_operations import (
     COMPLETED_OPERATION_RETENTION_SECONDS,
@@ -48,13 +50,17 @@ class GuardedTable:
         self.enumerations = 0
         self.writes = 0
         self.deletes = 0
+        self.deleted = []
         self.in_callback = False
         self.after_enumeration = None
         self.enumeration_hook = None
+        self.access_hook = None
 
     def _guard(self, operation):
         if self.in_callback:
             raise AssertionError(f"{operation} was resolved inside a mutation callback")
+        if self.access_hook is not None:
+            self.access_hook(operation)
 
     def retrieve(self, key):
         self._guard("retrieve")
@@ -102,6 +108,7 @@ class GuardedTable:
             return False
         self.rows.pop(key, None)
         self.deletes += 1
+        self.deleted.append(key)
         return True
 
     def delete(self, key):
@@ -456,13 +463,13 @@ class TerminalOperationServiceTests(unittest.TestCase):
             self.state.operations.rows[terminal_operation_id(package(index))] = record(
                 package(index)
             )
-        enumerations = self.state.operations.enumerations
+        before = self.rows()
 
         result = self.begin(index=0)
 
         self.assertEqual("resumed", result["outcome"])
         self.assertEqual("prepared", result["record"]["state"])
-        self.assertEqual(enumerations, self.state.operations.enumerations)
+        self.assertEqual(before, self.rows())
 
     def test_two_new_operations_cannot_both_consume_the_last_slot(self):
         first_enumerated = threading.Event()
@@ -551,6 +558,12 @@ class TerminalOperationServiceTests(unittest.TestCase):
         result = self.begin(index=MAXIMUM_TERMINAL_OPERATIONS + 1)
 
         self.assertEqual("opened", result["outcome"])
+        # Oldest first, so a run that can only free part of the table frees the
+        # rows whose retention expired longest ago.
+        self.assertEqual(
+            [terminal_operation_id(package(index)) for index in (2, 1, 0)],
+            self.state.operations.deleted,
+        )
         for index in range(expired):
             self.assertNotIn(terminal_operation_id(package(index)), self.rows())
         self.assertIn(
@@ -616,6 +629,237 @@ class TerminalOperationServiceTests(unittest.TestCase):
             {"prepared": 2, "submitted": 1, "complete": 1},
             counts,
         )
+
+    # --- retention ------------------------------------------------------
+
+    def complete_row(self, index, age, terminal_state="downloaded"):
+        self.state.operations.rows[terminal_operation_id(package(index))] = record(
+            package(index),
+            terminal_state=terminal_state,
+            state="complete",
+            updated=NOW - age,
+            package_removed=True,
+            package_terminal=True,
+        )
+
+    def test_an_ordinary_begin_prunes_expired_rows_far_below_capacity(self):
+        self.complete_row(1, COMPLETED_OPERATION_RETENTION_SECONDS)
+        self.complete_row(2, COMPLETED_OPERATION_RETENTION_SECONDS + 5)
+
+        result = self.begin(index=3)
+
+        self.assertEqual("opened", result["outcome"])
+        self.assertEqual({terminal_operation_id(package(3))}, set(self.rows()))
+        self.assertEqual(
+            {"prepared": 1, "submitted": 0, "complete": 0},
+            self.service.count_by_state(),
+        )
+
+    def test_an_ordinary_begin_prunes_at_the_exact_retention_boundary(self):
+        self.complete_row(1, COMPLETED_OPERATION_RETENTION_SECONDS + 1)
+        self.complete_row(2, COMPLETED_OPERATION_RETENTION_SECONDS)
+        self.complete_row(3, COMPLETED_OPERATION_RETENTION_SECONDS - 1)
+
+        self.begin(index=4)
+
+        self.assertEqual(
+            {terminal_operation_id(package(3)), terminal_operation_id(package(4))},
+            set(self.rows()),
+        )
+
+    def test_an_ordinary_begin_never_prunes_an_active_operation(self):
+        for index, state in ((1, "prepared"), (2, "submitted")):
+            self.state.operations.rows[terminal_operation_id(package(index))] = record(
+                package(index), state=state, updated=NOW - 400 * DAY
+            )
+        before = self.rows()
+
+        self.begin(index=3)
+
+        for operation_id, value in before.items():
+            self.assertEqual(value, self.rows()[operation_id])
+
+    def test_a_re_added_package_may_open_another_state_once_retention_passed(self):
+        self.complete_row(1, COMPLETED_OPERATION_RETENTION_SECONDS)
+
+        result = self.begin(index=1, terminal_state="failed")
+
+        self.assertEqual("opened", result["outcome"])
+        self.assertEqual("failed", result["record"]["terminal_state"])
+        self.assertEqual("prepared", result["record"]["state"])
+        self.assertEqual(NOW, result["record"]["created_epoch"])
+
+    def test_before_retention_another_terminal_state_still_conflicts(self):
+        self.complete_row(1, COMPLETED_OPERATION_RETENTION_SECONDS - 1)
+        before = self.rows()
+
+        result = self.begin(index=1, terminal_state="failed")
+
+        self.assertEqual("conflict", result["outcome"])
+        self.assertEqual(before, self.rows())
+
+    def test_before_retention_the_same_terminal_state_still_replays(self):
+        self.complete_row(1, COMPLETED_OPERATION_RETENTION_SECONDS - 1)
+        before = self.rows()
+
+        result = self.begin(index=1)
+
+        self.assertEqual("resumed", result["outcome"])
+        self.assertEqual("complete", result["record"]["state"])
+        self.assertTrue(result["record"]["package_removed"])
+        self.assertEqual(before, self.rows())
+
+
+class TerminalOperationLockTests(unittest.TestCase):
+    """One operation's side effects are serialized, and only that operation's.
+
+    Cross-process exclusion of the underlying file lock is owned by the storage
+    lock suite; what is proven here is the path this service derives and that
+    the execution context really holds it across admission and the transition.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.state = GuardedSharedState()
+        self.service = TerminalOperationService(self.state, clock=self.clock)
+        self.package_id = package(1)
+        self.operation_id = terminal_operation_id(self.package_id)
+
+    def exclusive(self, package_id=None, terminal_state="downloaded"):
+        package_id = package_id or self.package_id
+        return self.service.exclusive(
+            terminal_operation_id(package_id), package_id, terminal_state
+        )
+
+    def excluded_elsewhere(self, operation_id=None):
+        """Whether another thread is currently kept out of this operation."""
+        operation_id = self.operation_id if operation_id is None else operation_id
+        outcome = []
+
+        def probe():
+            try:
+                with self.service.operation_lock(operation_id).acquire(timeout=0):
+                    outcome.append(False)
+            except Timeout:
+                outcome.append(True)
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join(timeout=10)
+        self.assertEqual(1, len(outcome), msg="the lock probe never finished")
+        return outcome[0]
+
+    def test_every_operation_owns_a_stable_sanitized_lock_of_its_own(self):
+        elsewhere = TerminalOperationService(GuardedSharedState(), clock=self.clock)
+        mine = self.service.operation_lock(self.operation_id)
+        foreign = self.service.operation_lock(terminal_operation_id(package(2)))
+
+        self.assertIs(mine, elsewhere.operation_lock(self.operation_id))
+        self.assertNotEqual(mine.lock_file, foreign.lock_file)
+        self.assertEqual(tempfile.gettempdir(), os.path.dirname(mine.lock_file))
+        # The name is a digest, so no operation ID, package ID or separator a
+        # caller controls ever reaches the file system.
+        self.assertNotIn(self.operation_id, mine.lock_file)
+        self.assertNotIn(self.package_id, mine.lock_file)
+        for hostile in ("../../etc/quasarr", "a/b", "", None):
+            with self.subTest(operation_id=str(hostile)):
+                lock = self.service.operation_lock(hostile)
+                self.assertEqual(tempfile.gettempdir(), os.path.dirname(lock.lock_file))
+                self.assertRegex(
+                    os.path.basename(lock.lock_file), r"^quasarr_[0-9a-z_]+\.lock$"
+                )
+
+    def test_the_operation_lock_is_not_the_shared_admission_lock(self):
+        from quasarr.providers import terminal_operations
+
+        self.assertNotEqual(
+            terminal_operations._operation_lock.lock_file,
+            self.service.operation_lock(self.operation_id).lock_file,
+        )
+
+    def test_a_held_operation_excludes_a_second_thread_and_frees_it_after(self):
+        with self.service.operation_lock(self.operation_id):
+            self.assertTrue(self.excluded_elsewhere())
+
+        self.assertFalse(self.excluded_elsewhere())
+
+    def test_a_held_operation_never_blocks_a_different_operation(self):
+        other = terminal_operation_id(package(2))
+
+        with self.service.operation_lock(self.operation_id):
+            self.assertFalse(self.excluded_elsewhere(other))
+
+    def test_exclusive_holds_the_lock_across_admission_and_the_transition(self):
+        with self.exclusive() as opened:
+            self.assertEqual("opened", opened["outcome"])
+            self.assertEqual("prepared", opened["record"]["state"])
+            self.assertTrue(self.excluded_elsewhere())
+            self.service.mark_submitted(
+                self.operation_id, self.package_id, "downloaded"
+            )
+            self.assertTrue(self.excluded_elsewhere())
+
+        self.assertFalse(self.excluded_elsewhere())
+
+    def test_exclusive_releases_the_lock_when_the_side_effect_raises(self):
+        with self.assertRaises(RuntimeError):
+            with self.exclusive():
+                raise RuntimeError("the external side effect failed")
+
+        self.assertFalse(self.excluded_elsewhere())
+
+    def test_exclusive_refuses_a_malformed_identity_before_it_locks_anything(self):
+        malformed = "z" * 64
+
+        with self.assertRaises(ValueError):
+            with self.service.exclusive(malformed, self.package_id, "downloaded"):
+                self.fail("a malformed identity must never be admitted")
+
+        self.assertFalse(self.excluded_elsewhere(malformed))
+        self.assertFalse(self.excluded_elsewhere())
+        self.assertEqual({}, dict(self.state.operations.rows))
+
+    def test_a_waiting_thread_only_reads_the_state_the_holder_left_behind(self):
+        holder_inside = threading.Event()
+        follower_started = threading.Event()
+        follower_touched_storage = threading.Event()
+        observed = []
+
+        def note_access(_operation):
+            if threading.current_thread().name == "follower":
+                follower_touched_storage.set()
+
+        self.state.operations.access_hook = note_access
+
+        def holder():
+            with self.exclusive() as opened:
+                observed.append(opened["outcome"])
+                holder_inside.set()
+                follower_started.wait(timeout=10)
+                # In a build without the lock the follower is already inside by
+                # now; with it, this window can never be entered.
+                follower_touched_storage.wait(timeout=0.25)
+                self.service.mark_submitted(
+                    self.operation_id, self.package_id, "downloaded"
+                )
+
+        def follower():
+            holder_inside.wait(timeout=10)
+            follower_started.set()
+            with self.exclusive() as resumed:
+                observed.append(resumed["record"]["state"])
+
+        threads = [
+            threading.Thread(target=holder, name="holder"),
+            threading.Thread(target=follower, name="follower"),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        self.assertEqual([], [t.name for t in threads if t.is_alive()])
+        self.assertEqual(["opened", "submitted"], observed)
 
 
 class RealDatabaseTerminalOperationTests(unittest.TestCase):

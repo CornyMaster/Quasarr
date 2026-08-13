@@ -21,6 +21,7 @@ import hashlib
 import json
 import re
 import time
+from contextlib import contextmanager
 
 from quasarr.providers.log import debug, warn
 from quasarr.storage.lock import get_lock
@@ -51,6 +52,8 @@ CONFLICT = "conflict"
 CAPACITY = "capacity"
 
 _OPERATION_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+# Admission only: it guards the shared capacity of the table, never one
+# operation's side effects, which `operation_lock` owns per operation.
 _operation_lock = get_lock("terminal_operations")
 
 
@@ -106,6 +109,12 @@ class TerminalOperationService:
     row it acts on, and no callback ever resolves storage, a device, or
     settings. Capacity and pruning are proven before the transaction opens,
     because enumerating rows inside one is neither allowed nor sound.
+
+    A durable record alone still cannot stop two concurrent requests from
+    reading the same phase and both acting on it, so each operation also owns a
+    lock of its own that a caller holds across its whole transition. Lock order
+    is operation lock -> admission lock -> database lock, never the reverse,
+    and no external call is ever made while a storage lock is held.
     """
 
     def __init__(self, shared_state, clock=time.time):
@@ -130,6 +139,31 @@ class TerminalOperationService:
     @staticmethod
     def _result(outcome, record):
         return {"outcome": outcome, "record": record}
+
+    @staticmethod
+    def operation_lock(operation_id):
+        """The cross-process lock that serializes one operation's side effects.
+
+        The path is a digest of the identity rather than the identity itself,
+        so nothing a caller sends can shape a file name, and it is stable for
+        the same operation in every process and every service instance.
+        """
+        digest = hashlib.sha256(str(operation_id).encode("utf-8")).hexdigest()
+        return get_lock(f"terminal_operation_{digest}")
+
+    @contextmanager
+    def exclusive(self, operation_id, package_id, terminal_state):
+        """Admit one operation and hold it for the caller's whole transition.
+
+        The identity is validated before anything is locked, and the record is
+        re-read inside the lock, so what the caller decides from is what the
+        store held after every earlier attempt finished. The caller keeps the
+        lock until it leaves this block, which has to span the external side
+        effect and the durable phase that records it.
+        """
+        self._validate(operation_id, package_id, terminal_state)
+        with self.operation_lock(operation_id):
+            yield self.begin(operation_id, package_id, terminal_state)
 
     def _rows(self):
         return self._table().retrieve_all_titles() or ()
@@ -173,10 +207,7 @@ class TerminalOperationService:
         return pruned
 
     def _capacity_available(self):
-        """Whether one more operation may open, pruning what has expired first."""
-        if len(self._entries()) < MAXIMUM_TERMINAL_OPERATIONS:
-            return True
-        self.prune_completed()
+        """Whether one more operation may open, after expired rows are gone."""
         return len(self._entries()) < MAXIMUM_TERMINAL_OPERATIONS
 
     def begin(self, operation_id, package_id, terminal_state):
@@ -185,9 +216,15 @@ class TerminalOperationService:
         A repeated identity resumes at whatever phase it reached, so the caller
         can replay instead of repeating a side effect. A stored row naming
         another package or terminal state is a conflict and writes nothing.
+
+        Retention runs first, on every request rather than only on a full
+        table: an operation ID names a package, so a package that is added
+        again can only ever reach a different terminal state once the expired
+        record of its previous life is really gone.
         """
         self._validate(operation_id, package_id, terminal_state)
         with _operation_lock:
+            self.prune_completed()
             table = self._table()
             if decode_operation_record(table.retrieve(operation_id)) is None:
                 # Capacity is proven before any terminal side effect, never inside
