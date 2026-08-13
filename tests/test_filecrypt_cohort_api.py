@@ -1715,11 +1715,14 @@ class OfferOwnershipTests(CohortApiTestCase):
         deferred = self.service().get_package_defer(handout["id"])
         self.assertEqual([offer["link_fingerprint"]], deferred["link_fingerprints"])
 
-    def test_an_unreadable_inventory_writes_no_row_it_cannot_prove(self):
+    def test_an_unreadable_inventory_disproves_a_readable_foreign_row(self):
         self.store(filecrypt_rows(5))
         offer, handout = self.handout_offer()
         stranger = self.stranger_for(handout["id"])
-        packages = dict(self.state.databases["protected"].rows)
+        rows = {
+            table: dict(database.rows)
+            for table, database in self.state.databases.items()
+        }
 
         with mock.patch(
             "quasarr.api.sponsors_helper.enumerate_filecrypt_candidates",
@@ -1727,9 +1730,221 @@ class OfferOwnershipTests(CohortApiTestCase):
         ):
             response = self.call(DEFER_RULE, self.blocked_payload(offer, stranger))
 
+        # The narrow row read proved the mismatch, so the blind taint the
+        # inventory outage would otherwise install is never reached.
+        self.assertEqual("stale", response["instruction"])
+        self.assertEqual(
+            rows,
+            {
+                table: dict(database.rows)
+                for table, database in self.state.databases.items()
+            },
+        )
+
+
+class ProvenOwnershipTests(CohortApiTestCase):
+    """Ownership is proven, disproven, or unknown, and each answers differently."""
+
+    def setUp(self):
+        super().setUp()
+        self.store(filecrypt_rows(5))
+        self.renew_offer()
+
+    def renew_offer(self):
+        self.offer, handout = self.handout_offer()
+        self.owner = handout["id"]
+        self.stranger = next(
+            package(index) for index in range(1, 6) if package(index) != self.owner
+        )
+
+    def all_rows(self):
+        """Every row of every table, so a write anywhere at all is visible."""
+        return {
+            table: dict(database.rows)
+            for table, database in self.state.databases.items()
+        }
+
+    def blind(self):
+        return mock.patch(
+            "quasarr.api.sponsors_helper.enumerate_filecrypt_candidates",
+            side_effect=RuntimeError("inventory unavailable"),
+        )
+
+    def unreadable_owner_row(self):
+        return mock.patch.object(
+            self.state.databases["protected"],
+            "retrieve",
+            side_effect=RuntimeError("dbfile=/srv/secret/Quasarr.db"),
+        )
+
+    def assert_untouched(self, rule, payload, *, blind=False):
+        before = self.all_rows()
+        if blind:
+            with self.blind():
+                response = self.call(rule, payload)
+        else:
+            response = self.call(rule, payload)
+        self.assertEqual(before, self.all_rows())
+        return response
+
+    def assert_stale_defer(self, package_id, *, blind=False):
+        response = self.assert_untouched(
+            DEFER_RULE, self.blocked_payload(self.offer, package_id), blind=blind
+        )
+
+        self.assertEqual("stale", response["instruction"])
+        self.assertEqual("none", response["hold_type"])
+        self.assertEqual(0, response["retry_after_epoch"])
+
+    def assert_stale_access(self, package_id, *, access="clear", blind=False):
+        response = self.assert_untouched(
+            ACCESS_RULE,
+            self.access_payload(self.offer, package_id, access=access),
+            blind=blind,
+        )
+
+        self.assertIsInstance(response, HTTPResponse)
+        self.assertEqual(409, response.status_code)
+        body = json.loads(response.body)
+        self.assertEqual("stale", body["instruction"])
+        self.assertNotIn("cleared", body)
+
+    def assert_blind_taint(self):
+        packages = dict(self.state.databases["protected"].rows)
+
+        with self.blind():
+            response = self.call(
+                DEFER_RULE, self.blocked_payload(self.offer, self.owner)
+            )
+
+        self.assertEqual("hold", response["instruction"])
         self.assertEqual("individual", response["state"])
         self.assertEqual("inventory_unavailable", self.decision_row()["reason"])
         self.assertEqual(packages, self.state.databases["protected"].rows)
+        return response
+
+    def test_a_proven_owner_still_records_the_report_it_names(self):
+        response = self.call(DEFER_RULE, self.blocked_payload(self.offer, self.owner))
+
+        self.assertEqual("hold", response["instruction"])
+        self.assertEqual(
+            [self.offer["link_fingerprint"]],
+            self.service().get_package_defer(self.owner)["link_fingerprints"],
+        )
+
+    def test_a_readable_inventory_disproves_a_foreign_reporter(self):
+        self.assert_stale_defer(self.stranger)
+
+    def test_a_disproven_report_never_even_prunes_the_decision(self):
+        """A report that proved nothing may not decide the row has expired."""
+        self.clock.now = NOW + 121  # the unanswered lease of setUp has expired
+        self.drive_blocked(5)
+        self.assertEqual("cooldown", self.decision_row()["state"])
+        self.clock.now = NOW + COOLDOWN_SECONDS + 200
+
+        self.assert_stale_defer(self.stranger)
+
+        self.assertEqual("cooldown", self.decision_row()["state"])
+
+    def test_a_deleted_row_can_never_disprove_a_blind_reporter(self):
+        self.state.databases["protected"].rows.pop(self.owner)
+
+        self.assert_blind_taint()
+
+    def test_a_malformed_row_can_never_disprove_a_blind_reporter(self):
+        self.state.databases["protected"].update_store(self.owner, "{not json")
+
+        self.assert_blind_taint()
+
+    def test_an_ineligible_row_can_never_be_held_by_a_blind_reporter(self):
+        """It still carries the link, so it is unknown - and unknown holds nothing."""
+        row = json.loads(self.state.databases["protected"].rows[self.owner])
+        row["disabled"] = True
+        self.state.databases["protected"].update_store(self.owner, json.dumps(row))
+
+        self.assert_blind_taint()
+
+    def test_a_storage_error_is_unknown_and_never_reaches_the_helper(self):
+        packages = dict(self.state.databases["protected"].rows)
+
+        with (
+            self.blind(),
+            self.unreadable_owner_row(),
+            mock.patch("quasarr.providers.crypter_cooldowns.warn") as warned,
+        ):
+            response = self.call(
+                DEFER_RULE, self.blocked_payload(self.offer, self.owner)
+            )
+
+        self.assertEqual("hold", response["instruction"])
+        self.assertEqual("inventory_unavailable", self.decision_row()["reason"])
+        self.assertEqual(packages, self.state.databases["protected"].rows)
+        logged = " ".join(str(call.args[0]) for call in warned.call_args_list)
+        self.assertNotIn("/srv/secret/Quasarr.db", logged)
+        self.assertNotIn("/srv/secret/Quasarr.db", json.dumps(response))
+        self.assertIn(self.owner, logged)
+
+    def test_a_foreign_reporter_can_never_clear_the_generation(self):
+        self.drive_blocked(3)
+        self.renew_offer()
+
+        self.assert_stale_access(self.stranger)
+
+        self.assertEqual("sweeping", self.decision_row()["state"])
+
+    def test_an_unprovable_reporter_can_never_clear_the_generation(self):
+        self.drive_blocked(3)
+        self.renew_offer()
+        before = self.all_rows()
+
+        with self.blind(), self.unreadable_owner_row():
+            response = self.call(
+                ACCESS_RULE, self.access_payload(self.offer, self.owner)
+            )
+
+        # Health is evidence about a container, so a binding this could not
+        # authenticate may not end the generation - and may not taint it either.
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("stale", json.loads(response.body)["instruction"])
+        self.assertEqual(before, self.all_rows())
+        self.assertEqual("sweeping", self.decision_row()["state"])
+
+    def test_an_unprovable_reporter_may_still_report_an_unknown_access(self):
+        self.state.databases["protected"].rows.pop(self.owner)
+        packages = dict(self.state.databases["protected"].rows)
+
+        with self.blind():
+            response = self.call(
+                ACCESS_RULE,
+                self.access_payload(self.offer, self.owner, access="unknown"),
+            )
+
+        self.assertEqual("unknown", response["accepted"])
+        self.assertEqual("sweeping", response["state"])
+        self.assertEqual(1, response["sweep_tested"])
+        self.assertEqual(packages, self.state.databases["protected"].rows)
+
+    def test_a_foreign_reporter_cannot_even_report_an_unknown_access(self):
+        self.assert_stale_access(self.stranger, access="unknown")
+
+    def test_a_disproven_report_leaves_its_offer_replayable_for_the_owner(self):
+        self.assert_stale_defer(self.stranger)
+
+        accepted = self.call(DEFER_RULE, self.blocked_payload(self.offer, self.owner))
+        self.clock.now = NOW + 30
+        replay = self.call(DEFER_RULE, self.blocked_payload(self.offer, self.owner))
+
+        self.assertEqual("hold", accepted["instruction"])
+        self.assertEqual(accepted, replay)
+        self.assertEqual(
+            [self.offer["offer_id"]],
+            [entry["offer_id"] for entry in self.decision_row()["accepted_offers"]],
+        )
+
+    def test_an_accepted_result_is_never_replayable_by_a_stranger(self):
+        self.call(DEFER_RULE, self.blocked_payload(self.offer, self.owner))
+
+        self.assert_stale_defer(self.stranger)
 
 
 class VersionOnePrecedenceRaceTests(CohortApiTestCase):
@@ -2074,6 +2289,90 @@ class RealDatabaseCohortTests(unittest.TestCase):
         self.assertEqual(0, response["retry_after_epoch"])
         self.assertEqual(sweeping, cooldowns.retrieve(CRYPTER))
         self.assertNotIn("deferred", json.loads(protected.retrieve(package(1))))
+
+    def stored_rows(self):
+        return {
+            table: dict(self.state.get_db(table).retrieve_all_titles() or ())
+            for table in ("protected", "crypter_cooldowns", "crypter_events")
+        }
+
+    def real_handout(self):
+        return self.call(
+            DECRYPT_RULE,
+            {"supported_urls": ["filecrypt.invalid"], "capabilities": CAPABILITIES},
+        )["to_decrypt"]
+
+    def real_cohort(self, blocked=0):
+        protected = self.state.get_db("protected")
+        for index in range(1, 6):
+            protected.update_store(
+                package(index), protected_blob([[filecrypt_url(index), CRYPTER]])
+            )
+        for _ in range(blocked):
+            handout = self.real_handout()
+            offer = handout["crypter_offer"]
+            self.call(
+                DEFER_RULE,
+                {
+                    "package_id": handout["id"],
+                    "crypter": CRYPTER,
+                    "reason_code": REASON,
+                    "link_fingerprint": offer["link_fingerprint"],
+                    "sweep_id": offer["sweep_id"],
+                    "offer_id": offer["offer_id"],
+                },
+            )
+        handout = self.real_handout()
+        return handout, handout["crypter_offer"]
+
+    def real_clear(self, offer, package_id):
+        return self.call(
+            ACCESS_RULE,
+            {
+                "package_id": package_id,
+                "crypter": CRYPTER,
+                "access": "clear",
+                "link_fingerprint": offer["link_fingerprint"],
+                "sweep_id": offer["sweep_id"],
+                "offer_id": offer["offer_id"],
+            },
+        )
+
+    def test_a_foreign_clear_changes_no_real_row(self):
+        handout, offer = self.real_cohort(blocked=3)
+        stranger = next(
+            package(index) for index in range(1, 6) if package(index) != handout["id"]
+        )
+        before = self.stored_rows()
+
+        response = self.real_clear(offer, stranger)
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("stale", json.loads(response.body)["instruction"])
+        self.assertEqual(before, self.stored_rows())
+        service = CrypterCooldownService(self.state, clock=self.clock)
+        self.assertEqual(3, service.count_active_deferred_packages())
+
+    def test_an_unprovable_clear_changes_no_real_row(self):
+        handout, offer = self.real_cohort(blocked=3)
+        self.state.get_db("protected").delete(handout["id"])
+        before = self.stored_rows()
+
+        with mock.patch(
+            "quasarr.api.sponsors_helper.enumerate_filecrypt_candidates",
+            side_effect=RuntimeError("inventory unavailable"),
+        ):
+            response = self.real_clear(offer, handout["id"])
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("stale", json.loads(response.body)["instruction"])
+        self.assertEqual(before, self.stored_rows())
+        self.assertEqual(
+            "sweeping",
+            json.loads(self.state.get_db("crypter_cooldowns").retrieve(CRYPTER))[
+                "state"
+            ],
+        )
 
 
 if __name__ == "__main__":

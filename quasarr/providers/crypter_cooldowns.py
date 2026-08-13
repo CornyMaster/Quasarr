@@ -12,6 +12,9 @@ from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.providers.crypter_sweeps import (
     FAIL_CLOSED_INDIVIDUAL_REASON,
     MAXIMUM_COHORT_SIZE,
+    OWNERSHIP_NOT_OWNED,
+    OWNERSHIP_OWNED,
+    OWNERSHIP_UNKNOWN,
     SWEEP_SCHEMA_VERSION,
     Offer,
     bypass_decision,
@@ -703,16 +706,15 @@ class CrypterCooldownService:
         return migrate_legacy_record(current_value, now=now)
 
     def _report_ownership(self, crypter, package_id, link_fingerprint, inventory):
-        """Whether one report may write, and which protected rows it may write.
+        """What one report proved about itself, and which rows it may write.
 
-        An offer identity proves a generation, never a container, so the write
-        set is the live occurrence set of the reported link. While the inventory
-        can be read, a reporting package that does not own that link is stale
-        and writes nothing at all - a deleted, replaced, or simply wrong package
-        must never collect a hold for a link it does not carry. While it cannot,
-        one narrow row read may still prove the reporter itself; ownership that
-        stays unproven writes no row, so the fail-closed decision transition is
-        the only thing the report can still change.
+        An offer identity proves a generation, never a container, so ownership
+        of the reported link has to be established separately - and it has three
+        outcomes, not two. While the inventory can be read it is decisive: the
+        write set is the live occurrence set of that link, and a reporting
+        package that is not in it is proven wrong. While it cannot, one narrow
+        row read may still prove or disprove the reporter itself, but a row that
+        is missing, unreadable, or unreachable proves neither and stays unknown.
 
         Resolved before the transaction opens, so no mutation callback ever
         enumerates or reads storage.
@@ -727,19 +729,39 @@ class CrypterCooldownService:
                 }
             )
             if package_id not in owners:
-                return True, ()
-            return False, tuple(owners)
+                return OWNERSHIP_NOT_OWNED, ()
+            return OWNERSHIP_OWNED, tuple(owners)
         try:
             raw_package = self._shared_state.get_db("protected").retrieve(package_id)
         except Exception:
-            raw_package = None
+            # Only the two validated identifiers, never the storage error: a
+            # report may not learn anything about the store that answered it.
+            warn(
+                f'Ownership of package "{package_id}" could not be read while '
+                f'answering a "{crypter}" cohort report'
+            )
+            return OWNERSHIP_UNKNOWN, ()
         # Imported here because the candidate module reaches back into
         # `quasarr.downloads`, which imports this one at module scope.
-        from quasarr.providers.crypter_candidates import package_owns_fingerprint
+        from quasarr.providers.crypter_candidates import classify_package_ownership
 
-        if package_owns_fingerprint(raw_package, crypter, link_fingerprint):
-            return False, (package_id,)
-        return False, ()
+        ownership = classify_package_ownership(raw_package, crypter, link_fingerprint)
+        if ownership == OWNERSHIP_OWNED:
+            return ownership, (package_id,)
+        return ownership, ()
+
+    def _stale_report(self, crypter):
+        """Answer a report that proved no ownership, touching no row at all.
+
+        A pure read, so the decision, every package, and the ledger stay byte
+        for byte what they were - not even the expiry a transition would have
+        pruned on its way past. A reporter that cannot prove it carries the link
+        it names may not spend its offer, collect a hold, taint a generation, or
+        end one.
+        """
+        now = int(self._clock())
+        current = self._shared_state.get_db("crypter_cooldowns").retrieve(crypter)
+        return stale_decision(self._current_decision(current, now), now=now)
 
     def _commit_transition(self, crypter, targets, transition, package_write):
         """Commit one decision, its package rows, and its ledger deltas together.
@@ -858,14 +880,14 @@ class CrypterCooldownService:
         reason_code = _validate_reason_code(reason_code)
         if not crypter_blocks_deferred(self._shared_state):
             return bypass_decision()
-        cooldown_seconds = self._cooldown_seconds()
-        stale, targets = self._report_ownership(
+        ownership, targets = self._report_ownership(
             crypter, package_id, link_fingerprint, inventory
         )
+        if ownership == OWNERSHIP_NOT_OWNED:
+            return self._stale_report(crypter)
+        cooldown_seconds = self._cooldown_seconds()
 
         def transition(record, now):
-            if stale:
-                return record, stale_decision(record, now=now)
             return record_blocked(
                 record, offer, inventory, now=now, cooldown_seconds=cooldown_seconds
             )
@@ -925,13 +947,19 @@ class CrypterCooldownService:
             raise ValueError(f'Unsupported linkcrypter access value "{access}"')
         if not crypter_blocks_deferred(self._shared_state):
             return bypass_decision()
-        stale, targets = self._report_ownership(
+        ownership, targets = self._report_ownership(
             crypter, package_id, link_fingerprint, inventory
         )
+        # A CLEAR is the only report that ends a generation for every package at
+        # once, and the only evidence for it is that this container opened. An
+        # unproven binding is therefore not evidence of health, so an ownership
+        # that is merely unknown answers stale rather than clearing or tainting.
+        if ownership == OWNERSHIP_NOT_OWNED or (
+            ownership == OWNERSHIP_UNKNOWN and access == "clear"
+        ):
+            return self._stale_report(crypter)
 
         def transition(record, now):
-            if stale:
-                return record, stale_decision(record, now=now)
             return record_access(record, offer, access, inventory, now=now)
 
         def package_write(decision):

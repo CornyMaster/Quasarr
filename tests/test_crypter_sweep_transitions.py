@@ -2323,6 +2323,10 @@ class CohortBlockedServiceTests(SweepServiceTestCase):
         offer = self.open_sweep()
         self.report_blocked(offer, package(1))
         second = self.service.prepare_offer(CRYPTER, self.inventory)
+        # These synthetic fingerprints are not the digests of the stored links,
+        # so any readable row would disprove the reporter outright; removing the
+        # row is what leaves its ownership genuinely unknown.
+        self.state.databases["protected"].rows.pop(package(2))
 
         decision = self.service.record_cohort_blocked(
             CRYPTER,
@@ -2344,13 +2348,38 @@ class CohortBlockedServiceTests(SweepServiceTestCase):
             package_defer_is_active(self.stored_defer(package(1)), current, now=NOW),
             "the earlier member of the tainted generation is released",
         )
-        # These synthetic fingerprints are not the digests of the stored links,
-        # so the narrow verifier cannot prove the reporter owns the offer and no
-        # package row is written at all.
-        self.assertIsNone(self.stored_defer(package(2)))
+        # Unproven ownership authorizes no package at all, so the reporter does
+        # not even get a row of its own back.
+        self.assertNotIn(package(2), self.state.databases["protected"].rows)
         follow_up = self.service.prepare_offer(CRYPTER, self.inventory)
         self.assertEqual("individual", follow_up["mode"])
         self.assertEqual("individual", self.stored_decision()["state"])
+
+    def test_an_inventory_outage_still_defers_to_a_readable_row(self):
+        offer = self.open_sweep()
+        self.report_blocked(offer, package(1))
+        second = self.service.prepare_offer(CRYPTER, self.inventory)
+        decisions = dict(self.state.databases["crypter_cooldowns"].rows)
+        packages = dict(self.state.databases["protected"].rows)
+        self.state.databases["crypter_cooldowns"].mutations.clear()
+
+        decision = self.service.record_cohort_blocked(
+            CRYPTER,
+            package(2),
+            second["link_fingerprint"],
+            second["sweep_id"],
+            second["offer_id"],
+            REASON,
+            None,
+        )
+
+        # The row of package(2) is readable and does not carry the reported
+        # link, so the outage never gets as far as tainting the generation.
+        self.assertEqual("stale", decision["instruction"])
+        self.assertEqual("sweeping", self.stored_decision()["state"])
+        self.assertEqual(decisions, self.state.databases["crypter_cooldowns"].rows)
+        self.assertEqual(packages, self.state.databases["protected"].rows)
+        self.assertEqual([], self.state.databases["crypter_cooldowns"].mutations)
 
     def test_the_conclusive_cohort_counts_one_cooldown_and_holds_every_member(self):
         offer = self.open_sweep()

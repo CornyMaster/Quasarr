@@ -156,6 +156,14 @@ _RECORD_KEYS = {
 }
 _PACKAGE_CANDIDATE_KEYS = frozenset({"title", "password"})
 
+# What one reporting package could be proven to be. `OWNERSHIP_NOT_OWNED` is a
+# positive finding - the row was readable and does not carry the link - while
+# `OWNERSHIP_UNKNOWN` is the absence of any finding at all, so the two may never
+# authorize the same answer.
+OWNERSHIP_OWNED = "owned"
+OWNERSHIP_NOT_OWNED = "not_owned"
+OWNERSHIP_UNKNOWN = "unknown"
+
 
 def _identifier(value, field_name):
     if not isinstance(value, str) or not _IDENTIFIER_PATTERN.fullmatch(value):

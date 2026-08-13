@@ -12,6 +12,9 @@ from quasarr.downloads import resolve_protected_crypter_key
 from quasarr.providers.crypter_sweeps import (
     MAXIMUM_COHORT_OCCURRENCES,
     MAXIMUM_COHORT_SIZE,
+    OWNERSHIP_NOT_OWNED,
+    OWNERSHIP_OWNED,
+    OWNERSHIP_UNKNOWN,
     helper_package_is_candidate,
 )
 
@@ -60,26 +63,38 @@ def link_fingerprint(crypter: str, url: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def package_owns_fingerprint(raw_package, crypter: str, fingerprint: str) -> bool:
-    """Whether one stored protected row still carries this exact crypter link.
+def _link_carries_fingerprint(link, crypter: str, fingerprint: str) -> bool:
+    if resolve_protected_crypter_key(link) != crypter:
+        return False
+    url = link[0] if isinstance(link, (list, tuple)) and link else link
+    return isinstance(url, str) and link_fingerprint(crypter, url) == fingerprint
 
-    Narrow by design: it parses one raw row and proves one fingerprint, so a
-    report whose global inventory could not be read may still authorize a hold
-    on the package it names - and only on that package.
+
+def classify_package_ownership(raw_package, crypter: str, fingerprint: str) -> str:
+    """What one stored protected row proves about carrying this crypter link.
+
+    Narrow by design: it parses one raw row so a report whose global inventory
+    could not be read may still authorize a hold on the package it names - and
+    only on that package. The three answers are kept apart because a row that
+    could not be read proves nothing, while a row that could be read and does
+    not carry the link disproves the reporter outright. A row that carries the
+    link but could never be handed out is unknown rather than either: it is not
+    a mismatch, and it is not an ownership this may accept.
     """
     try:
         package = json.loads(raw_package)
     except (TypeError, ValueError, RecursionError):
-        return False
+        return OWNERSHIP_UNKNOWN
+    if not isinstance(package, dict) or not isinstance(package.get("links"), list):
+        return OWNERSHIP_UNKNOWN
+    if not any(
+        _link_carries_fingerprint(link, crypter, fingerprint)
+        for link in package["links"]
+    ):
+        return OWNERSHIP_NOT_OWNED
     if not helper_package_is_candidate(package):
-        return False
-    for link in package["links"]:
-        if resolve_protected_crypter_key(link) != crypter:
-            continue
-        url = link[0] if isinstance(link, (list, tuple)) and link else link
-        if isinstance(url, str) and link_fingerprint(crypter, url) == fingerprint:
-            return True
-    return False
+        return OWNERSHIP_UNKNOWN
+    return OWNERSHIP_OWNED
 
 
 def _canonical_rows(protected_rows):

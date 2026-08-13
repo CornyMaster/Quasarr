@@ -11,6 +11,7 @@ from quasarr.providers.crypter_candidates import (
     FilecryptCandidate,
     FilecryptInventory,
     FilecryptOccurrence,
+    classify_package_ownership,
     enumerate_filecrypt_candidates,
     link_fingerprint,
     normalize_crypter_url,
@@ -18,6 +19,9 @@ from quasarr.providers.crypter_candidates import (
 from quasarr.providers.crypter_sweeps import (
     MAXIMUM_COHORT_OCCURRENCES,
     MAXIMUM_COHORT_SIZE,
+    OWNERSHIP_NOT_OWNED,
+    OWNERSHIP_OWNED,
+    OWNERSHIP_UNKNOWN,
     helper_package_is_candidate,
 )
 
@@ -331,6 +335,76 @@ class FilecryptCandidateInventoryTests(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             json.dumps(inventory)
+
+
+class PackageOwnershipClassificationTests(unittest.TestCase):
+    """One raw row answers owned, not owned, or unknown - never two of them."""
+
+    URL = "https://filecrypt.invalid/Container/Owned.html"
+    OTHER = "https://filecrypt.invalid/Container/Other.html"
+
+    def classify(self, raw_package, url=None):
+        return classify_package_ownership(
+            raw_package, "filecrypt", link_fingerprint("filecrypt", url or self.URL)
+        )
+
+    def row(self, links, **extra):
+        return protected_row(package_id(1), links, **extra)[1]
+
+    def test_a_canonical_row_carrying_the_exact_link_is_owned(self):
+        self.assertEqual(
+            OWNERSHIP_OWNED, self.classify(self.row([[self.URL, "filecrypt"]]))
+        )
+
+    def test_normalization_decides_ownership_not_the_stored_spelling(self):
+        stored = "HTTPS://user:pw@FileCrypt.invalid:443/Container/Owned.html#frag"
+
+        self.assertEqual(
+            OWNERSHIP_OWNED, self.classify(self.row([[stored, "filecrypt"]]))
+        )
+
+    def test_a_readable_row_without_the_link_is_proven_not_owned(self):
+        cases = (
+            [[self.OTHER, "filecrypt"]],
+            [["https://tolink.invalid/Container/Owned.html", "tolink"]],
+            [],
+        )
+
+        for links in cases:
+            with self.subTest(links=links):
+                self.assertEqual(OWNERSHIP_NOT_OWNED, self.classify(self.row(links)))
+
+    def test_a_row_that_cannot_be_read_proves_nothing(self):
+        cases = (
+            None,
+            "",
+            "{not json",
+            json.dumps("a string"),
+            json.dumps([[self.URL, "filecrypt"]]),
+            json.dumps({"title": "T", "password": "", "links": "not-a-list"}),
+            json.dumps({"title": "T", "password": ""}),
+        )
+
+        for raw_package in cases:
+            with self.subTest(raw_package=raw_package):
+                self.assertEqual(OWNERSHIP_UNKNOWN, self.classify(raw_package))
+
+    def test_an_ineligible_row_that_still_carries_the_link_is_unknown(self):
+        """It is not a proven mismatch, so it may not disprove the reporter."""
+        cases = (
+            self.row([[self.URL, "filecrypt"]], disabled=True),
+            json.dumps({"title": "T", "links": [[self.URL, "filecrypt"]]}),
+        )
+
+        for raw_package in cases:
+            with self.subTest(raw_package=raw_package):
+                self.assertFalse(helper_package_is_candidate(json.loads(raw_package)))
+                self.assertEqual(OWNERSHIP_UNKNOWN, self.classify(raw_package))
+
+    def test_a_malformed_link_never_raises_and_never_proves_ownership(self):
+        raw_package = self.row([None, [], [5], [self.OTHER, "filecrypt"]])
+
+        self.assertEqual(OWNERSHIP_NOT_OWNED, self.classify(raw_package))
 
 
 if __name__ == "__main__":
