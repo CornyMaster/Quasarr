@@ -3,10 +3,12 @@
 import unittest
 
 from quasarr.downloads.packages import (
+    get_links_comment,
     get_links_status,
     is_not_downloadable,
     is_quasarr_package,
 )
+from quasarr.providers.terminal_operations import submission_comment
 
 PACKAGE = {"uuid": 1, "name": "Synthetic.Release.Example"}
 
@@ -50,6 +52,48 @@ class IsQuasarrPackageTests(unittest.TestCase):
         ):
             with self.subTest(package_id=package_id):
                 self.assertFalse(is_quasarr_package(package_id))
+
+
+class LinksCommentTests(unittest.TestCase):
+    """A terminal submission stays a Quasarr package everywhere it is read.
+
+    The additive operation marker travels in the same comment field, so the
+    package projection has to read the package ID out of it - otherwise every
+    version-two download would look foreign and lose its category, status and
+    auto-start.
+    """
+
+    PACKAGE_ID = "Quasarr_movies_" + "a1" * 16
+
+    def link(self, comment):
+        return {"uuid": 9, "packageUUID": 1, "comment": comment}
+
+    def test_a_marked_comment_resolves_to_its_package_id(self):
+        marked = submission_comment(self.PACKAGE_ID, "c0" * 32)
+
+        self.assertEqual(
+            self.PACKAGE_ID, get_links_comment(PACKAGE, [self.link(marked)])
+        )
+
+    def test_a_bare_comment_keeps_resolving_unchanged(self):
+        self.assertEqual(
+            self.PACKAGE_ID,
+            get_links_comment(PACKAGE, [self.link(self.PACKAGE_ID)]),
+        )
+
+    def test_a_marked_comment_is_preferred_over_a_foreign_fallback(self):
+        marked = submission_comment(self.PACKAGE_ID, "c0" * 32)
+
+        self.assertEqual(
+            self.PACKAGE_ID,
+            get_links_comment(PACKAGE, [self.link("foreign"), self.link(marked)]),
+        )
+
+    def test_a_foreign_comment_is_still_reported_verbatim(self):
+        self.assertEqual(
+            "foreign comment",
+            get_links_comment(PACKAGE, [self.link("foreign comment")]),
+        )
 
 
 class IsNotDownloadableTests(unittest.TestCase):

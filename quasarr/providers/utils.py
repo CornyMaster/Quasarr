@@ -1554,8 +1554,11 @@ def get_recently_searched(shared_state, context, timeout_seconds):
     return recently_searched
 
 
-def download_package(links, title, password, package_id, shared_state):
+def download_package(links, title, password, package_id, shared_state, comment=None):
     links = [sanitize_url(link) for link in links]
+    # The comment is the identity JDownloader hands back; a caller that has to
+    # recognize its own submission may extend it, but never replace it.
+    comment = package_id if comment is None else comment
 
     def submit(device):
         return device.linkgrabber.add_links(
@@ -1568,7 +1571,7 @@ def download_package(links, title, password, package_id, shared_state):
                     "priority": "DEFAULT",
                     "downloadPassword": password,
                     "destinationFolder": "Quasarr/<jd:packagename>",
-                    "comment": package_id,
+                    "comment": comment,
                     "overwritePackagizerRules": True,
                 }
             ]

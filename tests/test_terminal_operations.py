@@ -13,14 +13,21 @@ from filelock import Timeout
 from quasarr.providers import shared_state as provider_shared_state
 from quasarr.providers.terminal_operations import (
     COMPLETED_OPERATION_RETENTION_SECONDS,
+    EFFECT_STATES,
+    LEGACY_OPERATION_RECORD_KEYS,
     MAXIMUM_TERMINAL_OPERATIONS,
+    OPERATION_PHASES,
     OPERATION_RECORD_KEYS,
     OPERATION_STATES,
     TERMINAL_OPERATION_DOMAIN,
+    TERMINAL_OPERATION_MARKER,
     TERMINAL_OPERATION_TABLE,
     TERMINAL_STATES,
     TerminalOperationService,
     decode_operation_record,
+    decode_submission_comment,
+    operation_evidence,
+    submission_comment,
     terminal_operation_id,
 )
 from quasarr.storage.sqlite_database import DataBase
@@ -136,7 +143,7 @@ class GuardedSharedState:
         self.values[key] = value
 
 
-def record(
+def legacy_record(
     package_id,
     terminal_state="downloaded",
     state="prepared",
@@ -145,6 +152,7 @@ def record(
     package_removed=False,
     package_terminal=False,
 ):
+    """The exact seven-key row shape shipped before the effect phase existed."""
     return json.dumps(
         {
             "state": state,
@@ -158,6 +166,33 @@ def record(
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def record(
+    package_id,
+    terminal_state="downloaded",
+    state="prepared",
+    created=NOW,
+    updated=NOW,
+    package_removed=False,
+    package_terminal=False,
+    effect_state=None,
+):
+    if effect_state is None:
+        effect_state = "not_started" if state == "prepared" else "applied"
+    stored = json.loads(
+        legacy_record(
+            package_id,
+            terminal_state=terminal_state,
+            state=state,
+            created=created,
+            updated=updated,
+            package_removed=package_removed,
+            package_terminal=package_terminal,
+        )
+    )
+    stored["effect_state"] = effect_state
+    return json.dumps(stored, sort_keys=True, separators=(",", ":"))
 
 
 class TerminalOperationIdentityTests(unittest.TestCase):
@@ -188,6 +223,8 @@ class TerminalOperationIdentityTests(unittest.TestCase):
         )
         self.assertEqual({"downloaded", "failed", "disabled"}, set(TERMINAL_STATES))
         self.assertEqual({"prepared", "submitted", "complete"}, set(OPERATION_STATES))
+        self.assertEqual(("not_started", "attempting", "applied"), tuple(EFFECT_STATES))
+        self.assertEqual("terminal_operation", TERMINAL_OPERATION_MARKER)
         self.assertEqual(
             {
                 "state",
@@ -197,9 +234,124 @@ class TerminalOperationIdentityTests(unittest.TestCase):
                 "updated_epoch",
                 "package_removed",
                 "package_terminal",
+                "effect_state",
             },
             set(OPERATION_RECORD_KEYS),
         )
+        self.assertEqual(
+            set(OPERATION_RECORD_KEYS) - {"effect_state"},
+            set(LEGACY_OPERATION_RECORD_KEYS),
+        )
+
+    def test_the_phases_are_ordered_and_only_a_started_effect_is_applied(self):
+        # An effect is "applied" exactly when the operation left `prepared`, so
+        # a row can never claim a submission it has no phase for.
+        self.assertEqual(
+            (
+                ("prepared", "not_started"),
+                ("prepared", "attempting"),
+                ("submitted", "applied"),
+                ("complete", "applied"),
+            ),
+            tuple(OPERATION_PHASES),
+        )
+
+
+class OperationEvidenceTests(unittest.TestCase):
+    """The token that ties one artifact to the operation record that made it.
+
+    Package IDs are derived from the release, so one package reuses one
+    operation ID for its whole life. Only the record that opened this attempt
+    separates the artifacts of this lifecycle from those of an earlier one.
+    """
+
+    def test_the_evidence_is_the_documented_digest_of_this_record(self):
+        stored = json.loads(record(package(1)))
+
+        evidence = operation_evidence(stored)
+
+        self.assertEqual(
+            hashlib.sha256(
+                f"{TERMINAL_OPERATION_DOMAIN}\n{package(1)}\n{NOW}".encode("utf-8")
+            ).hexdigest(),
+            evidence,
+        )
+        self.assertRegex(evidence, r"^[0-9a-f]{64}$")
+
+    def test_the_evidence_never_changes_while_the_operation_advances(self):
+        opened = json.loads(record(package(1)))
+        advanced = json.loads(record(package(1), state="submitted", updated=NOW + 3600))
+
+        self.assertEqual(operation_evidence(opened), operation_evidence(advanced))
+
+    def test_a_later_lifecycle_of_the_same_package_proves_nothing_here(self):
+        first = json.loads(record(package(1)))
+        # A new operation for the same package can only open once the old one
+        # was pruned, which is at least the whole retention window later.
+        second = json.loads(
+            record(
+                package(1),
+                created=NOW + COMPLETED_OPERATION_RETENTION_SECONDS,
+                updated=NOW + COMPLETED_OPERATION_RETENTION_SECONDS,
+            )
+        )
+
+        self.assertNotEqual(operation_evidence(first), operation_evidence(second))
+        self.assertNotEqual(
+            operation_evidence(first),
+            operation_evidence(json.loads(record(package(2)))),
+        )
+
+    def test_the_evidence_carries_no_readable_identifier(self):
+        evidence = operation_evidence(json.loads(record(package(1))))
+
+        self.assertNotIn(package(1), evidence)
+        self.assertNotIn("Quasarr", evidence)
+
+
+class SubmissionCommentTests(unittest.TestCase):
+    """What a JDownloader package comment may carry, and what it proves.
+
+    Legacy and manual submissions travel the bare package ID, which every
+    consumer already reads as the Quasarr identity. A version-two terminal
+    submission adds the evidence of the operation behind it, and nothing else.
+    """
+
+    def test_a_submission_without_an_operation_travels_the_bare_package_id(self):
+        self.assertEqual(package(1), submission_comment(package(1)))
+        self.assertEqual(package(1), submission_comment(package(1), None))
+
+    def test_a_marked_comment_round_trips_to_its_package_and_evidence(self):
+        evidence = operation_evidence(json.loads(record(package(1))))
+
+        comment = submission_comment(package(1), evidence)
+
+        self.assertEqual(f"{package(1)} op:{evidence}", comment)
+        self.assertEqual((package(1), evidence), decode_submission_comment(comment))
+
+    def test_an_unmarked_comment_is_its_own_package_id_and_proves_nothing(self):
+        for comment in (package(1), "foreign package", ""):
+            with self.subTest(comment=comment):
+                self.assertEqual((comment, None), decode_submission_comment(comment))
+
+    def test_a_malformed_marker_is_never_read_as_evidence(self):
+        evidence = operation_evidence(json.loads(record(package(1))))
+        for comment in (
+            f"{package(1)} op:{evidence.upper()}",
+            f"{package(1)} op:{evidence[:63]}",
+            f"{package(1)} op:{evidence}0",
+            f"{package(1)} op:",
+            f"{package(1)}  op:{evidence}",
+            f"{package(1)} OP:{evidence}",
+            f"{package(1)} op:{evidence} op:{evidence}",
+        ):
+            with self.subTest(comment=comment[-24:]):
+                self.assertEqual((comment, None), decode_submission_comment(comment))
+
+    def test_a_comment_that_is_not_text_names_nothing(self):
+        for comment in (None, 7, [package(1)], {"comment": package(1)}):
+            with self.subTest(comment=str(comment)):
+                self.assertEqual((None, None), decode_submission_comment(comment))
 
 
 class OperationRecordCodecTests(unittest.TestCase):
@@ -209,6 +361,24 @@ class OperationRecordCodecTests(unittest.TestCase):
         self.assertEqual(set(OPERATION_RECORD_KEYS), set(decoded))
         self.assertEqual("prepared", decoded["state"])
         self.assertEqual(package(1), decoded["package_id"])
+        self.assertEqual("not_started", decoded["effect_state"])
+
+    def test_a_legacy_prepared_row_can_never_claim_a_side_effect(self):
+        decoded = decode_operation_record(legacy_record(package(1)))
+
+        self.assertEqual(set(OPERATION_RECORD_KEYS), set(decoded))
+        self.assertEqual("prepared", decoded["state"])
+        self.assertEqual("not_started", decoded["effect_state"])
+
+    def test_a_legacy_submitted_or_complete_row_stays_replayable(self):
+        for state in ("submitted", "complete"):
+            with self.subTest(state=state):
+                decoded = decode_operation_record(
+                    legacy_record(package(1), state=state)
+                )
+
+                self.assertEqual(state, decoded["state"])
+                self.assertEqual("applied", decoded["effect_state"])
 
     def test_every_unusable_row_decodes_to_none_instead_of_raising(self):
         deep = "[" * 100_000 + "]" * 100_000
@@ -229,7 +399,9 @@ class OperationRecordCodecTests(unittest.TestCase):
             deep,
             digits,
         ]
-        for key in sorted(OPERATION_RECORD_KEYS):
+        # Dropping `effect_state` leaves the legacy shape, which migrates; any
+        # other key missing leaves a set no shape ever had.
+        for key in sorted(LEGACY_OPERATION_RECORD_KEYS):
             missing = dict(base)
             missing.pop(key)
             cases.append(json.dumps(missing))
@@ -243,6 +415,26 @@ class OperationRecordCodecTests(unittest.TestCase):
         cases.append(json.dumps({**base, "updated_epoch": 1.5}))
         cases.append(json.dumps({**base, "package_removed": "yes"}))
         cases.append(json.dumps({**base, "package_terminal": 1}))
+        cases.append(json.dumps({**base, "effect_state": "started"}))
+        cases.append(json.dumps({**base, "effect_state": None}))
+        # An incoherent pair would let a row claim an outcome no phase of this
+        # operation can have produced.
+        for state, effect_state in (
+            ("prepared", "applied"),
+            ("submitted", "not_started"),
+            ("submitted", "attempting"),
+            ("complete", "not_started"),
+            ("complete", "attempting"),
+        ):
+            cases.append(
+                json.dumps({**base, "state": state, "effect_state": effect_state})
+            )
+        legacy = json.loads(legacy_record(package(1)))
+        cases.append(json.dumps({**legacy, "links": ["https://filecrypt.invalid/1"]}))
+        for key in sorted(legacy):
+            partial = dict(legacy)
+            partial.pop(key)
+            cases.append(json.dumps(partial))
 
         for value in cases:
             with self.subTest(value=str(value)[:60]):
@@ -315,6 +507,7 @@ class TerminalOperationServiceTests(unittest.TestCase):
                 "updated_epoch": NOW,
                 "package_removed": False,
                 "package_terminal": False,
+                "effect_state": "not_started",
             },
             stored,
         )
@@ -361,6 +554,7 @@ class TerminalOperationServiceTests(unittest.TestCase):
         submitted = self.service.mark_submitted(operation_id, package_id, "downloaded")
         self.assertEqual("applied", submitted["outcome"])
         self.assertEqual("submitted", submitted["record"]["state"])
+        self.assertEqual("applied", submitted["record"]["effect_state"])
 
         repeated = self.service.mark_submitted(operation_id, package_id, "downloaded")
         self.assertEqual("resumed", repeated["outcome"])
@@ -399,6 +593,77 @@ class TerminalOperationServiceTests(unittest.TestCase):
         stored = json.loads(self.rows()[operation_id])
         self.assertEqual(NOW, stored["created_epoch"])
         self.assertEqual(NOW + 30, stored["updated_epoch"])
+
+    def test_an_attempt_is_recorded_before_the_state_and_only_moves_forward(self):
+        """The phase that separates "admitted" from "the world may have changed".
+
+        Nothing outside this record can prove which of the two a crashed
+        operation was in, so the attempt is persisted before the side effect
+        and can never fall back to `not_started`.
+        """
+        package_id = package(1)
+        operation_id = terminal_operation_id(package_id)
+        self.begin()
+        self.clock.now = NOW + 5
+
+        attempting = self.service.mark_effect_attempting(
+            operation_id, package_id, "downloaded"
+        )
+
+        self.assertEqual("applied", attempting["outcome"])
+        self.assertEqual("prepared", attempting["record"]["state"])
+        self.assertEqual("attempting", attempting["record"]["effect_state"])
+        stored = json.loads(self.rows()[operation_id])
+        self.assertEqual("attempting", stored["effect_state"])
+        self.assertEqual(NOW + 5, stored["updated_epoch"])
+
+        writes = self.state.operations.writes
+        repeated = self.service.mark_effect_attempting(
+            operation_id, package_id, "downloaded"
+        )
+        self.assertEqual("resumed", repeated["outcome"])
+        self.assertEqual(writes, self.state.operations.writes)
+
+        self.service.mark_submitted(operation_id, package_id, "downloaded")
+        after = self.service.mark_effect_attempting(
+            operation_id, package_id, "downloaded"
+        )
+        self.assertEqual("resumed", after["outcome"])
+        self.assertEqual("submitted", after["record"]["state"])
+        self.assertEqual("applied", after["record"]["effect_state"])
+
+    def test_marking_an_attempt_on_a_missing_or_foreign_operation_conflicts(self):
+        package_id = package(1)
+        operation_id = terminal_operation_id(package_id)
+
+        missing = self.service.mark_effect_attempting(
+            operation_id, package_id, "downloaded"
+        )
+        self.assertEqual("conflict", missing["outcome"])
+        self.assertEqual({}, self.rows())
+
+        self.begin()
+        before = self.rows()
+        foreign = self.service.mark_effect_attempting(
+            operation_id, package_id, "failed"
+        )
+        self.assertEqual("conflict", foreign["outcome"])
+        self.assertEqual(before, self.rows())
+
+    def test_a_legacy_row_is_rewritten_in_the_current_shape_when_it_advances(self):
+        package_id = package(1)
+        operation_id = terminal_operation_id(package_id)
+        self.state.operations.rows[operation_id] = legacy_record(package_id)
+
+        resumed = self.service.begin(operation_id, package_id, "downloaded")
+        self.assertEqual("resumed", resumed["outcome"])
+        self.assertEqual("not_started", resumed["record"]["effect_state"])
+
+        self.service.mark_effect_attempting(operation_id, package_id, "downloaded")
+
+        stored = json.loads(self.rows()[operation_id])
+        self.assertEqual(set(OPERATION_RECORD_KEYS), set(stored))
+        self.assertEqual("attempting", stored["effect_state"])
 
     def test_advancing_a_missing_or_foreign_operation_conflicts(self):
         package_id = package(1)

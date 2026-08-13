@@ -9,13 +9,15 @@ from quasarr.downloads import (
     SUBMIT_PHASE_ALL,
     SUBMIT_PHASE_SUBMIT,
     confirm_protected_removal,
-    jdownloader_holds_package,
+    failed_package_records_operation,
+    jdownloader_holds_operation,
     submit_final_download_urls,
 )
 from quasarr.downloads.mirror_filters import (
     filter_final_download_urls,
     normalize_mirror_token,
 )
+from quasarr.providers.terminal_operations import submission_comment
 
 
 class NormalizeMirrorTokenTests(unittest.TestCase):
@@ -89,6 +91,7 @@ class SubmitFinalDownloadUrlsTests(unittest.TestCase):
             "",
             "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef",
             shared_state,
+            comment="Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef",
         )
 
     @patch("quasarr.downloads.download_package")
@@ -253,6 +256,82 @@ class SubmitFinalDownloadUrlsTests(unittest.TestCase):
             "all", signature(submit_final_download_urls).parameters["phase"].default
         )
 
+    @patch("quasarr.downloads.download_package", return_value=True)
+    @patch("quasarr.downloads.get_download_category_mirrors", return_value=[])
+    @patch("quasarr.downloads.get_download_category_from_package_id", return_value="tv")
+    def test_a_submission_travels_its_operation_only_when_one_is_named(
+        self,
+        mock_get_category,
+        mock_get_mirrors,
+        mock_download_package,
+    ):
+        shared_state = MagicMock()
+        evidence = "c0" * 32
+
+        submit_final_download_urls(
+            shared_state,
+            ["https://mirror.ddownload.com/file/def"],
+            "Example.Release",
+            "",
+            "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef",
+            terminal_operation=evidence,
+        )
+        submit_final_download_urls(
+            shared_state,
+            ["https://mirror.ddownload.com/file/def"],
+            "Example.Release",
+            "",
+            "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef",
+        )
+
+        self.assertEqual(
+            [
+                submission_comment(
+                    "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef", evidence
+                ),
+                "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef",
+            ],
+            [call.kwargs["comment"] for call in mock_download_package.call_args_list],
+        )
+        self.assertIsNone(
+            signature(submit_final_download_urls)
+            .parameters["terminal_operation"]
+            .default
+        )
+
+    @patch("quasarr.downloads.download_package")
+    @patch("quasarr.downloads.fail", return_value={"success": True, "failed": True})
+    @patch(
+        "quasarr.downloads.get_download_category_mirrors", return_value=["DDownload"]
+    )
+    @patch("quasarr.downloads.get_download_category_from_package_id", return_value="tv")
+    def test_a_whitelist_rejection_records_the_operation_that_caused_it(
+        self,
+        mock_get_category,
+        mock_get_mirrors,
+        mock_fail,
+        mock_download_package,
+    ):
+        protected_db = MagicMock()
+        protected_db.retrieve.return_value = json.dumps({"title": "Example.Release"})
+        shared_state = MagicMock()
+        shared_state.get_db.return_value = protected_db
+        evidence = "c0" * 32
+
+        with patch("quasarr.downloads.update_release_notification"):
+            submit_final_download_urls(
+                shared_state,
+                ["https://rapidgator.net/file/abc"],
+                "Example.Release",
+                "",
+                "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef",
+                remove_protected=True,
+                phase=SUBMIT_PHASE_SUBMIT,
+                terminal_operation=evidence,
+            )
+
+        self.assertEqual(evidence, mock_fail.call_args.kwargs["terminal_operation"])
+
 
 class ProtectedTable:
     def __init__(self, rows=None, deletes=True):
@@ -335,6 +414,7 @@ class ConfirmProtectedRemovalTests(unittest.TestCase):
 
 class JDownloaderReconciliationTests(unittest.TestCase):
     PACKAGE_ID = "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef"
+    EVIDENCE = "c0" * 32
 
     def shared_state(self, device, available=True):
         state = MagicMock()
@@ -355,7 +435,10 @@ class JDownloaderReconciliationTests(unittest.TestCase):
         device.downloads.query_links.return_value = lists.get("downloader_links", [])
         return device
 
-    def test_every_list_carrying_the_package_comment_proves_a_submission(self):
+    def marked(self):
+        return {"comment": submission_comment(self.PACKAGE_ID, self.EVIDENCE)}
+
+    def test_every_list_carrying_this_operations_comment_proves_a_submission(self):
         cases = (
             "packages",
             "links",
@@ -365,34 +448,127 @@ class JDownloaderReconciliationTests(unittest.TestCase):
 
         for name in cases:
             with self.subTest(list=name):
-                device = self.device(**{name: [{"comment": self.PACKAGE_ID}]})
+                device = self.device(**{name: [self.marked()]})
                 state = self.shared_state(device)
 
-                self.assertIs(True, jdownloader_holds_package(state, self.PACKAGE_ID))
+                self.assertIs(
+                    True,
+                    jdownloader_holds_operation(state, self.PACKAGE_ID, self.EVIDENCE),
+                )
+
+    def test_a_package_of_an_earlier_lifecycle_never_proves_this_submission(self):
+        # The bare package ID is what every legacy, manual and earlier
+        # submission of this very release carries, so it can only prove that
+        # some submission happened - never that this operation made it.
+        device = self.device(
+            packages=[{"comment": self.PACKAGE_ID}],
+            links=[{"comment": submission_comment(self.PACKAGE_ID, "d1" * 32)}],
+        )
+        state = self.shared_state(device)
+
+        self.assertIs(
+            False,
+            jdownloader_holds_operation(state, self.PACKAGE_ID, self.EVIDENCE),
+        )
 
     def test_a_foreign_comment_never_proves_a_submission(self):
         device = self.device(
-            packages=[{"comment": "Quasarr_tv_00000000000000000000000000000000"}],
+            packages=[
+                {
+                    "comment": submission_comment(
+                        "Quasarr_tv_00000000000000000000000000000000", self.EVIDENCE
+                    )
+                }
+            ],
             links=[{"comment": None}, "not-a-mapping"],
         )
         state = self.shared_state(device)
 
-        self.assertIs(False, jdownloader_holds_package(state, self.PACKAGE_ID))
+        self.assertIs(
+            False,
+            jdownloader_holds_operation(state, self.PACKAGE_ID, self.EVIDENCE),
+        )
 
     def test_an_unreachable_device_answers_unknown_rather_than_absent(self):
         device = self.device()
         state = self.shared_state(device, available=False)
 
-        self.assertIsNone(jdownloader_holds_package(state, self.PACKAGE_ID))
+        self.assertIsNone(
+            jdownloader_holds_operation(state, self.PACKAGE_ID, self.EVIDENCE)
+        )
 
     def test_the_linkgrabber_is_asked_before_the_download_list(self):
-        device = self.device(packages=[{"comment": self.PACKAGE_ID}])
+        device = self.device(packages=[self.marked()])
         state = self.shared_state(device)
 
-        jdownloader_holds_package(state, self.PACKAGE_ID)
+        jdownloader_holds_operation(state, self.PACKAGE_ID, self.EVIDENCE)
 
         device.downloads.query_packages.assert_not_called()
         device.downloads.query_links.assert_not_called()
+
+
+class FailedHistoryProvenanceTests(unittest.TestCase):
+    """Failed history only answers for the operation that actually wrote it."""
+
+    PACKAGE_ID = "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef"
+    EVIDENCE = "c0" * 32
+
+    def shared_state(self, table):
+        state = MagicMock()
+        state.get_db.return_value = table
+        return state
+
+    def row(self, **extra):
+        blob = {"title": "Example.Release", "error": "boom"}
+        blob.update(extra)
+        return json.dumps(json.dumps(blob))
+
+    def test_a_row_this_operation_wrote_is_proven(self):
+        table = MagicMock()
+        table.retrieve.return_value = self.row(terminal_operation=self.EVIDENCE)
+
+        self.assertIs(
+            True,
+            failed_package_records_operation(
+                self.shared_state(table), self.PACKAGE_ID, self.EVIDENCE
+            ),
+        )
+
+    def test_a_row_of_an_earlier_lifecycle_proves_nothing(self):
+        for stored in (self.row(), self.row(terminal_operation="d1" * 32)):
+            with self.subTest(stored=stored[-40:]):
+                table = MagicMock()
+                table.retrieve.return_value = stored
+
+                self.assertIs(
+                    False,
+                    failed_package_records_operation(
+                        self.shared_state(table), self.PACKAGE_ID, self.EVIDENCE
+                    ),
+                )
+
+    def test_a_missing_or_unreadable_row_answers_absent_rather_than_unknown(self):
+        for stored in (None, "{not json", '"text"', "[1, 2]"):
+            with self.subTest(stored=str(stored)):
+                table = MagicMock()
+                table.retrieve.return_value = stored
+
+                self.assertIs(
+                    False,
+                    failed_package_records_operation(
+                        self.shared_state(table), self.PACKAGE_ID, self.EVIDENCE
+                    ),
+                )
+
+    def test_an_unreadable_store_is_the_only_unknown(self):
+        table = MagicMock()
+        table.retrieve.side_effect = RuntimeError("failed storage unavailable")
+
+        self.assertIsNone(
+            failed_package_records_operation(
+                self.shared_state(table), self.PACKAGE_ID, self.EVIDENCE
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -26,9 +26,9 @@ from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.downloads import (
     SUBMIT_PHASE_SUBMIT,
     fail,
-    failed_package_present,
+    failed_package_records_operation,
     finalize_protected_removal,
-    jdownloader_holds_package,
+    jdownloader_holds_operation,
     project_final_download_urls,
     resolve_protected_crypter_key,
     submit_final_download_urls,
@@ -57,8 +57,10 @@ from quasarr.providers.statistics import StatsHelper
 from quasarr.providers.terminal_operations import (
     CAPACITY,
     CONFLICT,
-    OPENED,
+    EFFECT_ATTEMPTING,
+    TERMINAL_OPERATION_MARKER,
     TerminalOperationService,
+    operation_evidence,
 )
 from quasarr.storage.categories import (
     get_download_category_from_package_id,
@@ -466,7 +468,6 @@ def setup_sponsors_helper_routes(app):
             yield {
                 "service": service,
                 "operation_id": operation_id,
-                "outcome": opened["outcome"],
                 "record": opened["record"],
             }
 
@@ -603,11 +604,17 @@ def setup_sponsors_helper_routes(app):
             return str(reason)
         return default_reason
 
-    def mark_helper_package_failed(package_id, title, reason):
+    def mark_helper_package_failed(package_id, title, reason, terminal_operation=None):
         protected_release = get_protected_release(package_id)
         if protected_release and protected_release.get("title"):
             title = protected_release["title"]
-        fail(title, package_id, shared_state, reason=reason)
+        fail(
+            title,
+            package_id,
+            shared_state,
+            reason=reason,
+            terminal_operation=terminal_operation,
+        )
         try:
             shared_state.get_db("protected").delete(package_id)
         except Exception as e:
@@ -658,6 +665,23 @@ def setup_sponsors_helper_routes(app):
             return abort(409, "Terminal operation identity conflict")
         context["record"] = result["record"]
 
+    def begin_terminal_effect(context):
+        """Persist that this operation is about to touch the world.
+
+        Written before the side effect and before any external call, so a crash
+        can no longer look like a crash that never started: an operation still
+        marked as never started may - and must - apply its transition, whatever
+        an earlier life of the same release left lying around.
+        """
+        result = context["service"].mark_effect_attempting(
+            context["operation_id"],
+            context["record"]["package_id"],
+            context["record"]["terminal_state"],
+        )
+        if result["outcome"] == CONFLICT:
+            return abort(409, "Terminal operation identity conflict")
+        context["record"] = result["record"]
+
     def complete_terminal(context, *, package_removed, package_terminal):
         result = context["service"].mark_complete(
             context["operation_id"],
@@ -674,22 +698,32 @@ def setup_sponsors_helper_routes(app):
     def record_helper_terminal_failure(context, package_id, title, reason):
         """Persist this operation's failure once, resuming an interrupted one.
 
-        Existing failed history only proves anything for an operation that ran
-        before: package IDs are derived from the release, so a package that
-        failed once and was added again still carries that row while it is
-        protected, and a freshly opened operation would otherwise report its
-        own failure as already done without recording it.
+        Failed history only answers for the operation that wrote it: package
+        IDs are derived from the release, so a package that failed once and was
+        added again still carries that row while it is protected, and the
+        automatic download path and the legacy fail route write one too. An
+        operation that never began its attempt therefore reads no history at
+        all, and one that did may only recognize its own marker.
         """
-        persisted = False
-        if context["outcome"] != OPENED:
-            persisted = failed_package_present(shared_state, package_id)
+        evidence = operation_evidence(context["record"])
+        if context["record"]["effect_state"] == EFFECT_ATTEMPTING:
+            persisted = failed_package_records_operation(
+                shared_state, package_id, evidence
+            )
             if persisted is None:
                 return False
-        if not persisted:
-            StatsHelper(shared_state).increment_failed_decryptions_automatic()
-            mark_helper_package_failed(package_id, title, reason)
-            persisted = failed_package_present(shared_state, package_id)
-        return persisted is True
+            if persisted:
+                return True
+        begin_terminal_effect(context)
+        # The marker is written with the row, so a crash between it and the
+        # counter loses a count rather than duplicating a user-visible failure.
+        mark_helper_package_failed(
+            package_id, title, reason, terminal_operation=evidence
+        )
+        StatsHelper(shared_state).increment_failed_decryptions_automatic()
+        return (
+            failed_package_records_operation(shared_state, package_id, evidence) is True
+        )
 
     def projected_final_download_links(download_links, package_id):
         return project_final_download_urls(download_links, package_id)[2]["urls"]
@@ -700,76 +734,84 @@ def setup_sponsors_helper_routes(app):
         if context["record"]["state"] == "complete":
             return terminal_response(context["record"])
 
+        evidence = operation_evidence(context["record"])
         final_links = None
         # None until this request knows whether the operation ends in a failure.
-        # A freshly opened operation has provably run nothing yet, so a failed
-        # row of an earlier lifecycle is not an answer it may read.
+        # An operation that never began its attempt has provably changed
+        # nothing, so no artifact of an earlier lifecycle is an answer for it.
         failed_now = None
         if context["record"]["state"] == "prepared":
-            resumed = context["outcome"] != OPENED
             failed_now = False
-            if resumed:
-                failed_now = failed_package_present(shared_state, package_id)
+            submit = True
+            if context["record"]["effect_state"] == EFFECT_ATTEMPTING:
+                # The interrupted attempt could have ended in either side
+                # effect, so both are asked - each only about what this
+                # operation named.
+                failed_now = failed_package_records_operation(
+                    shared_state, package_id, evidence
+                )
                 if failed_now is None:
                     return unconfirmed_terminal_response(context)
-
-            submit = not resumed
-            if failed_now:
-                mark_terminal_submitted(context)
-            else:
-                if not submit:
-                    already_submitted = jdownloader_holds_package(
-                        shared_state, package_id
+                if failed_now:
+                    submit = False
+                else:
+                    already_submitted = jdownloader_holds_operation(
+                        shared_state, package_id, evidence
                     )
                     if already_submitted is None:
                         return unconfirmed_terminal_response(context)
                     submit = not already_submitted
 
-                if submit and (
-                    not isinstance(download_links, list) or not download_links
+            if not submit:
+                mark_terminal_submitted(context)
+            elif not isinstance(download_links, list) or not download_links:
+                reason = (
+                    "SponsorsHelper returned an invalid download payload."
+                    if not isinstance(download_links, list)
+                    else "SponsorsHelper returned no final download links."
+                )
+                if not record_helper_terminal_failure(
+                    context, package_id, title, reason
                 ):
-                    reason = (
-                        "SponsorsHelper returned an invalid download payload."
-                        if not isinstance(download_links, list)
-                        else "SponsorsHelper returned no final download links."
-                    )
-                    if not record_helper_terminal_failure(
-                        context, package_id, title, reason
+                    return unconfirmed_terminal_response(context)
+                failed_now = True
+                mark_terminal_submitted(context)
+            else:
+                begin_terminal_effect(context)
+                submit_result = submit_final_download_urls(
+                    shared_state,
+                    download_links,
+                    title,
+                    password,
+                    package_id,
+                    remove_protected=True,
+                    notification_details=notification,
+                    phase=SUBMIT_PHASE_SUBMIT,
+                    terminal_operation=evidence,
+                )
+                if submit_result["success"]:
+                    final_links = submit_result["links"]
+                    mark_terminal_submitted(context)
+                elif submit_result.get("persisted_failure"):
+                    StatsHelper(shared_state).increment_failed_decryptions_automatic()
+                    if (
+                        failed_package_records_operation(
+                            shared_state, package_id, evidence
+                        )
+                        is not True
                     ):
                         return unconfirmed_terminal_response(context)
                     failed_now = True
                     mark_terminal_submitted(context)
-                elif submit:
-                    submit_result = submit_final_download_urls(
-                        shared_state,
-                        download_links,
-                        title,
-                        password,
-                        package_id,
-                        remove_protected=True,
-                        notification_details=notification,
-                        phase=SUBMIT_PHASE_SUBMIT,
-                    )
-                    if submit_result["success"]:
-                        final_links = submit_result["links"]
-                        mark_terminal_submitted(context)
-                    elif submit_result.get("persisted_failure"):
-                        StatsHelper(
-                            shared_state
-                        ).increment_failed_decryptions_automatic()
-                        if failed_package_present(shared_state, package_id) is not True:
-                            return unconfirmed_terminal_response(context)
-                        failed_now = True
-                        mark_terminal_submitted(context)
-                    else:
-                        return unconfirmed_terminal_response(context)
                 else:
-                    mark_terminal_submitted(context)
+                    return unconfirmed_terminal_response(context)
 
         if failed_now is None:
             # Resumed after the submitted phase: history is the only durable
             # record left of how that phase ended.
-            failed_now = failed_package_present(shared_state, package_id)
+            failed_now = failed_package_records_operation(
+                shared_state, package_id, evidence
+            )
             if failed_now is None:
                 return unconfirmed_terminal_response(context)
         removal = finalize_protected_removal(
@@ -817,20 +859,34 @@ def setup_sponsors_helper_routes(app):
             package_data = None
         return True, package_data
 
+    def disabled_by_operation(package_data, evidence):
+        """Whether the package carries the disable this operation applied.
+
+        A package can already be disabled by an earlier life of the release or
+        by hand, which says nothing about the operation asking, so the marker
+        written with the flag is what answers.
+        """
+        return (
+            isinstance(package_data, dict)
+            and package_data.get("disabled") is True
+            and package_data.get(TERMINAL_OPERATION_MARKER) == evidence
+        )
+
     def confirm_terminal_disable(context, package_id, reason):
         if context["record"]["state"] == "complete":
             return terminal_response(context["record"])
 
         if context["record"]["state"] == "prepared":
+            evidence = operation_evidence(context["record"])
             present, package_data = read_protected_package(package_id)
             if present is None:
                 return unconfirmed_terminal_response(context)
-            if present and not (
-                isinstance(package_data, dict) and package_data.get("disabled") is True
-            ):
+            if present and not disabled_by_operation(package_data, evidence):
                 if not isinstance(package_data, dict):
                     return unconfirmed_terminal_response(context)
+                begin_terminal_effect(context)
                 package_data["disabled"] = True
+                package_data[TERMINAL_OPERATION_MARKER] = evidence
                 shared_state.get_db("protected").update_store(
                     package_id, json.dumps(package_data)
                 )

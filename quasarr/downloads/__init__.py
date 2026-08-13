@@ -23,6 +23,10 @@ from quasarr.providers.notifications import (
 )
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
 from quasarr.providers.statistics import StatsHelper
+from quasarr.providers.terminal_operations import (
+    TERMINAL_OPERATION_MARKER,
+    submission_comment,
+)
 from quasarr.providers.utils import (
     download_package,
     extract_client_type,
@@ -178,14 +182,25 @@ def classify_links(links):
 
 
 def _persist_failed_package(
-    shared_state, title, package_id, reason, remove_protected=False
+    shared_state,
+    title,
+    package_id,
+    reason,
+    remove_protected=False,
+    terminal_operation=None,
 ):
     if remove_protected:
         try:
             shared_state.get_db("protected").delete(package_id)
         except Exception as e:
             info(f'Error removing protected package "{package_id}" before fail: {e}')
-    fail(title, package_id, shared_state, reason=reason)
+    fail(
+        title,
+        package_id,
+        shared_state,
+        reason=reason,
+        terminal_operation=terminal_operation,
+    )
     return {"success": False, "persisted_failure": True, "reason": reason}
 
 
@@ -227,13 +242,30 @@ def _protected_package_present(shared_state, package_id):
         return None
 
 
-def failed_package_present(shared_state, package_id):
-    """Whether failed history exists, or None when that cannot be proven."""
+def failed_package_records_operation(shared_state, package_id, terminal_operation):
+    """Whether failed history proves THIS operation wrote it, or None if unreadable.
+
+    The mere presence of a row proves nothing: package IDs are derived from the
+    release, and the automatic download path, the legacy fail route and every
+    earlier life of the same release write one too. Only the operation marker
+    the row was stored with answers for the operation asking.
+    """
     try:
-        return shared_state.get_db("failed").retrieve(package_id) is not None
+        raw = shared_state.get_db("failed").retrieve(package_id)
     except Exception as e:
         info(f'Error reading failed package "{package_id}": {e}')
         return None
+    if raw is None:
+        return False
+    try:
+        blob = json.loads(raw)
+        if isinstance(blob, str):
+            blob = json.loads(blob)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    if not isinstance(blob, dict):
+        return False
+    return blob.get(TERMINAL_OPERATION_MARKER) == terminal_operation
 
 
 def finalize_protected_removal(
@@ -273,21 +305,24 @@ def confirm_protected_removal(shared_state, package_id, notification_details=Non
     ]
 
 
-def jdownloader_holds_package(shared_state, package_id):
-    """Whether JDownloader already carries this package, or None if unprovable.
+def jdownloader_holds_operation(shared_state, package_id, terminal_operation):
+    """Whether JDownloader carries what THIS operation submitted, or None.
 
-    An earlier HTTP 200 never proved that a submission was recorded here, so a
-    resumed operation asks JDownloader itself before it may submit again. The
-    package comment is the ID Quasarr submits with; both JDownloader lists are
-    consulted because a package can already have left the linkgrabber. `None`
-    means the answer could not be obtained and never authorizes a second
-    submission.
+    An earlier HTTP 200 never proved that a submission was recorded here, so an
+    operation that already began its attempt asks JDownloader itself before it
+    may submit again. The bare package ID in a comment only shows that some
+    submission happened - a legacy one, a manual one, or an earlier life of the
+    same release - so the operation marker the submission travelled with is
+    what is matched. Both JDownloader lists are consulted because a package can
+    already have left the linkgrabber. `None` means the answer could not be
+    obtained and never authorizes a second submission.
     """
     unknown = object()
+    comment = submission_comment(package_id, terminal_operation)
 
     def carries(entries):
         for entry in entries or ():
-            if isinstance(entry, dict) and entry.get("comment") == package_id:
+            if isinstance(entry, dict) and entry.get("comment") == comment:
                 return True
         return False
 
@@ -317,6 +352,7 @@ def submit_final_download_urls(
     remove_protected=False,
     notification_details=None,
     phase=SUBMIT_PHASE_ALL,
+    terminal_operation=None,
 ):
     """
     Final mirror whitelist check before sending direct HTTP links to JDownloader.
@@ -350,6 +386,7 @@ def submit_final_download_urls(
             package_id,
             reason,
             remove_protected=remove_protected,
+            terminal_operation=terminal_operation,
         )
         if protected_release:
             update_release_notification(
@@ -361,7 +398,14 @@ def submit_final_download_urls(
         return result
 
     info(f"Sending {len(final_urls)} direct download links for {title}")
-    if download_package(final_urls, title, password, package_id, shared_state):
+    if download_package(
+        final_urls,
+        title,
+        password,
+        package_id,
+        shared_state,
+        comment=submission_comment(package_id, terminal_operation),
+    ):
         if remove_protected and phase != SUBMIT_PHASE_SUBMIT:
             _delete_protected_package(shared_state, package_id)
             if protected_release:
@@ -774,12 +818,19 @@ def download(
         return {"package_id": package_id, **result}
 
 
-def fail(title, package_id, shared_state, reason="Unknown error"):
+def fail(
+    title, package_id, shared_state, reason="Unknown error", terminal_operation=None
+):
     """Mark download as failed."""
     try:
         error(f"Reason for failure: {reason}")
         StatsHelper(shared_state).increment_failed_downloads()
-        blob = json.dumps({"title": title, "error": reason})
+        entry = {"title": title, "error": reason}
+        if terminal_operation:
+            # Written with the row itself, so a retry of the operation that
+            # recorded this failure can recognize its own work.
+            entry[TERMINAL_OPERATION_MARKER] = terminal_operation
+        blob = json.dumps(entry)
         shared_state.get_db("failed").store(package_id, json.dumps(blob))
         warn(f'Package "{title}" marked as failed!')
     except Exception as e:

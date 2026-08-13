@@ -12,6 +12,8 @@ import quasarr.api.sponsors_helper as sponsors_helper_api
 from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
 from quasarr.providers.terminal_operations import (
     TERMINAL_OPERATION_TABLE,
+    operation_evidence,
+    submission_comment,
     terminal_operation_id,
 )
 
@@ -42,12 +44,16 @@ class MemoryTable:
         self.writes = 0
         self.deletes = 0
         self.unavailable = False
+        # Access order, so a read taken to decide something can be told from
+        # one taken to verify a write that already happened.
+        self.events = []
 
     def _check(self):
         if self.unavailable:
             raise RuntimeError("table unavailable")
 
     def retrieve(self, key):
+        self.events.append("read")
         self._check()
         return self.rows.get(key)
 
@@ -57,6 +63,7 @@ class MemoryTable:
         return items or None
 
     def store(self, key, value):
+        self.events.append("write")
         self._check()
         self.writes += 1
         self.rows[key] = value
@@ -239,6 +246,67 @@ class TerminalConfirmationTestCase(unittest.TestCase):
 
     def failed_row(self, package_id=None):
         return self.state.get_db("failed").retrieve(package_id or package())
+
+    def failed_blob(self, package_id=None):
+        raw = self.failed_row(package_id)
+        if raw is None:
+            return None
+        blob = json.loads(raw)
+        return json.loads(blob) if isinstance(blob, str) else blob
+
+    def store_failed(self, package_id=None, **extra):
+        """History of an earlier lifecycle of this very release."""
+        blob = {"title": TITLE, "error": "last time"}
+        blob.update(extra)
+        self.state.get_db("failed").update_store(
+            package_id or package(), json.dumps(json.dumps(blob))
+        )
+
+    def evidence(self, package_id=None, created=1):
+        return operation_evidence(
+            {"package_id": package_id or package(), "created_epoch": created}
+        )
+
+    def current_evidence(self, package_id=None):
+        """The evidence of the operation record this request actually opened."""
+        return operation_evidence(self.operation_row(package_id))
+
+    def seed_operation(
+        self,
+        terminal_state,
+        package_id=None,
+        *,
+        state="prepared",
+        effect_state="not_started",
+        created=1,
+        legacy=False,
+    ):
+        """Persist the record a crashed request would have left behind.
+
+        `legacy` writes the exact seven-key row shipped before the effect
+        phase existed, which is what a Quasarr that is upgraded mid-operation
+        finds on disk.
+        """
+        package_id = package_id or package()
+        stored = {
+            "state": state,
+            "terminal_state": terminal_state,
+            "package_id": package_id,
+            "created_epoch": created,
+            "updated_epoch": created,
+            "package_removed": False,
+            "package_terminal": False,
+        }
+        if not legacy:
+            stored["effect_state"] = effect_state
+        self.state.get_db(TERMINAL_OPERATION_TABLE).update_store(
+            terminal_operation_id(package_id),
+            json.dumps(stored, sort_keys=True, separators=(",", ":")),
+        )
+        return self.evidence(package_id, created)
+
+    def submitted_comments(self):
+        return [call[0]["comment"] for call in self.state.device.add_links_calls]
 
     def statistic(self, key):
         raw = self.state.get_db("statistics").retrieve(key)
@@ -524,18 +592,20 @@ class DownloadTerminalConfirmationTests(TerminalConfirmationTestCase):
         original = operations.mutate_value
         calls = {"count": 0}
 
-        def fail_the_second_transaction(key, mutator):
+        # begin, the durable attempt, then the submission this one loses.
+        def fail_the_third_transaction(key, mutator):
             calls["count"] += 1
-            if calls["count"] == 2:
+            if calls["count"] == 3:
                 raise RuntimeError("terminal operation storage unavailable")
             return original(key, mutator)
 
-        with mock.patch.object(operations, "mutate_value", fail_the_second_transaction):
+        with mock.patch.object(operations, "mutate_value", fail_the_third_transaction):
             with self.assertRaises(HTTPError):
                 self.call(DOWNLOAD_RULE, payload)
 
         self.assertEqual(1, len(self.state.device.add_links_calls))
         self.assertEqual("prepared", self.operation_row()["state"])
+        self.assertEqual("attempting", self.operation_row()["effect_state"])
 
         result = self.call(DOWNLOAD_RULE, payload)
 
@@ -551,13 +621,13 @@ class DownloadTerminalConfirmationTests(TerminalConfirmationTestCase):
         original = operations.mutate_value
         calls = {"count": 0}
 
-        def fail_the_third_transaction(key, mutator):
+        def fail_the_fourth_transaction(key, mutator):
             calls["count"] += 1
-            if calls["count"] == 3:
+            if calls["count"] == 4:
                 raise RuntimeError("terminal completion unavailable")
             return original(key, mutator)
 
-        with mock.patch.object(operations, "mutate_value", fail_the_third_transaction):
+        with mock.patch.object(operations, "mutate_value", fail_the_fourth_transaction):
             with self.assertRaises(HTTPError):
                 self.call(DOWNLOAD_RULE, payload)
 
@@ -578,22 +648,7 @@ class DownloadTerminalConfirmationTests(TerminalConfirmationTestCase):
 
     def test_an_unprovable_linkgrabber_never_authorizes_a_second_submission(self):
         payload = self.version_two(self.download_payload())
-        self.state.get_db(TERMINAL_OPERATION_TABLE).update_store(
-            terminal_operation_id(package()),
-            json.dumps(
-                {
-                    "state": "prepared",
-                    "terminal_state": "downloaded",
-                    "package_id": package(),
-                    "created_epoch": 1,
-                    "updated_epoch": 1,
-                    "package_removed": False,
-                    "package_terminal": False,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
+        self.seed_operation("downloaded", effect_state="attempting")
         self.state.device_available = False
 
         result = self.call(DOWNLOAD_RULE, payload)
@@ -605,23 +660,10 @@ class DownloadTerminalConfirmationTests(TerminalConfirmationTestCase):
 
     def test_a_package_already_moved_to_the_download_list_counts_as_submitted(self):
         payload = self.version_two(self.download_payload())
-        self.state.get_db(TERMINAL_OPERATION_TABLE).update_store(
-            terminal_operation_id(package()),
-            json.dumps(
-                {
-                    "state": "prepared",
-                    "terminal_state": "downloaded",
-                    "package_id": package(),
-                    "created_epoch": 1,
-                    "updated_epoch": 1,
-                    "package_removed": False,
-                    "package_terminal": False,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
+        evidence = self.seed_operation("downloaded", effect_state="attempting")
+        self.state.device.downloader_packages.append(
+            {"uuid": 5, "comment": submission_comment(package(), evidence)}
         )
-        self.state.device.downloader_packages.append({"uuid": 5, "comment": package()})
 
         result = self.call(DOWNLOAD_RULE, payload)
 
@@ -790,13 +832,14 @@ class FailTerminalConfirmationTests(TerminalConfirmationTestCase):
         original = operations.mutate_value
         calls = {"count": 0}
 
-        def fail_the_second_transaction(key, mutator):
+        # begin, the durable attempt, then the confirmation this one loses.
+        def fail_the_third_transaction(key, mutator):
             calls["count"] += 1
-            if calls["count"] == 2:
+            if calls["count"] == 3:
                 raise RuntimeError("terminal operation storage unavailable")
             return original(key, mutator)
 
-        with mock.patch.object(operations, "mutate_value", fail_the_second_transaction):
+        with mock.patch.object(operations, "mutate_value", fail_the_third_transaction):
             with self.assertRaises(HTTPError):
                 self.call(FAIL_RULE, payload)
 
@@ -862,13 +905,14 @@ class DisableTerminalConfirmationTests(TerminalConfirmationTestCase):
         original = operations.mutate_value
         calls = {"count": 0}
 
-        def fail_the_second_transaction(key, mutator):
+        # begin, the durable attempt, then the confirmation this one loses.
+        def fail_the_third_transaction(key, mutator):
             calls["count"] += 1
-            if calls["count"] == 2:
+            if calls["count"] == 3:
                 raise RuntimeError("terminal operation storage unavailable")
             return original(key, mutator)
 
-        with mock.patch.object(operations, "mutate_value", fail_the_second_transaction):
+        with mock.patch.object(operations, "mutate_value", fail_the_third_transaction):
             with self.assertRaises(HTTPError):
                 self.call(DISABLE_RULE, payload)
 
@@ -1001,9 +1045,7 @@ class StaleFailedHistoryTests(TerminalConfirmationTestCase):
 
     def setUp(self):
         super().setUp()
-        self.state.get_db("failed").update_store(
-            package(), json.dumps(json.dumps({"title": TITLE, "error": "last time"}))
-        )
+        self.store_failed()
 
     def test_a_stale_failed_row_never_reports_success_without_submitting(self):
         result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
@@ -1024,6 +1066,278 @@ class StaleFailedHistoryTests(TerminalConfirmationTestCase):
         self.assertEqual(["failed"], self.notification_cases())
         self.assertEqual(1, self.statistic("failed_downloads"))
         self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+
+class TerminalSubmissionProvenanceTests(TerminalConfirmationTestCase):
+    """What a version-two submission leaves behind for a later retry to read."""
+
+    def test_a_terminal_submission_names_the_operation_behind_it(self):
+        self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assertEqual(
+            [submission_comment(package(), self.current_evidence())],
+            self.submitted_comments(),
+        )
+
+    def test_a_legacy_submission_still_travels_the_bare_package_id(self):
+        self.call(DOWNLOAD_RULE, self.download_payload())
+
+        self.assertEqual([package()], self.submitted_comments())
+
+    def test_a_terminal_failure_names_the_operation_behind_it(self):
+        self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assertEqual(
+            self.current_evidence(), self.failed_blob()["terminal_operation"]
+        )
+
+    def test_a_legacy_failure_records_no_operation_at_all(self):
+        self.call(FAIL_RULE, {"package_id": package(), "name": TITLE})
+
+        self.assertNotIn("terminal_operation", self.failed_blob())
+
+    def test_a_terminal_disable_names_the_operation_behind_it(self):
+        self.call(DISABLE_RULE, self.version_two({"package_id": package()}))
+
+        self.assertEqual(
+            self.current_evidence(), self.protected_row()["terminal_operation"]
+        )
+
+    def test_a_legacy_disable_records_no_operation_at_all(self):
+        self.call(DISABLE_RULE, {"package_id": package()})
+
+        self.assertTrue(self.protected_row()["disabled"])
+        self.assertNotIn("terminal_operation", self.protected_row())
+
+
+class ResumedDownloadProvenanceTests(TerminalConfirmationTestCase):
+    """A resumed `prepared` download may only reconcile from its own evidence.
+
+    Everything the crash window can leave behind - failed history, a package in
+    a JDownloader list - is also produced by earlier lifecycles of the same
+    release, by the automatic download path and by hand. Only the record proves
+    whether this operation ever reached its side effect, and only the marker it
+    submits with proves that the artifact found is the one it made.
+    """
+
+    def stale_artifacts(self):
+        self.store_failed()
+        self.state.device.downloader_packages.append({"uuid": 5, "comment": package()})
+
+    def assert_submitted_once(self, result, evidence):
+        self.assertTrue(result["success"])
+        self.assertTrue(result["package_removed"])
+        self.assertEqual(
+            [submission_comment(package(), evidence)], self.submitted_comments()
+        )
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["solved"], self.notification_cases())
+        self.assertEqual(1, self.statistic("packages_downloaded"))
+        self.assertEqual(1, self.statistic("captcha_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_an_operation_that_never_started_submits_despite_stale_artifacts(self):
+        evidence = self.seed_operation("downloaded")
+        self.stale_artifacts()
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assert_submitted_once(result, evidence)
+        # Nothing about the world was read: the record already answered.
+        self.assertEqual(0, self.state.device.queries)
+
+    def test_a_legacy_prepared_row_is_resumed_as_never_started(self):
+        evidence = self.seed_operation("downloaded", legacy=True)
+        self.stale_artifacts()
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assert_submitted_once(result, evidence)
+        self.assertEqual(0, self.state.device.queries)
+
+    def test_a_crash_after_submission_is_proven_by_this_operations_package(self):
+        evidence = self.seed_operation("downloaded", effect_state="attempting")
+        self.state.device.downloader_packages.append(
+            {"uuid": 5, "comment": submission_comment(package(), evidence)}
+        )
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assertTrue(result["success"])
+        self.assertEqual([], self.submitted_comments())
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["solved"], self.notification_cases())
+        self.assertEqual(1, self.statistic("packages_downloaded"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_a_package_of_an_earlier_lifecycle_never_counts_as_submitted(self):
+        evidence = self.seed_operation("downloaded", effect_state="attempting")
+        self.state.device.downloader_packages.append({"uuid": 5, "comment": package()})
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assert_submitted_once(result, evidence)
+        self.assertGreater(self.state.device.queries, 0)
+
+    def test_a_failed_row_of_an_earlier_lifecycle_never_ends_this_operation(self):
+        evidence = self.seed_operation("downloaded", effect_state="attempting")
+        self.store_failed()
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assert_submitted_once(result, evidence)
+
+    def test_history_this_operation_wrote_ends_it_without_submitting(self):
+        evidence = self.seed_operation("downloaded", effect_state="attempting")
+        self.store_failed(terminal_operation=evidence)
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["package_removed"])
+        self.assertEqual([], self.submitted_comments())
+        self.assertEqual(0, self.state.device.queries)
+        self.assertIsNone(self.protected_row())
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(0, self.statistic("packages_downloaded"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+
+class ResumedFailureProvenanceTests(TerminalConfirmationTestCase):
+    """A resumed `prepared` failure records its own history exactly once."""
+
+    def assert_failed_once(self, result, evidence):
+        self.assertTrue(result["success"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(evidence, self.failed_blob()["terminal_operation"])
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_an_operation_that_never_started_records_its_own_failure(self):
+        evidence = self.seed_operation("failed")
+        self.store_failed()
+
+        result = self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assert_failed_once(result, evidence)
+
+    def test_a_legacy_prepared_row_records_its_own_failure(self):
+        evidence = self.seed_operation("failed", legacy=True)
+        self.store_failed()
+
+        result = self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assert_failed_once(result, evidence)
+
+    def test_an_attempt_that_never_reached_history_records_it(self):
+        evidence = self.seed_operation("failed", effect_state="attempting")
+        self.store_failed()
+
+        result = self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assert_failed_once(result, evidence)
+
+    def test_history_this_operation_wrote_is_never_recorded_twice(self):
+        evidence = self.seed_operation("failed", effect_state="attempting")
+        self.store_failed(terminal_operation=evidence)
+
+        result = self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual("last time", self.failed_blob()["error"])
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(0, self.statistic("failed_downloads"))
+        self.assertEqual(0, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_an_unstarted_failure_writes_before_it_ever_reads_history(self):
+        # Nothing in history can answer for an operation that provably ran
+        # nothing, so the first thing it does to history is record its own row.
+        self.seed_operation("failed")
+        self.store_failed()
+        history = self.state.get_db("failed")
+        history.events.clear()
+
+        self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assertEqual("write", history.events[0])
+
+    def test_an_interrupted_failure_reads_history_before_it_writes(self):
+        self.seed_operation("failed", effect_state="attempting")
+        self.store_failed()
+        history = self.state.get_db("failed")
+        history.events.clear()
+
+        self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assertEqual("read", history.events[0])
+
+    def test_unreadable_history_never_confirms_a_failure_it_cannot_prove(self):
+        self.seed_operation("failed", effect_state="attempting")
+        self.state.get_db("failed").unavailable = True
+
+        result = self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assertFalse(result["success"])
+        self.assertEqual("prepared", self.operation_row()["state"])
+        self.assertIsNotNone(self.protected_row())
+        self.assertEqual([], self.notification_cases())
+
+
+class ResumedDisableProvenanceTests(TerminalConfirmationTestCase):
+    """A resumed `prepared` disable applies its own transition exactly once."""
+
+    def assert_disabled_once(self, result, evidence):
+        self.assertTrue(result["success"])
+        self.assertTrue(result["package_terminal"])
+        self.assertFalse(result["package_removed"])
+        self.assertTrue(self.protected_row()["disabled"])
+        self.assertEqual(evidence, self.protected_row()["terminal_operation"])
+        self.assertEqual(["disabled"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual(1, self.statistic("captcha_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_an_operation_that_never_started_disables_despite_a_stale_flag(self):
+        self.store_protected(disabled=True)
+        evidence = self.seed_operation("disabled")
+
+        result = self.call(DISABLE_RULE, self.version_two({"package_id": package()}))
+
+        self.assert_disabled_once(result, evidence)
+
+    def test_a_legacy_prepared_row_applies_the_disable(self):
+        self.store_protected(disabled=True)
+        evidence = self.seed_operation("disabled", legacy=True)
+
+        result = self.call(DISABLE_RULE, self.version_two({"package_id": package()}))
+
+        self.assert_disabled_once(result, evidence)
+
+    def test_an_attempt_that_never_reached_the_package_applies_it(self):
+        self.store_protected(disabled=True)
+        evidence = self.seed_operation("disabled", effect_state="attempting")
+
+        result = self.call(DISABLE_RULE, self.version_two({"package_id": package()}))
+
+        self.assert_disabled_once(result, evidence)
+
+    def test_a_flag_this_operation_wrote_is_never_applied_twice(self):
+        evidence = self.seed_operation("disabled", effect_state="attempting")
+        self.store_protected(disabled=True, terminal_operation=evidence)
+
+        result = self.call(DISABLE_RULE, self.version_two({"package_id": package()}))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["package_terminal"])
+        self.assertTrue(self.protected_row()["disabled"])
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(0, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual(0, self.statistic("captcha_decryptions_automatic"))
         self.assertEqual("complete", self.operation_row()["state"])
 
 

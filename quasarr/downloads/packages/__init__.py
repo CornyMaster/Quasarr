@@ -21,6 +21,7 @@ from quasarr.providers.crypter_cooldowns import (
 )
 from quasarr.providers.jd_cache import JDPackageCache
 from quasarr.providers.log import debug, info, trace
+from quasarr.providers.terminal_operations import decode_submission_comment
 from quasarr.storage.categories import get_download_category_from_package_id
 
 DEFERRED_STATUS_PREFIX = "[Waiting for linkcrypter retry] "
@@ -85,6 +86,15 @@ def _project_package_defer(service, package_data, projections):
     )
 
 
+def package_comment_id(comment):
+    """The Quasarr identity a JDownloader comment names.
+
+    A terminal submission adds its operation marker to the same field, so the
+    package ID has to be read out of it; anything else is its own comment.
+    """
+    return decode_submission_comment(comment)[0]
+
+
 def get_links_comment(package, package_links):
     """Get the first non-empty comment from links matching the package UUID."""
     package_uuid = package.get("uuid")
@@ -93,7 +103,7 @@ def get_links_comment(package, package_links):
         for link in package_links:
             if link.get("packageUUID") != package_uuid:
                 continue
-            comment = link.get("comment")
+            comment = package_comment_id(link.get("comment"))
             if not comment:
                 continue
             if is_quasarr_package(comment):
@@ -469,7 +479,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
             package_name = package.get("name", "unknown")
             package_uuid = package.get("uuid")
 
-            comment = package.get("comment")
+            comment = package_comment_id(package.get("comment"))
             if not is_quasarr_package(comment):
                 comment = get_links_comment(package, linkgrabber_links)
             # Validate comment is a real ID - if not, ignore it
@@ -554,7 +564,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
             package_name = package.get("name", "unknown")
             package_uuid = package.get("uuid")
 
-            comment = package.get("comment")
+            comment = package_comment_id(package.get("comment"))
             if not is_quasarr_package(comment):
                 comment = get_links_comment(package, downloader_links)
             # Validate comment is a real ID - if not, ignore it
