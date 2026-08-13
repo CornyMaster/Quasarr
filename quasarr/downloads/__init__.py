@@ -47,6 +47,16 @@ _PROTECTED_MIRROR_KEYS = frozenset({"junkies"})
 SUBMIT_PHASE_ALL = "all"
 SUBMIT_PHASE_SUBMIT = "submit"
 
+# The rows one terminal failure commits together. They are named here because
+# this module owns the shape of a failed row and the meaning of the counters;
+# the operation service owns the transaction that writes them.
+FAILED_TABLE = "failed"
+STATISTICS_TABLE = "statistics"
+TERMINAL_FAILURE_COUNTERS = ("failed_downloads", "failed_decryptions_automatic")
+# Told apart from "there is no row": a store that cannot be read proves nothing
+# either way and may never authorize a second terminal side effect.
+_UNREADABLE = object()
+
 # =============================================================================
 # DETERMINISTIC PACKAGE ID GENERATION
 # =============================================================================
@@ -187,20 +197,13 @@ def _persist_failed_package(
     package_id,
     reason,
     remove_protected=False,
-    terminal_operation=None,
 ):
     if remove_protected:
         try:
             shared_state.get_db("protected").delete(package_id)
         except Exception as e:
             info(f'Error removing protected package "{package_id}" before fail: {e}')
-    fail(
-        title,
-        package_id,
-        shared_state,
-        reason=reason,
-        terminal_operation=terminal_operation,
-    )
+    fail(title, package_id, shared_state, reason=reason)
     return {"success": False, "persisted_failure": True, "reason": reason}
 
 
@@ -250,22 +253,81 @@ def failed_package_records_operation(shared_state, package_id, terminal_operatio
     earlier life of the same release write one too. Only the operation marker
     the row was stored with answers for the operation asking.
     """
+    blob = _failed_package_blob(shared_state, package_id)
+    if blob is None or blob is _UNREADABLE:
+        return None if blob is _UNREADABLE else False
+    return blob.get(TERMINAL_OPERATION_MARKER) == terminal_operation
+
+
+def failed_package_reason(shared_state, package_id, terminal_operation):
+    """The reason THIS operation recorded, or None when it recorded none.
+
+    An interrupted failure has to be able to finish telling the operator what
+    it already wrote down, and the row it wrote is the only place that reason
+    still exists - the operation record itself stays bounded and secret-free.
+    """
+    blob = _failed_package_blob(shared_state, package_id)
+    if not isinstance(blob, dict):
+        return None
+    if blob.get(TERMINAL_OPERATION_MARKER) != terminal_operation:
+        return None
+    reason = blob.get("error")
+    return reason if isinstance(reason, str) else None
+
+
+def _failed_package_blob(shared_state, package_id):
+    """The decoded failed row, None when there is none, `_UNREADABLE` on error."""
     try:
-        raw = shared_state.get_db("failed").retrieve(package_id)
+        raw = shared_state.get_db(FAILED_TABLE).retrieve(package_id)
     except Exception as e:
         info(f'Error reading failed package "{package_id}": {e}')
-        return None
+        return _UNREADABLE
     if raw is None:
-        return False
+        return None
     try:
         blob = json.loads(raw)
         if isinstance(blob, str):
             blob = json.loads(blob)
     except (TypeError, ValueError, RecursionError):
-        return False
-    if not isinstance(blob, dict):
-        return False
-    return blob.get(TERMINAL_OPERATION_MARKER) == terminal_operation
+        return None
+    return blob if isinstance(blob, dict) else None
+
+
+def failed_row_value(title, reason, terminal_operation=None):
+    """The exact stored value of one failed-history row.
+
+    Kept as a pure projection so the same bytes can be written by the legacy
+    path and inside the transaction that commits a terminal failure with its
+    counters, and so nothing but the marker ever changes between the two.
+    """
+    entry = {"title": title, "error": reason}
+    if terminal_operation:
+        # Written with the row itself, so a retry of the operation that
+        # recorded this failure can recognize its own work.
+        entry[TERMINAL_OPERATION_MARKER] = terminal_operation
+    return json.dumps(json.dumps(entry))
+
+
+def commit_terminal_failure(
+    service, operation_id, package_id, terminal_state, title, reason, evidence
+):
+    """Persist one operation's failure, its counters and its marker as one commit.
+
+    Everything a helper can observe about a failure - the history row, the two
+    counters, the notification, the removal of the protected package - waits
+    behind this, because a failure that was never written down must never be
+    reported, counted or cleaned up after.
+    """
+    return service.record_failure(
+        operation_id,
+        package_id,
+        terminal_state,
+        failed_target=(FAILED_TABLE, package_id),
+        failed_value=failed_row_value(title, reason, evidence),
+        counter_targets=tuple(
+            (STATISTICS_TABLE, counter) for counter in TERMINAL_FAILURE_COUNTERS
+        ),
+    )
 
 
 def finalize_protected_removal(
@@ -380,13 +442,17 @@ def submit_final_download_urls(
             f"Allowed mirrors: {_format_mirror_token_list(filtered['allowed_tokens'])}. "
             f"Received mirrors: {_format_mirror_token_list({item['token'] for item in dropped})}."
         )
+        if phase == SUBMIT_PHASE_SUBMIT:
+            # A terminal caller owns the whole failure: it has to persist it
+            # against its operation before anything is counted, announced or
+            # removed, so this half only reports that nothing was submitted.
+            return {"success": False, "mirror_rejected": True, "reason": reason}
         result = _persist_failed_package(
             shared_state,
             title,
             package_id,
             reason,
             remove_protected=remove_protected,
-            terminal_operation=terminal_operation,
         )
         if protected_release:
             update_release_notification(
@@ -818,21 +884,26 @@ def download(
         return {"package_id": package_id, **result}
 
 
-def fail(
-    title, package_id, shared_state, reason="Unknown error", terminal_operation=None
-):
-    """Mark download as failed."""
+def fail(title, package_id, shared_state, reason="Unknown error"):
+    """Mark download as failed.
+
+    The row is stored before anything is counted or announced, so a store that
+    never lands cannot leave a counter answering for history nobody has, and
+    the result says whether the failure was really recorded.
+    """
+    persisted = False
     try:
         error(f"Reason for failure: {reason}")
-        StatsHelper(shared_state).increment_failed_downloads()
-        entry = {"title": title, "error": reason}
-        if terminal_operation:
-            # Written with the row itself, so a retry of the operation that
-            # recorded this failure can recognize its own work.
-            entry[TERMINAL_OPERATION_MARKER] = terminal_operation
-        blob = json.dumps(entry)
-        shared_state.get_db("failed").store(package_id, json.dumps(blob))
-        warn(f'Package "{title}" marked as failed!')
+        shared_state.get_db(FAILED_TABLE).store(
+            package_id, failed_row_value(title, reason)
+        )
+        persisted = True
     except Exception as e:
         error(f'Error marking package "{package_id}" as failed: {e}')
-    return {"success": True, "title": title, "failed": True}
+    if persisted:
+        try:
+            StatsHelper(shared_state).increment_failed_downloads()
+        except Exception as e:
+            error(f'Error counting the failure of package "{package_id}": {e}')
+        warn(f'Package "{title}" marked as failed!')
+    return {"success": persisted, "title": title, "failed": True}

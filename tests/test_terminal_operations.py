@@ -13,9 +13,14 @@ from filelock import Timeout
 from quasarr.providers import shared_state as provider_shared_state
 from quasarr.providers.terminal_operations import (
     COMPLETED_OPERATION_RETENTION_SECONDS,
+    EFFECT_OPERATION_RECORD_KEYS,
     EFFECT_STATES,
     LEGACY_OPERATION_RECORD_KEYS,
     MAXIMUM_TERMINAL_OPERATIONS,
+    NOTIFICATION_ATTEMPTING,
+    NOTIFICATION_NOT_STARTED,
+    NOTIFICATION_RECORDED,
+    NOTIFICATION_STATES,
     OPERATION_PHASES,
     OPERATION_RECORD_KEYS,
     OPERATION_STATES,
@@ -51,7 +56,7 @@ class FakeClock:
 class GuardedTable:
     """One in-memory table that fails the test on storage access from a callback."""
 
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, tables=None, name=TERMINAL_OPERATION_TABLE):
         self.rows = dict(rows or {})
         self.reads = 0
         self.enumerations = 0
@@ -62,6 +67,13 @@ class GuardedTable:
         self.after_enumeration = None
         self.enumeration_hook = None
         self.access_hook = None
+        # Every table of a Quasarr database lives in one file, so the fake
+        # reaches its peers the same way one connection does.
+        self.tables = {name: self} if tables is None else tables
+        self.tables.setdefault(name, self)
+        self.name = name
+        self.transactions = []
+        self.commit_hook = None
 
     def _guard(self, operation):
         if self.in_callback:
@@ -109,6 +121,47 @@ class GuardedTable:
             self.rows[key] = value
         return value
 
+    def _peer(self, table):
+        if table not in self.tables:
+            self.tables[table] = GuardedTable(tables=self.tables, name=table)
+        return self.tables[table]
+
+    def mutate_values(self, targets, mutator):
+        """One transaction over several keys of the same database file."""
+        self._guard("mutate_values")
+        resolved = list(targets)
+        if len(set(resolved)) != len(resolved) or not resolved:
+            raise ValueError("mutate_values targets must be unique and non-empty")
+        self.transactions.append(tuple(resolved))
+        tables = [self._peer(table) for table, _key in resolved]
+        current = tuple(
+            table.rows.get(key)
+            for table, (_name, key) in zip(tables, resolved, strict=True)
+        )
+        for table in tables:
+            table.in_callback = True
+        try:
+            new_values = mutator(current)
+        finally:
+            for table in tables:
+                table.in_callback = False
+        if not isinstance(new_values, (list, tuple)) or len(new_values) != len(
+            resolved
+        ):
+            raise TypeError("mutator must return one value per target")
+        if self.commit_hook is not None:
+            self.commit_hook()
+        for table, (_name, key), value in zip(
+            tables, resolved, new_values, strict=True
+        ):
+            if value != table.rows.get(key):
+                table.writes += 1
+            if value is None:
+                table.rows.pop(key, None)
+            else:
+                table.rows[key] = value
+        return tuple(new_values)
+
     def delete_exact(self, key, value):
         self._guard("delete_exact")
         if self.rows.get(key) != value:
@@ -127,12 +180,13 @@ class GuardedTable:
 
 class GuardedSharedState:
     def __init__(self, rows=None):
-        self.tables = {TERMINAL_OPERATION_TABLE: GuardedTable(rows)}
+        self.tables = {}
+        GuardedTable(rows, tables=self.tables)
         self.values = {}
 
     def get_db(self, table):
         if table not in self.tables:
-            self.tables[table] = GuardedTable()
+            self.tables[table] = GuardedTable(tables=self.tables, name=table)
         return self.tables[table]
 
     @property
@@ -168,7 +222,7 @@ def legacy_record(
     )
 
 
-def record(
+def effect_record(
     package_id,
     terminal_state="downloaded",
     state="prepared",
@@ -178,6 +232,7 @@ def record(
     package_terminal=False,
     effect_state=None,
 ):
+    """The exact eight-key row shape shipped before the bookkeeping existed."""
     if effect_state is None:
         effect_state = "not_started" if state == "prepared" else "applied"
     stored = json.loads(
@@ -192,6 +247,35 @@ def record(
         )
     )
     stored["effect_state"] = effect_state
+    return json.dumps(stored, sort_keys=True, separators=(",", ":"))
+
+
+def record(
+    package_id,
+    terminal_state="downloaded",
+    state="prepared",
+    created=NOW,
+    updated=NOW,
+    package_removed=False,
+    package_terminal=False,
+    effect_state=None,
+    failure_persisted=False,
+    notification_state=NOTIFICATION_NOT_STARTED,
+):
+    stored = json.loads(
+        effect_record(
+            package_id,
+            terminal_state=terminal_state,
+            state=state,
+            created=created,
+            updated=updated,
+            package_removed=package_removed,
+            package_terminal=package_terminal,
+            effect_state=effect_state,
+        )
+    )
+    stored["failure_persisted"] = failure_persisted
+    stored["notification_state"] = notification_state
     return json.dumps(stored, sort_keys=True, separators=(",", ":"))
 
 
@@ -224,6 +308,9 @@ class TerminalOperationIdentityTests(unittest.TestCase):
         self.assertEqual({"downloaded", "failed", "disabled"}, set(TERMINAL_STATES))
         self.assertEqual({"prepared", "submitted", "complete"}, set(OPERATION_STATES))
         self.assertEqual(("not_started", "attempting", "applied"), tuple(EFFECT_STATES))
+        self.assertEqual(
+            ("not_started", "attempting", "recorded"), tuple(NOTIFICATION_STATES)
+        )
         self.assertEqual("terminal_operation", TERMINAL_OPERATION_MARKER)
         self.assertEqual(
             {
@@ -235,11 +322,17 @@ class TerminalOperationIdentityTests(unittest.TestCase):
                 "package_removed",
                 "package_terminal",
                 "effect_state",
+                "failure_persisted",
+                "notification_state",
             },
             set(OPERATION_RECORD_KEYS),
         )
         self.assertEqual(
-            set(OPERATION_RECORD_KEYS) - {"effect_state"},
+            set(OPERATION_RECORD_KEYS) - {"failure_persisted", "notification_state"},
+            set(EFFECT_OPERATION_RECORD_KEYS),
+        )
+        self.assertEqual(
+            set(EFFECT_OPERATION_RECORD_KEYS) - {"effect_state"},
             set(LEGACY_OPERATION_RECORD_KEYS),
         )
 
@@ -355,30 +448,109 @@ class SubmissionCommentTests(unittest.TestCase):
 
 
 class OperationRecordCodecTests(unittest.TestCase):
+    def decoded_keys(self):
+        return set(OPERATION_RECORD_KEYS) | {"legacy_unproven"}
+
     def test_a_valid_record_round_trips(self):
         decoded = decode_operation_record(record(package(1)))
 
-        self.assertEqual(set(OPERATION_RECORD_KEYS), set(decoded))
+        self.assertEqual(self.decoded_keys(), set(decoded))
         self.assertEqual("prepared", decoded["state"])
         self.assertEqual(package(1), decoded["package_id"])
         self.assertEqual("not_started", decoded["effect_state"])
+        self.assertFalse(decoded["failure_persisted"])
+        self.assertEqual("not_started", decoded["notification_state"])
+        self.assertFalse(decoded["legacy_unproven"])
+
+    def test_a_recorded_current_row_keeps_its_bookkeeping(self):
+        decoded = decode_operation_record(
+            record(
+                package(1),
+                state="submitted",
+                failure_persisted=True,
+                notification_state=NOTIFICATION_RECORDED,
+            )
+        )
+
+        self.assertTrue(decoded["failure_persisted"])
+        self.assertEqual("recorded", decoded["notification_state"])
+        self.assertFalse(decoded["legacy_unproven"])
+
+    def test_an_eight_key_row_migrates_without_losing_its_provenance(self):
+        """The shape that already marked its artifacts stays provable.
+
+        Its failed rows, disabled packages and JDownloader packages carry this
+        operation's evidence, so it needs no blanket refusal - only the
+        bookkeeping it never wrote, which it may not claim either.
+        """
+        for state, effect_state in (
+            ("prepared", "not_started"),
+            ("prepared", "attempting"),
+            ("submitted", "applied"),
+            ("complete", "applied"),
+        ):
+            with self.subTest(state=state, effect_state=effect_state):
+                decoded = decode_operation_record(
+                    effect_record(package(1), state=state, effect_state=effect_state)
+                )
+
+                self.assertEqual(self.decoded_keys(), set(decoded))
+                self.assertEqual(state, decoded["state"])
+                self.assertEqual(effect_state, decoded["effect_state"])
+                self.assertFalse(decoded["failure_persisted"])
+                self.assertEqual("not_started", decoded["notification_state"])
+                self.assertFalse(decoded["legacy_unproven"])
 
     def test_a_legacy_prepared_row_can_never_claim_a_side_effect(self):
         decoded = decode_operation_record(legacy_record(package(1)))
 
-        self.assertEqual(set(OPERATION_RECORD_KEYS), set(decoded))
+        self.assertEqual(self.decoded_keys(), set(decoded))
         self.assertEqual("prepared", decoded["state"])
         self.assertEqual("not_started", decoded["effect_state"])
+        self.assertFalse(decoded["failure_persisted"])
+        self.assertEqual("not_started", decoded["notification_state"])
+        # Nothing happened yet, so the current operation may simply run.
+        self.assertFalse(decoded["legacy_unproven"])
 
-    def test_a_legacy_submitted_or_complete_row_stays_replayable(self):
+    def test_a_legacy_row_past_prepared_is_marked_unprovable(self):
+        """The seven-key shape left artifacts that name no operation at all.
+
+        A row that already applied its effect can therefore not show whether
+        links were added or a failure was persisted, and the absence of a
+        marker is not evidence of either.
+        """
         for state in ("submitted", "complete"):
-            with self.subTest(state=state):
-                decoded = decode_operation_record(
-                    legacy_record(package(1), state=state)
-                )
+            for terminal_state in TERMINAL_STATES:
+                with self.subTest(state=state, terminal_state=terminal_state):
+                    decoded = decode_operation_record(
+                        legacy_record(
+                            package(1), state=state, terminal_state=terminal_state
+                        )
+                    )
 
-                self.assertEqual(state, decoded["state"])
-                self.assertEqual("applied", decoded["effect_state"])
+                    self.assertEqual(state, decoded["state"])
+                    self.assertEqual("applied", decoded["effect_state"])
+                    self.assertTrue(decoded["legacy_unproven"])
+
+    def test_a_migrated_row_never_claims_bookkeeping_it_never_wrote(self):
+        for raw in (
+            legacy_record(package(1), state="submitted"),
+            legacy_record(package(1), state="complete"),
+            effect_record(package(1), state="submitted"),
+        ):
+            with self.subTest(raw=raw[:40]):
+                decoded = decode_operation_record(raw)
+
+                self.assertFalse(decoded["failure_persisted"])
+                self.assertEqual("not_started", decoded["notification_state"])
+
+    def test_the_migration_provenance_is_never_persisted(self):
+        stored = json.loads(record(package(1)))
+
+        self.assertNotIn("legacy_unproven", stored)
+        self.assertIsNone(
+            decode_operation_record(json.dumps({**stored, "legacy_unproven": True}))
+        )
 
     def test_every_unusable_row_decodes_to_none_instead_of_raising(self):
         deep = "[" * 100_000 + "]" * 100_000
@@ -399,7 +571,8 @@ class OperationRecordCodecTests(unittest.TestCase):
             deep,
             digits,
         ]
-        # Dropping `effect_state` leaves the legacy shape, which migrates; any
+        # Dropping a bookkeeping key leaves the eight-key shape and dropping
+        # `effect_state` too leaves the seven-key one, and both migrate; any
         # other key missing leaves a set no shape ever had.
         for key in sorted(LEGACY_OPERATION_RECORD_KEYS):
             missing = dict(base)
@@ -417,6 +590,10 @@ class OperationRecordCodecTests(unittest.TestCase):
         cases.append(json.dumps({**base, "package_terminal": 1}))
         cases.append(json.dumps({**base, "effect_state": "started"}))
         cases.append(json.dumps({**base, "effect_state": None}))
+        cases.append(json.dumps({**base, "failure_persisted": "yes"}))
+        cases.append(json.dumps({**base, "failure_persisted": 1}))
+        cases.append(json.dumps({**base, "notification_state": "sent"}))
+        cases.append(json.dumps({**base, "notification_state": True}))
         # An incoherent pair would let a row claim an outcome no phase of this
         # operation can have produced.
         for state, effect_state in (
@@ -429,12 +606,20 @@ class OperationRecordCodecTests(unittest.TestCase):
             cases.append(
                 json.dumps({**base, "state": state, "effect_state": effect_state})
             )
-        legacy = json.loads(legacy_record(package(1)))
-        cases.append(json.dumps({**legacy, "links": ["https://filecrypt.invalid/1"]}))
-        for key in sorted(legacy):
-            partial = dict(legacy)
-            partial.pop(key)
-            cases.append(json.dumps(partial))
+        # An operation that never began its attempt has provably touched
+        # nothing, so it can carry no bookkeeping either.
+        cases.append(json.dumps({**base, "failure_persisted": True}))
+        for notification_state in (NOTIFICATION_ATTEMPTING, NOTIFICATION_RECORDED):
+            cases.append(json.dumps({**base, "notification_state": notification_state}))
+        for older in (legacy_record(package(1)), effect_record(package(1))):
+            partial_base = json.loads(older)
+            cases.append(
+                json.dumps({**partial_base, "links": ["https://filecrypt.invalid/1"]})
+            )
+            for key in sorted(set(partial_base) & LEGACY_OPERATION_RECORD_KEYS):
+                partial = dict(partial_base)
+                partial.pop(key)
+                cases.append(json.dumps(partial))
 
         for value in cases:
             with self.subTest(value=str(value)[:60]):
@@ -508,6 +693,8 @@ class TerminalOperationServiceTests(unittest.TestCase):
                 "package_removed": False,
                 "package_terminal": False,
                 "effect_state": "not_started",
+                "failure_persisted": False,
+                "notification_state": "not_started",
             },
             stored,
         )
@@ -975,6 +1162,243 @@ class TerminalOperationServiceTests(unittest.TestCase):
         self.assertEqual(before, self.rows())
 
 
+class TerminalFailureBookkeepingTests(unittest.TestCase):
+    """The durable ledger behind one terminal failure.
+
+    Persisting the failure and counting it are one commit, so no counter can
+    ever answer for a row that was never written and no row can be counted a
+    second time. The notification is the one step no store can undo, so it is
+    fenced by a durable pending phase instead of a flag written afterwards.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.state = GuardedSharedState()
+        self.service = TerminalOperationService(self.state, clock=self.clock)
+        self.package_id = package(1)
+        self.operation_id = terminal_operation_id(self.package_id)
+        self.service.begin(self.operation_id, self.package_id, "failed")
+        self.service.mark_effect_attempting(
+            self.operation_id, self.package_id, "failed"
+        )
+
+    def counters(self):
+        return tuple(
+            (self.state.get_db("statistics").rows.get(key) or "0")
+            for key in ("failed_downloads", "failed_decryptions_automatic")
+        )
+
+    def failed_row(self):
+        return self.state.get_db("failed").rows.get(self.package_id)
+
+    def stored(self):
+        return json.loads(
+            self.state.get_db(TERMINAL_OPERATION_TABLE).rows[self.operation_id]
+        )
+
+    def record_failure(self, value="the failure row", terminal_state="failed"):
+        return self.service.record_failure(
+            self.operation_id,
+            self.package_id,
+            terminal_state,
+            failed_target=("failed", self.package_id),
+            failed_value=value,
+            counter_targets=(
+                ("statistics", "failed_downloads"),
+                ("statistics", "failed_decryptions_automatic"),
+            ),
+        )
+
+    def test_the_row_its_counters_and_the_marker_commit_together(self):
+        operations = self.state.get_db(TERMINAL_OPERATION_TABLE)
+        operations.transactions.clear()
+
+        result = self.record_failure()
+
+        self.assertEqual("applied", result["outcome"])
+        self.assertTrue(result["record"]["failure_persisted"])
+        self.assertEqual("the failure row", self.failed_row())
+        self.assertEqual(("1", "1"), self.counters())
+        self.assertTrue(self.stored()["failure_persisted"])
+        self.assertEqual(
+            [
+                (
+                    (TERMINAL_OPERATION_TABLE, self.operation_id),
+                    ("failed", self.package_id),
+                    ("statistics", "failed_downloads"),
+                    ("statistics", "failed_decryptions_automatic"),
+                )
+            ],
+            operations.transactions,
+        )
+
+    def test_a_commit_that_never_lands_leaves_no_counter_and_no_row(self):
+        operations = self.state.get_db(TERMINAL_OPERATION_TABLE)
+        operations.commit_hook = lambda: (_ for _ in ()).throw(
+            RuntimeError("terminal operation storage unavailable")
+        )
+
+        with self.assertRaises(RuntimeError):
+            self.record_failure()
+
+        self.assertIsNone(self.failed_row())
+        self.assertEqual(("0", "0"), self.counters())
+        self.assertFalse(self.stored()["failure_persisted"])
+
+    def test_a_repeated_failure_writes_no_second_row_and_no_second_count(self):
+        self.record_failure()
+
+        repeated = self.record_failure(value="a different row")
+
+        self.assertEqual("resumed", repeated["outcome"])
+        self.assertTrue(repeated["record"]["failure_persisted"])
+        self.assertEqual("the failure row", self.failed_row())
+        self.assertEqual(("1", "1"), self.counters())
+
+    def test_an_unusable_counter_row_is_counted_from_zero(self):
+        self.state.get_db("statistics").rows["failed_downloads"] = "not a number"
+
+        self.record_failure()
+
+        self.assertEqual(("1", "1"), self.counters())
+
+    def test_an_existing_counter_is_advanced_by_exactly_one(self):
+        statistics = self.state.get_db("statistics")
+        statistics.rows["failed_downloads"] = "41"
+        statistics.rows["failed_decryptions_automatic"] = "7"
+
+        self.record_failure()
+
+        self.assertEqual(("42", "8"), self.counters())
+
+    def test_a_failure_is_never_persisted_before_the_attempt_is_durable(self):
+        fresh = package(2)
+        operation_id = terminal_operation_id(fresh)
+        self.service.begin(operation_id, fresh, "failed")
+
+        result = self.service.record_failure(
+            operation_id,
+            fresh,
+            "failed",
+            failed_target=("failed", fresh),
+            failed_value="the failure row",
+            counter_targets=(("statistics", "failed_downloads"),),
+        )
+
+        self.assertEqual("conflict", result["outcome"])
+        self.assertIsNone(self.state.get_db("failed").rows.get(fresh))
+        self.assertEqual(("0", "0"), self.counters())
+
+    def test_a_failure_of_another_report_is_refused_without_writes(self):
+        result = self.record_failure(terminal_state="downloaded")
+
+        self.assertEqual("conflict", result["outcome"])
+        self.assertIsNone(self.failed_row())
+        self.assertEqual(("0", "0"), self.counters())
+
+    def test_adopting_a_row_an_earlier_attempt_wrote_counts_nothing(self):
+        """The upgrade path: the row is already there, its count is not.
+
+        A crashed attempt of an older shape can leave a marked failed row
+        without the bookkeeping that now records it. Adopting it may never
+        invent the counter that write did or did not produce.
+        """
+        self.state.get_db("failed").rows[self.package_id] = "the failure row"
+
+        adopted = self.service.mark_failure_persisted(
+            self.operation_id, self.package_id, "failed"
+        )
+
+        self.assertEqual("applied", adopted["outcome"])
+        self.assertTrue(adopted["record"]["failure_persisted"])
+        self.assertEqual(("0", "0"), self.counters())
+
+        repeated = self.service.mark_failure_persisted(
+            self.operation_id, self.package_id, "failed"
+        )
+        self.assertEqual("resumed", repeated["outcome"])
+
+    def test_adopting_a_row_needs_a_durable_attempt_and_the_same_report(self):
+        fresh = package(2)
+        self.service.begin(terminal_operation_id(fresh), fresh, "failed")
+
+        never_started = self.service.mark_failure_persisted(
+            terminal_operation_id(fresh), fresh, "failed"
+        )
+        foreign = self.service.mark_failure_persisted(
+            self.operation_id, self.package_id, "downloaded"
+        )
+
+        self.assertEqual("conflict", never_started["outcome"])
+        self.assertEqual("conflict", foreign["outcome"])
+        self.assertFalse(self.stored()["failure_persisted"])
+
+    def test_the_notification_phase_only_moves_forward(self):
+        attempting = self.service.mark_notification(
+            self.operation_id, self.package_id, "failed", NOTIFICATION_ATTEMPTING
+        )
+        self.assertEqual("applied", attempting["outcome"])
+        self.assertEqual("attempting", self.stored()["notification_state"])
+
+        repeated = self.service.mark_notification(
+            self.operation_id, self.package_id, "failed", NOTIFICATION_ATTEMPTING
+        )
+        self.assertEqual("resumed", repeated["outcome"])
+
+        recorded = self.service.mark_notification(
+            self.operation_id, self.package_id, "failed", NOTIFICATION_RECORDED
+        )
+        self.assertEqual("applied", recorded["outcome"])
+        self.assertEqual("recorded", self.stored()["notification_state"])
+
+        backwards = self.service.mark_notification(
+            self.operation_id, self.package_id, "failed", NOTIFICATION_ATTEMPTING
+        )
+        self.assertEqual("resumed", backwards["outcome"])
+        self.assertEqual("recorded", self.stored()["notification_state"])
+
+    def test_a_notification_phase_needs_a_durable_attempt_and_a_known_phase(self):
+        fresh = package(2)
+        self.service.begin(terminal_operation_id(fresh), fresh, "failed")
+
+        never_started = self.service.mark_notification(
+            terminal_operation_id(fresh), fresh, "failed", NOTIFICATION_ATTEMPTING
+        )
+        self.assertEqual("conflict", never_started["outcome"])
+        self.assertEqual(
+            "not_started",
+            json.loads(
+                self.state.get_db(TERMINAL_OPERATION_TABLE).rows[
+                    terminal_operation_id(fresh)
+                ]
+            )["notification_state"],
+        )
+
+        with self.assertRaises(ValueError):
+            self.service.mark_notification(
+                self.operation_id, self.package_id, "failed", "sent"
+            )
+
+    def test_the_bookkeeping_survives_the_transitions_that_follow_it(self):
+        self.record_failure()
+        self.service.mark_notification(
+            self.operation_id, self.package_id, "failed", NOTIFICATION_RECORDED
+        )
+
+        self.service.mark_submitted(self.operation_id, self.package_id, "failed")
+        completed = self.service.mark_complete(
+            self.operation_id,
+            self.package_id,
+            "failed",
+            package_removed=True,
+            package_terminal=True,
+        )
+
+        self.assertTrue(completed["record"]["failure_persisted"])
+        self.assertEqual("recorded", completed["record"]["notification_state"])
+        self.assertEqual(set(OPERATION_RECORD_KEYS), set(self.stored()))
+
+
 class TerminalOperationLockTests(unittest.TestCase):
     """One operation's side effects are serialized, and only that operation's.
 
@@ -1177,6 +1601,37 @@ class RealDatabaseTerminalOperationTests(unittest.TestCase):
 
         self.assertEqual("resumed", resumed["outcome"])
         self.assertEqual("submitted", resumed["record"]["state"])
+
+    def test_a_failure_and_its_counters_are_one_commit_on_disk(self):
+        package_id = package(1)
+        operation_id = terminal_operation_id(package_id)
+        state = self.shared_state()
+        service = TerminalOperationService(state, clock=self.clock)
+        service.begin(operation_id, package_id, "failed")
+        service.mark_effect_attempting(operation_id, package_id, "failed")
+
+        for _attempt in range(2):
+            service.record_failure(
+                operation_id,
+                package_id,
+                "failed",
+                failed_target=("failed", package_id),
+                failed_value="the failure row",
+                counter_targets=(
+                    ("statistics", "failed_downloads"),
+                    ("statistics", "failed_decryptions_automatic"),
+                ),
+            )
+
+        restarted = TerminalOperationService(self.shared_state(), clock=self.clock)
+        resumed = restarted.begin(operation_id, package_id, "failed")
+
+        self.assertTrue(resumed["record"]["failure_persisted"])
+        self.assertEqual("the failure row", state.get_db("failed").retrieve(package_id))
+        self.assertEqual("1", state.get_db("statistics").retrieve("failed_downloads"))
+        self.assertEqual(
+            "1", state.get_db("statistics").retrieve("failed_decryptions_automatic")
+        )
 
     def test_a_concurrent_replacement_survives_pruning_on_disk(self):
         package_id = package(1)

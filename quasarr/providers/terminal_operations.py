@@ -46,6 +46,17 @@ EFFECT_NOT_STARTED = "not_started"
 EFFECT_ATTEMPTING = "attempting"
 EFFECT_APPLIED = "applied"
 EFFECT_STATES = (EFFECT_NOT_STARTED, EFFECT_ATTEMPTING, EFFECT_APPLIED)
+# The phase of the one notification a terminal failure sends. `attempting` is
+# written before it is dispatched, because no store can prove afterwards
+# whether the operator already saw it and a second one would be visible.
+NOTIFICATION_NOT_STARTED = "not_started"
+NOTIFICATION_ATTEMPTING = "attempting"
+NOTIFICATION_RECORDED = "recorded"
+NOTIFICATION_STATES = (
+    NOTIFICATION_NOT_STARTED,
+    NOTIFICATION_ATTEMPTING,
+    NOTIFICATION_RECORDED,
+)
 # The only phases an operation can be in, in the order it passes through them.
 # `applied` belongs to a state past `prepared` by construction, so a row can
 # never claim an outcome no phase of this operation could have produced.
@@ -66,7 +77,14 @@ LEGACY_OPERATION_RECORD_KEYS = frozenset(
         "package_terminal",
     }
 )
-OPERATION_RECORD_KEYS = LEGACY_OPERATION_RECORD_KEYS | {"effect_state"}
+EFFECT_OPERATION_RECORD_KEYS = LEGACY_OPERATION_RECORD_KEYS | {"effect_state"}
+OPERATION_RECORD_KEYS = EFFECT_OPERATION_RECORD_KEYS | {
+    "failure_persisted",
+    "notification_state",
+}
+# Decoded, never stored: which row shape answered, and therefore whether the
+# record can still account for the side effects it applied.
+LEGACY_PROVENANCE_KEY = "legacy_unproven"
 # The key an artifact of one operation carries, in the package or history JSON
 # it was written with. Non-secret by construction: it is a digest.
 TERMINAL_OPERATION_MARKER = "terminal_operation"
@@ -147,10 +165,13 @@ def decode_operation_record(value):
     """Project one persisted row onto the exact record shape, or None.
 
     Total for any input: an unreadable row can never brick a terminal request,
-    it simply authorizes nothing. A row written before the effect phase existed
-    is migrated on read rather than discarded, and a prepared one is migrated
-    as `not_started`: it proves the operation was admitted and nothing more, so
-    it may not adopt an artifact it cannot show it produced.
+    it simply authorizes nothing. Rows written before the effect phase and
+    before the failure bookkeeping existed are migrated on read rather than
+    discarded, and a migration never invents what it cannot show. A prepared
+    row proves the operation was admitted and nothing more, so it may not adopt
+    an artifact it cannot show it produced; a seven-key row past `prepared`
+    marked none of its artifacts at all and is flagged as unprovable, because
+    the absence of a marker is not evidence of anything it did.
     """
     try:
         record = json.loads(value) if isinstance(value, str) else None
@@ -159,15 +180,31 @@ def decode_operation_record(value):
     if not isinstance(record, dict):
         return None
     keys = set(record)
+    legacy_unproven = False
+    failure_persisted = False
+    notification_state = NOTIFICATION_NOT_STARTED
     if keys == OPERATION_RECORD_KEYS:
+        effect_state = record["effect_state"]
+        failure_persisted = record["failure_persisted"]
+        notification_state = record["notification_state"]
+    elif keys == EFFECT_OPERATION_RECORD_KEYS:
         effect_state = record["effect_state"]
     elif keys == LEGACY_OPERATION_RECORD_KEYS:
         effect_state = (
             EFFECT_NOT_STARTED if record["state"] == "prepared" else EFFECT_APPLIED
         )
+        legacy_unproven = record["state"] != "prepared"
     else:
         return None
     if (record["state"], effect_state) not in OPERATION_PHASES:
+        return None
+    if not isinstance(failure_persisted, bool):
+        return None
+    if notification_state not in NOTIFICATION_STATES:
+        return None
+    if effect_state == EFFECT_NOT_STARTED and (
+        failure_persisted or notification_state != NOTIFICATION_NOT_STARTED
+    ):
         return None
     if record["terminal_state"] not in TERMINAL_STATES:
         return None
@@ -179,11 +216,40 @@ def decode_operation_record(value):
         return None
     if not isinstance(record["package_terminal"], bool):
         return None
-    return {**record, "effect_state": effect_state}
+    return {
+        **record,
+        "effect_state": effect_state,
+        "failure_persisted": failure_persisted,
+        "notification_state": notification_state,
+        LEGACY_PROVENANCE_KEY: legacy_unproven,
+    }
 
 
 def _encode(record):
-    return json.dumps(record, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        {key: record[key] for key in OPERATION_RECORD_KEYS},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _incremented(value):
+    """One more than a stored counter, treating an unusable row as zero."""
+    try:
+        current = int(value)
+    except (TypeError, ValueError):
+        current = 0
+    return str(current + 1)
+
+
+def _advanced(record, **updates):
+    """The record a transition leaves behind, in the current shape.
+
+    Whatever shape the row was read in, what is written back is the current
+    one, so the transition itself is what ends a migrated record's inability to
+    account for its own side effects.
+    """
+    return {**record, **updates, LEGACY_PROVENANCE_KEY: False}
 
 
 class TerminalOperationService:
@@ -334,6 +400,9 @@ class TerminalOperationService:
                         "package_removed": False,
                         "package_terminal": False,
                         "effect_state": EFFECT_NOT_STARTED,
+                        "failure_persisted": False,
+                        "notification_state": NOTIFICATION_NOT_STARTED,
+                        LEGACY_PROVENANCE_KEY: False,
                     }
                     decided.update(outcome=OPENED, record=opened)
                     return _encode(opened)
@@ -358,12 +427,8 @@ class TerminalOperationService:
         target_phase = OPERATION_PHASES.index(target)
 
         def decide(current_value):
-            record = decode_operation_record(current_value)
-            if (
-                record is None
-                or record["package_id"] != package_id
-                or record["terminal_state"] != terminal_state
-            ):
+            record = self._own(current_value, package_id, terminal_state)
+            if record is None:
                 decided.update(outcome=CONFLICT, record=record)
                 return current_value
             if (
@@ -372,8 +437,8 @@ class TerminalOperationService:
             ):
                 decided.update(outcome=RESUMED, record=record)
                 return current_value
-            advanced = dict(record)
-            advanced.update(
+            advanced = _advanced(
+                record,
                 state=target[0],
                 effect_state=target[1],
                 updated_epoch=now,
@@ -384,6 +449,125 @@ class TerminalOperationService:
 
         self._table().mutate_value(operation_id, decide)
         return self._result(decided["outcome"], decided["record"])
+
+    @staticmethod
+    def _own(current_value, package_id, terminal_state):
+        """The record this exact report may act on, or None for anything else."""
+        record = decode_operation_record(current_value)
+        if (
+            record is None
+            or record["package_id"] != package_id
+            or record["terminal_state"] != terminal_state
+        ):
+            return None
+        return record
+
+    def _bookkeep(self, operation_id, package_id, terminal_state, decide):
+        """Commit one bookkeeping phase of an operation that began its attempt.
+
+        Nothing is ever recorded while the operation is still merely admitted:
+        a record that provably touched nothing may not claim a counter or a
+        notification, and the caller that skipped its durable attempt would
+        otherwise hide exactly that.
+        """
+        self._validate(operation_id, package_id, terminal_state)
+        now = int(self._clock())
+        decided = {}
+
+        def mutate(current_value):
+            record = self._own(current_value, package_id, terminal_state)
+            if record is None or record["effect_state"] == EFFECT_NOT_STARTED:
+                decided.update(outcome=CONFLICT, record=record)
+                return current_value
+            updates = decide(record)
+            if not updates:
+                decided.update(outcome=RESUMED, record=record)
+                return current_value
+            advanced = _advanced(record, **updates, updated_epoch=now)
+            decided.update(outcome=APPLIED, record=advanced)
+            return _encode(advanced)
+
+        self._table().mutate_value(operation_id, mutate)
+        return self._result(decided["outcome"], decided["record"])
+
+    def record_failure(
+        self,
+        operation_id,
+        package_id,
+        terminal_state,
+        *,
+        failed_target,
+        failed_value,
+        counter_targets,
+    ):
+        """Commit the failure row, its counters and this operation's marker at once.
+
+        Every table of one Quasarr database lives in one file, so this is a
+        single transaction: a counter can never answer for a row that was never
+        written, a row can never be counted twice, and a retry that finds the
+        marker knows both already happened. The caller owns the shape of the
+        row and the names of the counters; this owns when they may be written.
+        """
+        self._validate(operation_id, package_id, terminal_state)
+        if not isinstance(failed_value, str):
+            raise TypeError("failed_value must be str")
+        targets = (
+            (TERMINAL_OPERATION_TABLE, operation_id),
+            tuple(failed_target),
+            *(tuple(target) for target in counter_targets),
+        )
+        now = int(self._clock())
+        decided = {}
+
+        def mutate(current_values):
+            record = self._own(current_values[0], package_id, terminal_state)
+            if record is None or record["effect_state"] == EFFECT_NOT_STARTED:
+                decided.update(outcome=CONFLICT, record=record)
+                return list(current_values)
+            if record["failure_persisted"]:
+                decided.update(outcome=RESUMED, record=record)
+                return list(current_values)
+            advanced = _advanced(record, failure_persisted=True, updated_epoch=now)
+            decided.update(outcome=APPLIED, record=advanced)
+            return [_encode(advanced), failed_value] + [
+                _incremented(value) for value in current_values[2:]
+            ]
+
+        self._table().mutate_values(targets, mutate)
+        return self._result(decided["outcome"], decided["record"])
+
+    def mark_failure_persisted(self, operation_id, package_id, terminal_state):
+        """Adopt a marked failure row an interrupted attempt already committed.
+
+        Only the row is adopted, never a count: an older shape wrote its
+        history without this bookkeeping, so whether it also counted the
+        failure is exactly what cannot be shown, and inventing the counter
+        would be the duplicate this whole ledger exists to prevent.
+        """
+        return self._bookkeep(
+            operation_id,
+            package_id,
+            terminal_state,
+            lambda record: (
+                None if record["failure_persisted"] else {"failure_persisted": True}
+            ),
+        )
+
+    def mark_notification(self, operation_id, package_id, terminal_state, target):
+        """Move the notification phase forward, never backwards."""
+        if target not in NOTIFICATION_STATES:
+            raise ValueError("Unsupported notification phase")
+        reached = NOTIFICATION_STATES.index(target)
+        return self._bookkeep(
+            operation_id,
+            package_id,
+            terminal_state,
+            lambda record: (
+                None
+                if NOTIFICATION_STATES.index(record["notification_state"]) >= reached
+                else {"notification_state": target}
+            ),
+        )
 
     def mark_effect_attempting(self, operation_id, package_id, terminal_state):
         """Record that this operation is about to touch the world.

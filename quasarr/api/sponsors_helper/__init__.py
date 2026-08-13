@@ -25,7 +25,9 @@ from quasarr.api.sponsors_helper.cohort_protocol import (
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.downloads import (
     SUBMIT_PHASE_SUBMIT,
+    commit_terminal_failure,
     fail,
+    failed_package_reason,
     failed_package_records_operation,
     finalize_protected_removal,
     jdownloader_holds_operation,
@@ -58,6 +60,9 @@ from quasarr.providers.terminal_operations import (
     CAPACITY,
     CONFLICT,
     EFFECT_ATTEMPTING,
+    NOTIFICATION_ATTEMPTING,
+    NOTIFICATION_NOT_STARTED,
+    NOTIFICATION_RECORDED,
     TERMINAL_OPERATION_MARKER,
     TerminalOperationService,
     operation_evidence,
@@ -604,17 +609,11 @@ def setup_sponsors_helper_routes(app):
             return str(reason)
         return default_reason
 
-    def mark_helper_package_failed(package_id, title, reason, terminal_operation=None):
+    def mark_helper_package_failed(package_id, title, reason):
         protected_release = get_protected_release(package_id)
         if protected_release and protected_release.get("title"):
             title = protected_release["title"]
-        fail(
-            title,
-            package_id,
-            shared_state,
-            reason=reason,
-            terminal_operation=terminal_operation,
-        )
+        fail(title, package_id, shared_state, reason=reason)
         try:
             shared_state.get_db("protected").delete(package_id)
         except Exception as e:
@@ -698,6 +697,13 @@ def setup_sponsors_helper_routes(app):
     def record_helper_terminal_failure(context, package_id, title, reason):
         """Persist this operation's failure once, resuming an interrupted one.
 
+        The history row is the commit point of the whole failure: it is written
+        with this operation's evidence and with both counters in one
+        transaction, and nothing a helper or an operator can observe happens
+        before it lands. A write that never landed therefore leaves the
+        operation exactly where it was, with no counter, no notification and a
+        protected package the next attempt can still act on.
+
         Failed history only answers for the operation that wrote it: package
         IDs are derived from the release, so a package that failed once and was
         added again still carries that row while it is protected, and the
@@ -705,25 +711,112 @@ def setup_sponsors_helper_routes(app):
         operation that never began its attempt therefore reads no history at
         all, and one that did may only recognize its own marker.
         """
-        evidence = operation_evidence(context["record"])
-        if context["record"]["effect_state"] == EFFECT_ATTEMPTING:
-            persisted = failed_package_records_operation(
-                shared_state, package_id, evidence
-            )
-            if persisted is None:
-                return False
+        record = context["record"]
+        evidence = operation_evidence(record)
+        if not record["failure_persisted"]:
+            persisted = False
+            if record["effect_state"] == EFFECT_ATTEMPTING:
+                persisted = failed_package_records_operation(
+                    shared_state, package_id, evidence
+                )
+                if persisted is None:
+                    return False
             if persisted:
-                return True
-        begin_terminal_effect(context)
-        # The marker is written with the row, so a crash between it and the
-        # counter loses a count rather than duplicating a user-visible failure.
-        mark_helper_package_failed(
-            package_id, title, reason, terminal_operation=evidence
+                # An interrupted attempt of an older shape already committed
+                # the row. Nothing that followed it left a trace, so neither
+                # its count nor its notification may be invented here: the
+                # notification is closed unsent rather than risking a second
+                # one the operator would see.
+                result = context["service"].mark_failure_persisted(
+                    context["operation_id"],
+                    package_id,
+                    record["terminal_state"],
+                )
+                if result["outcome"] == CONFLICT:
+                    return abort(409, "Terminal operation identity conflict")
+                context["record"] = result["record"]
+                if not context["record"]["failure_persisted"]:
+                    return False
+                return mark_terminal_notification(context, NOTIFICATION_RECORDED)
+
+            begin_terminal_effect(context)
+            protected_release = get_protected_release(package_id)
+            if protected_release and protected_release.get("title"):
+                title = protected_release["title"]
+            try:
+                result = commit_terminal_failure(
+                    context["service"],
+                    context["operation_id"],
+                    package_id,
+                    record["terminal_state"],
+                    title,
+                    reason,
+                    evidence,
+                )
+            except Exception as e:
+                info(
+                    "Error recording the terminal failure of "
+                    f'"{_log_safe_package_id(package_id)}": {e}'
+                )
+                return False
+            if result["outcome"] == CONFLICT:
+                return abort(409, "Terminal operation identity conflict")
+            context["record"] = result["record"]
+            if not context["record"]["failure_persisted"]:
+                return False
+        return notify_terminal_failure(context, package_id, title, reason)
+
+    def notify_terminal_failure(context, package_id, title, reason):
+        """Tell the operator about this failure at most once, ever.
+
+        A message that was already dispatched cannot be recalled and cannot be
+        proven to have arrived, so the pending phase is persisted before it is
+        sent: a retry that finds one never sends a second, and a retry that
+        finds none knows the first was never dispatched at all.
+        """
+        phase = context["record"]["notification_state"]
+        if phase == NOTIFICATION_RECORDED:
+            return True
+        if phase == NOTIFICATION_NOT_STARTED:
+            release = get_protected_release(package_id) or {"title": title}
+            if not mark_terminal_notification(context, NOTIFICATION_ATTEMPTING):
+                return False
+            update_release_notification(
+                shared_state,
+                release,
+                NotificationType.FAILED,
+                details={"reason": reason},
+            )
+        return mark_terminal_notification(context, NOTIFICATION_RECORDED)
+
+    def mark_terminal_notification(context, phase):
+        result = context["service"].mark_notification(
+            context["operation_id"],
+            context["record"]["package_id"],
+            context["record"]["terminal_state"],
+            phase,
         )
-        StatsHelper(shared_state).increment_failed_decryptions_automatic()
-        return (
-            failed_package_records_operation(shared_state, package_id, evidence) is True
-        )
+        if result["outcome"] == CONFLICT:
+            return abort(409, "Terminal operation identity conflict")
+        context["record"] = result["record"]
+        return True
+
+    def unprovable_legacy_terminal(context, package_id):
+        """Answer a migrated record that can account for nothing it applied.
+
+        The row shape it was written in marked none of its artifacts, so a
+        failed row, a JDownloader package or a disabled flag found now proves
+        nothing about it - and neither does their absence. The only thing still
+        worth reading is whether the protected package is gone, which is
+        terminal on its own and invents no outcome. Anything else waits for the
+        operator, or for retention to allow a fresh lifecycle.
+        """
+        present, _package_data = read_protected_package(package_id)
+        if present is False:
+            return complete_terminal(
+                context, package_removed=True, package_terminal=True
+            )
+        return unconfirmed_terminal_response(context)
 
     def projected_final_download_links(download_links, package_id):
         return project_final_download_urls(download_links, package_id)[2]["urls"]
@@ -733,6 +826,8 @@ def setup_sponsors_helper_routes(app):
     ):
         if context["record"]["state"] == "complete":
             return terminal_response(context["record"])
+        if context["record"]["legacy_unproven"]:
+            return unprovable_legacy_terminal(context, package_id)
 
         evidence = operation_evidence(context["record"])
         final_links = None
@@ -747,11 +842,13 @@ def setup_sponsors_helper_routes(app):
                 # The interrupted attempt could have ended in either side
                 # effect, so both are asked - each only about what this
                 # operation named.
-                failed_now = failed_package_records_operation(
-                    shared_state, package_id, evidence
-                )
-                if failed_now is None:
-                    return unconfirmed_terminal_response(context)
+                failed_now = context["record"]["failure_persisted"]
+                if not failed_now:
+                    failed_now = failed_package_records_operation(
+                        shared_state, package_id, evidence
+                    )
+                    if failed_now is None:
+                        return unconfirmed_terminal_response(context)
                 if failed_now:
                     submit = False
                 else:
@@ -763,6 +860,18 @@ def setup_sponsors_helper_routes(app):
                     submit = not already_submitted
 
             if not submit:
+                # An interrupted attempt of this operation already wrote the
+                # failure; the reason it recorded is what finishes telling the
+                # operator about it, so a lost answer costs no notification.
+                recorded_reason = (
+                    failed_package_reason(shared_state, package_id, evidence)
+                    if failed_now
+                    else None
+                )
+                if recorded_reason is not None and not record_helper_terminal_failure(
+                    context, package_id, title, recorded_reason
+                ):
+                    return unconfirmed_terminal_response(context)
                 mark_terminal_submitted(context)
             elif not isinstance(download_links, list) or not download_links:
                 reason = (
@@ -792,13 +901,9 @@ def setup_sponsors_helper_routes(app):
                 if submit_result["success"]:
                     final_links = submit_result["links"]
                     mark_terminal_submitted(context)
-                elif submit_result.get("persisted_failure"):
-                    StatsHelper(shared_state).increment_failed_decryptions_automatic()
-                    if (
-                        failed_package_records_operation(
-                            shared_state, package_id, evidence
-                        )
-                        is not True
+                elif submit_result.get("mirror_rejected"):
+                    if not record_helper_terminal_failure(
+                        context, package_id, title, submit_result["reason"]
                     ):
                         return unconfirmed_terminal_response(context)
                     failed_now = True
@@ -807,13 +912,15 @@ def setup_sponsors_helper_routes(app):
                     return unconfirmed_terminal_response(context)
 
         if failed_now is None:
-            # Resumed after the submitted phase: history is the only durable
-            # record left of how that phase ended.
-            failed_now = failed_package_records_operation(
-                shared_state, package_id, evidence
-            )
-            if failed_now is None:
-                return unconfirmed_terminal_response(context)
+            # Resumed after the submitted phase: the durable marker, and then
+            # history, are the only records left of how that phase ended.
+            failed_now = context["record"]["failure_persisted"]
+            if not failed_now:
+                failed_now = failed_package_records_operation(
+                    shared_state, package_id, evidence
+                )
+                if failed_now is None:
+                    return unconfirmed_terminal_response(context)
         removal = finalize_protected_removal(
             shared_state,
             package_id,
@@ -833,6 +940,8 @@ def setup_sponsors_helper_routes(app):
     def confirm_terminal_failure(context, package_id, title, reason):
         if context["record"]["state"] == "complete":
             return terminal_response(context["record"])
+        if context["record"]["legacy_unproven"]:
+            return unprovable_legacy_terminal(context, package_id)
 
         if context["record"]["state"] == "prepared":
             if not record_helper_terminal_failure(context, package_id, title, reason):
@@ -875,6 +984,8 @@ def setup_sponsors_helper_routes(app):
     def confirm_terminal_disable(context, package_id, reason):
         if context["record"]["state"] == "complete":
             return terminal_response(context["record"])
+        if context["record"]["legacy_unproven"]:
+            return unprovable_legacy_terminal(context, package_id)
 
         if context["record"]["state"] == "prepared":
             evidence = operation_evidence(context["record"])

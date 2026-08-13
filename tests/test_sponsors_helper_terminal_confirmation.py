@@ -3,6 +3,7 @@
 import contextlib
 import json
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -39,7 +40,7 @@ def package(index=1):
 
 
 class MemoryTable:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, tables=None, name="protected"):
         self.rows = dict(rows or {})
         self.writes = 0
         self.deletes = 0
@@ -47,6 +48,12 @@ class MemoryTable:
         # Access order, so a read taken to decide something can be told from
         # one taken to verify a write that already happened.
         self.events = []
+        # Every table of a Quasarr database lives in one file, so the fake
+        # reaches its peers the same way one connection does.
+        self.tables = {} if tables is None else tables
+        self.tables.setdefault(name, self)
+        self.name = name
+        self.transactions = []
 
     def _check(self):
         if self.unavailable:
@@ -81,6 +88,42 @@ class MemoryTable:
         else:
             self.rows[key] = value
         return value
+
+    def _peer(self, table):
+        if table not in self.tables:
+            self.tables[table] = MemoryTable(tables=self.tables, name=table)
+        return self.tables[table]
+
+    def mutate_values(self, targets, mutator):
+        """One transaction over several keys of the same database file."""
+        resolved = list(targets)
+        if len(set(resolved)) != len(resolved) or not resolved:
+            raise ValueError("mutate_values targets must be unique and non-empty")
+        self.transactions.append(tuple(resolved))
+        tables = [self._peer(table) for table, _key in resolved]
+        for table in tables:
+            table._check()
+        current = tuple(
+            table.rows.get(key)
+            for table, (_name, key) in zip(tables, resolved, strict=True)
+        )
+        new_values = mutator(current)
+        if not isinstance(new_values, (list, tuple)) or len(new_values) != len(
+            resolved
+        ):
+            raise TypeError("mutator must return one value per target")
+        for table, (_name, key), value in zip(
+            tables, resolved, new_values, strict=True
+        ):
+            if value == table.rows.get(key):
+                continue
+            table.events.append("write")
+            table.writes += 1
+            if value is None:
+                table.rows.pop(key, None)
+            else:
+                table.rows[key] = value
+        return tuple(new_values)
 
     def delete_exact(self, key, value):
         self._check()
@@ -166,7 +209,7 @@ class MemorySharedState:
 
     def get_db(self, table):
         if table not in self.tables:
-            self.tables[table] = MemoryTable()
+            self.tables[table] = MemoryTable(tables=self.tables, name=table)
         return self.tables[table]
 
     def update(self, key, value):
@@ -280,25 +323,36 @@ class TerminalConfirmationTestCase(unittest.TestCase):
         effect_state="not_started",
         created=1,
         legacy=False,
+        shape=None,
+        failure_persisted=False,
+        notification_state="not_started",
+        package_removed=False,
+        package_terminal=False,
     ):
         """Persist the record a crashed request would have left behind.
 
-        `legacy` writes the exact seven-key row shipped before the effect
-        phase existed, which is what a Quasarr that is upgraded mid-operation
-        finds on disk.
+        `shape` picks which deployed row a Quasarr that is upgraded
+        mid-operation finds on disk: the seven-key row shipped before the
+        effect phase existed, the eight-key row shipped before the failure
+        bookkeeping existed, or the current one.
         """
         package_id = package_id or package()
+        if shape is None:
+            shape = "legacy" if legacy else "current"
         stored = {
             "state": state,
             "terminal_state": terminal_state,
             "package_id": package_id,
             "created_epoch": created,
             "updated_epoch": created,
-            "package_removed": False,
-            "package_terminal": False,
+            "package_removed": package_removed,
+            "package_terminal": package_terminal,
         }
-        if not legacy:
+        if shape != "legacy":
             stored["effect_state"] = effect_state
+        if shape == "current":
+            stored["failure_persisted"] = failure_persisted
+            stored["notification_state"] = notification_state
         self.state.get_db(TERMINAL_OPERATION_TABLE).update_store(
             terminal_operation_id(package_id),
             json.dumps(stored, sort_keys=True, separators=(",", ":")),
@@ -404,6 +458,27 @@ class TerminalConfirmationTestCase(unittest.TestCase):
         with self.assertRaises(HTTPError) as context:
             self.call(rule, payload)
         self.assertEqual(status, context.exception.status_code)
+
+    @contextlib.contextmanager
+    def crash_after(self, ordinal, method="mutate_value"):
+        """Lose the n-th operation-table transaction of the next request.
+
+        Every durable phase of a terminal request is one such transaction, so
+        naming its ordinal is how a crash is placed in an exact window between
+        two side effects.
+        """
+        operations = self.state.get_db(TERMINAL_OPERATION_TABLE)
+        original = getattr(operations, method)
+        calls = {"count": 0}
+
+        def crashing(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == ordinal:
+                raise RuntimeError("terminal operation storage unavailable")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(operations, method, crashing):
+            yield calls
 
 
 class LegacyTerminalRequestTests(TerminalConfirmationTestCase):
@@ -828,18 +903,10 @@ class FailTerminalConfirmationTests(TerminalConfirmationTestCase):
 
     def test_an_existing_failed_row_is_never_written_a_second_time(self):
         payload = self.version_two({"package_id": package()})
-        operations = self.state.get_db(TERMINAL_OPERATION_TABLE)
-        original = operations.mutate_value
-        calls = {"count": 0}
 
-        # begin, the durable attempt, then the confirmation this one loses.
-        def fail_the_third_transaction(key, mutator):
-            calls["count"] += 1
-            if calls["count"] == 3:
-                raise RuntimeError("terminal operation storage unavailable")
-            return original(key, mutator)
-
-        with mock.patch.object(operations, "mutate_value", fail_the_third_transaction):
+        # begin, the durable attempt, the two notification phases, then the
+        # confirmation this request loses.
+        with self.crash_after(5):
             with self.assertRaises(HTTPError):
                 self.call(FAIL_RULE, payload)
 
@@ -901,18 +968,9 @@ class DisableTerminalConfirmationTests(TerminalConfirmationTestCase):
 
     def test_a_crash_before_confirmation_never_disables_twice(self):
         payload = self.version_two({"package_id": package()})
-        operations = self.state.get_db(TERMINAL_OPERATION_TABLE)
-        original = operations.mutate_value
-        calls = {"count": 0}
 
         # begin, the durable attempt, then the confirmation this one loses.
-        def fail_the_third_transaction(key, mutator):
-            calls["count"] += 1
-            if calls["count"] == 3:
-                raise RuntimeError("terminal operation storage unavailable")
-            return original(key, mutator)
-
-        with mock.patch.object(operations, "mutate_value", fail_the_third_transaction):
+        with self.crash_after(3):
             with self.assertRaises(HTTPError):
                 self.call(DISABLE_RULE, payload)
 
@@ -993,8 +1051,8 @@ class ConcurrentTerminalRequestTests(TerminalConfirmationTestCase):
         gate = SideEffectGate()
 
         with mock.patch(
-            "quasarr.api.sponsors_helper.fail",
-            gate.wrap(sponsors_helper_api.fail),
+            "quasarr.api.sponsors_helper.commit_terminal_failure",
+            gate.wrap(sponsors_helper_api.commit_terminal_failure),
         ):
             first, second = self.concurrently(
                 FAIL_RULE, self.version_two({"package_id": package()}), gate
@@ -1339,6 +1397,387 @@ class ResumedDisableProvenanceTests(TerminalConfirmationTestCase):
         self.assertEqual(0, self.statistic("failed_decryptions_automatic"))
         self.assertEqual(0, self.statistic("captcha_decryptions_automatic"))
         self.assertEqual("complete", self.operation_row()["state"])
+
+
+class TerminalFailurePersistenceTests(TerminalConfirmationTestCase):
+    """Nothing a helper can see happens before the failure is durably this one's.
+
+    Counting a failure, telling the operator about it and dropping the
+    protected package are the three things a retry cannot take back, and none
+    of them may answer for a history row that was never written.
+    """
+
+    def payload(self):
+        return self.version_two({"package_id": package()})
+
+    def assert_nothing_happened(self, result):
+        self.state.get_db("failed").unavailable = False
+        self.assertEqual(
+            {
+                "success": False,
+                "terminal_state": "failed",
+                "package_removed": False,
+                "package_terminal": False,
+                "package_id": package(),
+            },
+            result,
+        )
+        self.assertIsNone(self.failed_row())
+        self.assertIsNotNone(self.protected_row())
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(0, self.statistic("failed_downloads"))
+        self.assertEqual(0, self.statistic("failed_decryptions_automatic"))
+
+    def test_a_history_write_that_never_lands_confirms_nothing(self):
+        self.state.get_db("failed").unavailable = True
+
+        result = self.call(FAIL_RULE, self.payload())
+
+        self.assert_nothing_happened(result)
+        self.assertEqual("prepared", self.operation_row()["state"])
+        self.assertFalse(self.operation_row()["failure_persisted"])
+
+    def test_a_history_write_that_never_lands_still_resumes_afterwards(self):
+        history = self.state.get_db("failed")
+        history.unavailable = True
+        self.call(FAIL_RULE, self.payload())
+        history.unavailable = False
+
+        retry = self.call(FAIL_RULE, self.payload())
+
+        self.assertTrue(retry["success"])
+        self.assertEqual(
+            self.current_evidence(), self.failed_blob()["terminal_operation"]
+        )
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+
+    def test_the_row_and_both_counters_are_one_commit(self):
+        self.call(FAIL_RULE, self.payload())
+
+        self.assertEqual(
+            [
+                (
+                    (TERMINAL_OPERATION_TABLE, terminal_operation_id(package())),
+                    ("failed", package()),
+                    ("statistics", "failed_downloads"),
+                    ("statistics", "failed_decryptions_automatic"),
+                )
+            ],
+            self.state.get_db(TERMINAL_OPERATION_TABLE).transactions,
+        )
+
+    def test_history_is_written_before_the_notification_and_the_removal(self):
+        order = []
+        operations = self.state.get_db(TERMINAL_OPERATION_TABLE)
+        protected = self.state.get_db("protected")
+        original = operations.mutate_values
+        removal = protected.delete
+        self.notifications.side_effect = lambda *a, **k: order.append("notify")
+
+        def committed(targets, mutator):
+            order.append("history")
+            return original(targets, mutator)
+
+        def removed(key):
+            order.append("remove")
+            return removal(key)
+
+        with (
+            mock.patch.object(operations, "mutate_values", committed),
+            mock.patch.object(protected, "delete", removed),
+        ):
+            self.call(FAIL_RULE, self.payload())
+
+        self.assertEqual(["history", "notify", "remove"], order)
+
+    def test_a_crash_after_the_row_notifies_exactly_once_on_the_retry(self):
+        payload = self.payload()
+
+        # begin, the durable attempt, then the notification phase this one loses.
+        with self.crash_after(3):
+            with self.assertRaises(HTTPError):
+                self.call(FAIL_RULE, payload)
+
+        self.assertIsNotNone(self.failed_row())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual([], self.notification_cases())
+        self.assertIsNotNone(self.protected_row())
+
+        retry = self.call(FAIL_RULE, payload)
+
+        self.assertTrue(retry["success"])
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+
+    def test_a_dispatched_notification_is_never_sent_a_second_time(self):
+        """The one step no store can undo is fenced before it is taken.
+
+        A crash between dispatching the notification and recording it leaves a
+        phase that cannot prove whether the operator saw it, and repeating it
+        would be a visible duplicate, so it is never repeated.
+        """
+        payload = self.payload()
+
+        # begin, the durable attempt, the pending notification phase, then the
+        # phase that records it, which this request loses.
+        with self.crash_after(4):
+            with self.assertRaises(HTTPError):
+                self.call(FAIL_RULE, payload)
+
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual("attempting", self.operation_row()["notification_state"])
+
+        retry = self.call(FAIL_RULE, payload)
+
+        self.assertTrue(retry["success"])
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+
+    def test_the_pending_phase_is_durable_before_the_notification_is_sent(self):
+        order = []
+        self.notifications.side_effect = lambda *a, **k: order.append("notify")
+        operations = self.state.get_db(TERMINAL_OPERATION_TABLE)
+        original = operations.mutate_value
+
+        def observed(key, mutator):
+            value = original(key, mutator)
+            order.append(json.loads(value)["notification_state"])
+            return value
+
+        with mock.patch.object(operations, "mutate_value", observed):
+            self.call(FAIL_RULE, self.payload())
+
+        self.assertLess(order.index("attempting"), order.index("notify"))
+        self.assertLess(order.index("notify"), order.index("recorded"))
+
+    def test_an_unusable_download_payload_persists_before_it_counts(self):
+        self.state.get_db("failed").unavailable = True
+        payload = self.version_two(self.download_payload(urls=[]))
+
+        result = self.call(DOWNLOAD_RULE, payload)
+
+        self.assertFalse(result["success"])
+        self.assertIsNotNone(self.protected_row())
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(0, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual(0, self.statistic("failed_downloads"))
+
+    def test_an_interrupted_download_failure_finishes_telling_the_operator(self):
+        """The reason it wrote down is what the resumed notification carries.
+
+        A download failure whose answer was lost still owes the operator the
+        message it never sent, and the only place that reason survives is the
+        history row - the operation record itself stays bounded.
+        """
+        payload = self.version_two(self.download_payload(urls=[]))
+
+        # begin, the durable attempt, then the notification phase this one loses.
+        with self.crash_after(3):
+            with self.assertRaises(HTTPError):
+                self.call(DOWNLOAD_RULE, payload)
+
+        self.assertIsNotNone(self.failed_row())
+        self.assertEqual([], self.notification_cases())
+
+        retry = self.call(DOWNLOAD_RULE, payload)
+
+        self.assertTrue(retry["success"])
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(
+            "SponsorsHelper returned no final download links.",
+            self.notifications.call_args.kwargs["details"]["reason"],
+        )
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual(0, len(self.state.device.add_links_calls))
+        self.assertIsNone(self.protected_row())
+
+    def test_a_rejected_mirror_whitelist_persists_before_it_counts(self):
+        self.state.get_db("failed").unavailable = True
+        payload = self.version_two(self.download_payload())
+        route = route_for(DOWNLOAD_RULE)
+
+        with (
+            self.patched(payload),
+            mock.patch(
+                "quasarr.downloads.get_download_category_mirrors",
+                return_value=["ddownload"],
+            ),
+        ):
+            result = route.callback()
+
+        self.assertFalse(result["success"])
+        self.assertIsNotNone(self.protected_row())
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(0, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual(0, self.statistic("failed_downloads"))
+        self.assertEqual(0, len(self.state.device.add_links_calls))
+
+
+class MigratedTerminalRecordTests(TerminalConfirmationTestCase):
+    """A seven-key row past `prepared` can never show what it applied.
+
+    Its failed rows, disabled packages and JDownloader packages name no
+    operation, so the absence of a marker is not evidence that this operation
+    failed, and it is certainly not evidence that it solved anything.
+    """
+
+    RULES = {
+        "downloaded": DOWNLOAD_RULE,
+        "failed": FAIL_RULE,
+        "disabled": DISABLE_RULE,
+    }
+
+    def request(self, terminal_state):
+        if terminal_state == "downloaded":
+            return DOWNLOAD_RULE, self.version_two(self.download_payload())
+        return self.RULES[terminal_state], self.version_two({"package_id": package()})
+
+    def assert_untouched(self, result, terminal_state):
+        self.assertEqual(
+            {
+                "success": False,
+                "terminal_state": terminal_state,
+                "package_removed": False,
+                "package_terminal": False,
+                "package_id": package(),
+            },
+            result,
+        )
+        self.assertIsNotNone(self.protected_row())
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual([], self.submitted_comments())
+        self.assertEqual(0, self.state.device.queries)
+        self.assertEqual(0, self.statistic("failed_downloads"))
+        self.assertEqual(0, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual(0, self.statistic("captcha_decryptions_automatic"))
+        self.assertEqual(0, self.statistic("packages_downloaded"))
+
+    def test_a_protected_package_blocks_every_migrated_submitted_report(self):
+        for terminal_state in ("downloaded", "failed", "disabled"):
+            with self.subTest(terminal_state=terminal_state):
+                self.setUp()
+                self.seed_operation(terminal_state, state="submitted", legacy=True)
+                rule, payload = self.request(terminal_state)
+
+                result = self.call(rule, payload)
+
+                self.assert_untouched(result, terminal_state)
+                self.assertNotIn("disabled", self.protected_row())
+                self.assertIsNone(self.failed_row())
+
+    def test_an_absent_package_completes_a_migrated_report_without_effects(self):
+        for terminal_state in ("downloaded", "failed", "disabled"):
+            with self.subTest(terminal_state=terminal_state):
+                self.setUp()
+                self.seed_operation(terminal_state, state="submitted", legacy=True)
+                self.state.get_db("protected").delete(package())
+                rule, payload = self.request(terminal_state)
+
+                result = self.call(rule, payload)
+
+                self.assertEqual(
+                    {
+                        "success": True,
+                        "terminal_state": terminal_state,
+                        "package_removed": True,
+                        "package_terminal": True,
+                        "package_id": package(),
+                    },
+                    result,
+                )
+                self.assertEqual([], self.notification_cases())
+                self.assertEqual([], self.submitted_comments())
+                self.assertEqual(0, self.state.device.queries)
+                self.assertIsNone(self.failed_row())
+                self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_an_unmarked_failed_row_never_solves_a_migrated_download(self):
+        self.seed_operation("downloaded", state="submitted", legacy=True)
+        self.store_failed()
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assert_untouched(result, "downloaded")
+        self.assertEqual("last time", self.failed_blob()["error"])
+
+    def test_an_unmarked_jdownloader_package_never_ends_a_migrated_download(self):
+        self.seed_operation("downloaded", state="submitted", legacy=True)
+        self.state.device.downloader_packages.append({"uuid": 5, "comment": package()})
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assert_untouched(result, "downloaded")
+
+    def test_an_unmarked_disabled_flag_never_confirms_a_migrated_disable(self):
+        self.store_protected(disabled=True)
+        self.seed_operation("disabled", state="submitted", legacy=True)
+
+        result = self.call(DISABLE_RULE, self.version_two({"package_id": package()}))
+
+        self.assertFalse(result["success"])
+        self.assertFalse(result["package_terminal"])
+        self.assertTrue(self.protected_row()["disabled"])
+        self.assertNotIn("terminal_operation", self.protected_row())
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(0, self.statistic("captcha_decryptions_automatic"))
+
+    def test_a_migrated_complete_row_replays_its_stored_outcome_only(self):
+        for terminal_state in ("downloaded", "failed", "disabled"):
+            with self.subTest(terminal_state=terminal_state):
+                self.setUp()
+                self.seed_operation(
+                    terminal_state,
+                    state="complete",
+                    legacy=True,
+                    # Inside retention, or admission would prune it and open a
+                    # fresh operation instead of replaying this one.
+                    created=int(time.time()),
+                    package_removed=True,
+                    package_terminal=True,
+                )
+                rule, payload = self.request(terminal_state)
+
+                first = self.call(rule, payload)
+                replay = self.call(rule, payload)
+
+                self.assertEqual(first, replay)
+                self.assertTrue(first["success"])
+                self.assertTrue(first["package_removed"])
+                self.assertEqual([], self.notification_cases())
+                self.assertEqual([], self.submitted_comments())
+                self.assertEqual(0, self.state.device.queries)
+                # The protected row is the one thing a replay must not touch.
+                self.assertIsNotNone(self.protected_row())
+                self.assertIsNone(self.failed_row())
+
+    def test_a_migrated_prepared_row_still_performs_its_own_transition(self):
+        evidence = self.seed_operation("failed", legacy=True)
+
+        result = self.call(FAIL_RULE, self.version_two({"package_id": package()}))
+
+        self.assertTrue(result["success"])
+        self.assertEqual(evidence, self.failed_blob()["terminal_operation"])
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+
+    def test_an_eight_key_submitted_row_is_still_proven_by_its_marker(self):
+        """The shape that already marked its artifacts is not blocked."""
+        evidence = self.seed_operation("downloaded", state="submitted", shape="effect")
+        self.state.device.downloader_packages.append(
+            {"uuid": 5, "comment": submission_comment(package(), evidence)}
+        )
+
+        result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["package_removed"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["solved"], self.notification_cases())
 
 
 if __name__ == "__main__":

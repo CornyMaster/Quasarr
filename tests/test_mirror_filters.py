@@ -221,13 +221,18 @@ class SubmitFinalDownloadUrlsTests(unittest.TestCase):
         "quasarr.downloads.get_download_category_mirrors", return_value=["DDownload"]
     )
     @patch("quasarr.downloads.get_download_category_from_package_id", return_value="tv")
-    def test_the_submit_phase_still_persists_a_whitelist_rejection(
+    def test_the_submit_phase_leaves_a_whitelist_rejection_to_its_caller(
         self,
         mock_get_category,
         mock_get_mirrors,
         mock_fail,
         mock_download_package,
     ):
+        """A terminal caller owns the whole failure, including when it lands.
+
+        Persisting it here would count it, announce it and drop the protected
+        package before the caller could bind any of that to its operation.
+        """
         protected_db = MagicMock()
         protected_db.retrieve.return_value = json.dumps({"title": "Example.Release"})
         shared_state = MagicMock()
@@ -244,10 +249,12 @@ class SubmitFinalDownloadUrlsTests(unittest.TestCase):
                 phase=SUBMIT_PHASE_SUBMIT,
             )
 
-        self.assertTrue(result["persisted_failure"])
-        mock_fail.assert_called_once()
-        protected_db.delete.assert_called_once()
-        self.assertEqual("failed", mock_update.call_args.args[2].value)
+        self.assertFalse(result["success"])
+        self.assertTrue(result["mirror_rejected"])
+        self.assertNotIn("persisted_failure", result)
+        mock_fail.assert_not_called()
+        protected_db.delete.assert_not_called()
+        mock_update.assert_not_called()
         mock_download_package.assert_not_called()
 
     def test_the_default_phase_is_the_unchanged_whole_funnel(self):
@@ -305,7 +312,7 @@ class SubmitFinalDownloadUrlsTests(unittest.TestCase):
         "quasarr.downloads.get_download_category_mirrors", return_value=["DDownload"]
     )
     @patch("quasarr.downloads.get_download_category_from_package_id", return_value="tv")
-    def test_a_whitelist_rejection_records_the_operation_that_caused_it(
+    def test_the_whole_funnel_still_persists_a_whitelist_rejection_itself(
         self,
         mock_get_category,
         mock_get_mirrors,
@@ -316,21 +323,25 @@ class SubmitFinalDownloadUrlsTests(unittest.TestCase):
         protected_db.retrieve.return_value = json.dumps({"title": "Example.Release"})
         shared_state = MagicMock()
         shared_state.get_db.return_value = protected_db
-        evidence = "c0" * 32
 
-        with patch("quasarr.downloads.update_release_notification"):
-            submit_final_download_urls(
+        with patch("quasarr.downloads.update_release_notification") as mock_update:
+            result = submit_final_download_urls(
                 shared_state,
                 ["https://rapidgator.net/file/abc"],
                 "Example.Release",
                 "",
                 "Quasarr_tv_deadbeefdeadbeefdeadbeefdeadbeef",
                 remove_protected=True,
-                phase=SUBMIT_PHASE_SUBMIT,
-                terminal_operation=evidence,
+                terminal_operation="c0" * 32,
             )
 
-        self.assertEqual(evidence, mock_fail.call_args.kwargs["terminal_operation"])
+        self.assertTrue(result["persisted_failure"])
+        # The comment is the only thing an operation names here; the row a
+        # legacy caller writes never carries a marker.
+        self.assertNotIn("terminal_operation", mock_fail.call_args.kwargs)
+        protected_db.delete.assert_called_once()
+        self.assertEqual("failed", mock_update.call_args.args[2].value)
+        mock_download_package.assert_not_called()
 
 
 class ProtectedTable:
