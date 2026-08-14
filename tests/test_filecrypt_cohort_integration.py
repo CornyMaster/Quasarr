@@ -403,18 +403,35 @@ class CohortDenominatorTests(CohortIntegrationTestCase):
         status, body = self.report_blocked(offer, handout["id"])
 
         self.assertEqual(200, status)
-        self.assertEqual("legacy_failure", body["instruction"])
+        self.assertEqual("hold", body["instruction"])
         self.assertEqual("individual", body["state"])
+        self.assertEqual("provisional", body["hold_type"])
+        self.assertEqual(NOW + SWEEP_WINDOW_SECONDS, body["retry_after_epoch"])
         self.assertEqual(0, body["sweep_total"])
         self.assertNotEqual("cooldown", self.service().snapshot(CRYPTER)["state"])
+
+    def test_an_individual_block_holds_its_package_instead_of_reoffering_it(self):
+        self.store_filecrypt_cohort(1)
+        offer, handout = self.offered()
+        self.report_blocked(offer, handout["id"])
+
+        held = self.protected_row(handout["id"])["deferred"]
+        self.assertEqual(CRYPTER, held["crypter"])
+        self.assertEqual(self.decision_row()["generation_id"], held["sweep_id"])
+        self.assertEqual([fingerprint_of(filecrypt_url(1))], held["link_fingerprints"])
+        self.assertEqual(1, self.service().count_active_deferred_packages())
+        self.assertIsNone(self.handout(), "a held package is not handed out again")
 
     def test_four_unique_fingerprints_end_the_sweep_without_cooling(self):
         answers = self.assert_never_cools(4)
 
-        self.assertEqual("legacy_failure", answers[-1]["instruction"])
+        self.assertEqual("hold", answers[-1]["instruction"])
         self.assertEqual("individual", answers[-1]["state"])
+        self.assertEqual("provisional", answers[-1]["hold_type"])
         self.assertEqual(4, answers[-1]["sweep_total"])
         self.assertEqual(4, answers[-1]["sweep_tested"])
+        self.assertEqual(4, self.service().count_active_deferred_packages())
+        self.assertIsNone(self.handout(), "a completed small cohort hands out nothing")
 
     def test_five_unique_fingerprints_are_the_smallest_cooling_cohort(self):
         self.store_filecrypt_cohort(MINIMUM_CONCLUSIVE_COHORT_SIZE)
@@ -786,8 +803,9 @@ class InventoryShapeTests(CohortIntegrationTestCase):
         status, body = self.report_blocked(offer, handout["id"])
 
         self.assertEqual(200, status)
-        self.assertEqual("legacy_failure", body["instruction"])
+        self.assertEqual("hold", body["instruction"])
         self.assertEqual("individual", body["state"])
+        self.assertEqual("provisional", body["hold_type"])
         self.assertEqual(5, body["sweep_total"])
         self.assertEqual(3, body["sweep_tested"])
         self.assertNotEqual("cooldown", self.service().snapshot(CRYPTER)["state"])
@@ -803,11 +821,16 @@ class UnknownAndProbeTests(CohortIntegrationTestCase):
         self.assertEqual(200, exchanges[2]["status"])
         self.assertEqual("unknown", exchanges[2]["body"]["accepted"])
         self.assertNotIn("cleared", exchanges[2]["body"])
-        self.assertEqual("legacy_failure", exchanges[-1]["body"]["instruction"])
+        self.assertEqual("hold", exchanges[-1]["body"]["instruction"])
         self.assertEqual(5, exchanges[-1]["body"]["sweep_tested"])
         self.assertNotEqual("cooldown", self.service().snapshot(CRYPTER)["state"])
         stored = self.service().crypter_decision(CRYPTER)
         self.assertEqual("individual", stored["state"])
+        self.assertNotIn(
+            exchanges[2]["offer"]["link_fingerprint"],
+            stored["hold_fingerprints"],
+            "the UNKNOWN member is not held by the window it made inconclusive",
+        )
 
     def test_a_whole_cohort_of_unknowns_never_reaches_a_cooldown(self):
         self.store_filecrypt_cohort(5)
@@ -1107,6 +1130,141 @@ class TerminalConfirmationTests(CohortIntegrationTestCase):
         self.assertEqual([], self.state.device.add_links_calls)
         self.assertIsNotNone(self.protected_row(held["id"]))
         self.assertNotIn(TERMINAL_OPERATION_MARKER, self.protected_row(held["id"]))
+
+
+class AbandonedSweepTests(CohortIntegrationTestCase):
+    """A sweep no helper ever finishes stops holding packages by itself."""
+
+    def test_an_abandoned_sweep_releases_its_packages_at_the_grace_boundary(self):
+        self.store_filecrypt_cohort(5)
+        offer, handout = self.offered()
+        self.report_blocked(offer, handout["id"])
+        stored = self.decision_row()
+        self.assertEqual("sweeping", stored["state"])
+        grace_end = stored["deadline_epoch"] + SWEEP_WINDOW_SECONDS
+
+        for offset, expected in ((-1, 1), (0, 0), (1, 0)):
+            with self.subTest(offset=offset):
+                self.clock.now = grace_end + offset
+                self.assertEqual(
+                    expected, self.service().count_active_deferred_packages()
+                )
+                projected = self.service().project_package_defer(
+                    self.service().get_package_defer(handout["id"]),
+                    self.service().snapshot(CRYPTER),
+                    self.service().crypter_decision(CRYPTER),
+                )
+                self.assertEqual(bool(expected), projected["active"])
+
+        # No read transitioned the abandoned row; it is still the sweep it was.
+        self.assertEqual(stored, self.decision_row())
+
+    def test_the_released_package_is_offered_again_after_the_grace(self):
+        self.store_filecrypt_cohort(5)
+        offer, handout = self.offered()
+        self.report_blocked(offer, handout["id"])
+        stored = self.decision_row()
+
+        self.clock.now = stored["deadline_epoch"] + SWEEP_WINDOW_SECONDS
+        second, _handout = self.offered()
+
+        self.assertNotEqual(stored["sweep_id"], second["sweep_id"])
+
+
+class LegacyHoldInvalidationTests(CohortIntegrationTestCase):
+    """A proven container ends every Filecrypt hold, generation or not."""
+
+    def legacy_report(self, package_id):
+        return self.attempt(
+            DEFER_RULE,
+            {
+                "package_id": package_id,
+                "crypter": CRYPTER,
+                "reason_code": REASON,
+                "link_fingerprint": fingerprint_of(filecrypt_url(1)),
+            },
+        )
+
+    def hold_two_packages(self):
+        """Two packages holding a generationless version-one hold each."""
+        self.store_filecrypt_cohort(2)
+        for index in (1, 2):
+            status, body = self.attempt(
+                DEFER_RULE,
+                {
+                    "package_id": package(index),
+                    "crypter": CRYPTER,
+                    "reason_code": REASON,
+                    "link_fingerprint": fingerprint_of(filecrypt_url(index)),
+                },
+            )
+            self.assertEqual(200, status)
+            self.assertEqual("hold", body["instruction"])
+            stored = self.protected_row(package(index))["deferred"]
+            self.assertNotIn("sweep_id", stored)
+        return [package(1), package(2)]
+
+    def clear_globally(self, package_id):
+        return self.attempt(
+            ACCESS_RULE,
+            {"package_id": package_id, "crypter": CRYPTER, "access": "clear"},
+        )
+
+    def test_a_global_clear_erases_every_generationless_hold(self):
+        held = self.hold_two_packages()
+
+        status, body = self.clear_globally(held[0])
+
+        self.assertEqual(200, status)
+        self.assertTrue(body["cleared"])
+        for package_id in held:
+            self.assertNotIn("deferred", self.protected_row(package_id))
+
+    def test_no_generationless_hold_resurrects_after_the_health_window(self):
+        held = self.hold_two_packages()
+        self.clear_globally(held[0])
+
+        self.clock.now = NOW + SWEEP_WINDOW_SECONDS + 1
+
+        self.assertEqual(0, self.service().count_active_deferred_packages())
+        for package_id in held:
+            self.assertIsNone(self.service().get_package_defer(package_id))
+
+    def test_a_cleanup_outage_never_downgrades_the_proven_clear(self):
+        held = self.hold_two_packages()
+        service = CrypterCooldownService
+
+        def failing(_self, _package_id, *args, **kwargs):
+            raise RuntimeError("protected row unavailable")
+
+        with mock.patch.object(service, "_mutate_deferred_package", failing):
+            status, body = self.clear_globally(held[0])
+
+        self.assertEqual(200, status)
+        self.assertEqual({"success": True, "state": "available", "cleared": True}, body)
+        self.assertEqual("healthy", self.decision_row()["state"])
+
+    def test_a_generation_bound_replacement_written_meanwhile_survives(self):
+        held = self.hold_two_packages()
+        replacement = {
+            "crypter": CRYPTER,
+            "reason_code": REASON,
+            "since_epoch": NOW,
+            "retry_after_epoch": NOW + SWEEP_WINDOW_SECONDS,
+            "probe_requested": False,
+            "observation_holds": 1,
+            "schema_version": 2,
+            "sweep_id": "e" * 32,
+            "link_fingerprints": [fingerprint_of(filecrypt_url(2))],
+        }
+        row = self.protected_row(held[1])
+        row["deferred"] = replacement
+        self.state.get_db("protected").update_store(held[1], json.dumps(row))
+
+        self.clear_globally(held[0])
+
+        self.assertNotIn("deferred", self.protected_row(held[0]))
+        self.assertEqual(replacement, self.protected_row(held[1])["deferred"])
 
 
 if __name__ == "__main__":

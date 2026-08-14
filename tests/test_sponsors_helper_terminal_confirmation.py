@@ -588,6 +588,91 @@ class TerminalProtocolValidationTests(TerminalConfirmationTestCase):
         self.assertEqual(0, len(self.state.device.add_links_calls))
 
 
+class UnreadableTerminalRecordTests(TerminalConfirmationTestCase):
+    """A row this Quasarr cannot read may describe an effect that happened."""
+
+    corrupt = {
+        "post effect corruption": '{"state": "complete", "package_id"',
+        "a future schema": json.dumps(
+            {
+                "schema_version": 3,
+                "state": "complete",
+                "terminal_state": "downloaded",
+                "package_id": package(),
+            },
+            sort_keys=True,
+        ),
+        "a future phase": json.dumps(
+            {
+                "state": "reconciled",
+                "terminal_state": "downloaded",
+                "package_id": package(),
+                "created_epoch": 1,
+                "updated_epoch": 1,
+                "package_removed": True,
+                "package_terminal": True,
+                "effect_state": "applied",
+                "failure_persisted": True,
+                "notification_state": "recorded",
+            },
+            sort_keys=True,
+        ),
+    }
+
+    def seed_corrupt(self, raw, package_id=None):
+        self.state.get_db(TERMINAL_OPERATION_TABLE).update_store(
+            terminal_operation_id(package_id or package()), raw
+        )
+        return raw
+
+    def raw_operation(self, package_id=None):
+        return self.state.get_db(TERMINAL_OPERATION_TABLE).retrieve(
+            terminal_operation_id(package_id or package())
+        )
+
+    def test_every_terminal_route_answers_service_unavailable(self):
+        routes = (
+            (DOWNLOAD_RULE, self.download_payload()),
+            (DISABLE_RULE, {"package_id": package()}),
+            (FAIL_RULE, {"package_id": package(), "name": TITLE}),
+        )
+
+        for label, raw in self.corrupt.items():
+            for rule, payload in routes:
+                with self.subTest(row=label, rule=rule):
+                    self.seed_corrupt(raw)
+
+                    self.expect_status(rule, self.version_two(payload), 503)
+
+    def test_a_refused_request_authorizes_no_side_effect_at_all(self):
+        before = self.protected_row()
+
+        for label, raw in self.corrupt.items():
+            for rule, payload in (
+                (DOWNLOAD_RULE, self.download_payload()),
+                (DISABLE_RULE, {"package_id": package()}),
+                (FAIL_RULE, {"package_id": package(), "name": TITLE}),
+            ):
+                with self.subTest(row=label, rule=rule):
+                    self.seed_corrupt(raw)
+
+                    self.expect_status(rule, self.version_two(payload), 503)
+
+                    self.assertEqual(raw, self.raw_operation())
+                    self.assertEqual(before, self.protected_row())
+                    self.assertIsNone(self.failed_row())
+                    self.assertEqual([], self.state.device.add_links_calls)
+                    self.assertEqual([], self.notifications.call_args_list)
+                    self.assertEqual(0, self.statistic("packages_failed"))
+
+    def test_a_readable_conflicting_row_still_answers_conflict(self):
+        self.seed_operation("downloaded")
+
+        self.expect_status(FAIL_RULE, self.version_two({"package_id": package()}), 409)
+
+        self.assertEqual("downloaded", self.operation_row()["terminal_state"])
+
+
 class DownloadTerminalConfirmationTests(TerminalConfirmationTestCase):
     def test_a_confirmed_download_is_structured_complete_and_submitted_once(self):
         result = self.call(DOWNLOAD_RULE, self.version_two(self.download_payload()))
@@ -1767,7 +1852,9 @@ class MigratedTerminalRecordTests(TerminalConfirmationTestCase):
 
     def test_an_eight_key_submitted_row_is_still_proven_by_its_marker(self):
         """The shape that already marked its artifacts is not blocked."""
-        evidence = self.seed_operation("downloaded", state="submitted", shape="effect")
+        evidence = self.seed_operation(
+            "downloaded", state="submitted", shape="effect", effect_state="applied"
+        )
         self.state.device.downloader_packages.append(
             {"uuid": 5, "comment": submission_comment(package(), evidence)}
         )

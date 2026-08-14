@@ -28,6 +28,7 @@ from quasarr.providers.terminal_operations import (
     TERMINAL_OPERATION_MARKER,
     TERMINAL_OPERATION_TABLE,
     TERMINAL_STATES,
+    UNREADABLE,
     TerminalOperationService,
     decode_operation_record,
     decode_submission_comment,
@@ -873,15 +874,48 @@ class TerminalOperationServiceTests(unittest.TestCase):
         self.assertEqual("conflict", foreign["outcome"])
         self.assertEqual(before, self.rows())
 
-    def test_an_unreadable_row_is_replaced_rather_than_resumed(self):
+    def test_an_unreadable_row_authorizes_nothing_and_is_preserved(self):
         package_id = package(1)
         operation_id = terminal_operation_id(package_id)
-        self.state.operations.rows[operation_id] = "{not json"
+        corrupt = (
+            "{not json",
+            json.dumps({"schema_version": 3, "state": "complete"}),
+            json.dumps({**json.loads(record(package_id)), "state": "finished"}),
+            "null",
+        )
 
-        result = self.service.begin(operation_id, package_id, "downloaded")
+        for raw in corrupt:
+            with self.subTest(raw=raw[:24]):
+                self.state.operations.rows[operation_id] = raw
+                writes = self.state.operations.writes
+                deletes = self.state.operations.deletes
 
-        self.assertEqual("opened", result["outcome"])
-        self.assertEqual("prepared", result["record"]["state"])
+                result = self.service.begin(operation_id, package_id, "downloaded")
+
+                self.assertEqual(UNREADABLE, result["outcome"])
+                self.assertIsNone(result["record"])
+                self.assertEqual(raw, self.state.operations.rows[operation_id])
+                self.assertEqual(writes, self.state.operations.writes)
+                self.assertEqual(deletes, self.state.operations.deletes)
+
+    def test_an_unreadable_row_is_never_pruned_as_capacity(self):
+        readable = terminal_operation_id(package(2))
+        self.state.operations.rows[terminal_operation_id(package(1))] = "{not json"
+        self.state.operations.rows[readable] = record(
+            package(2),
+            state="complete",
+            updated=NOW - COMPLETED_OPERATION_RETENTION_SECONDS,
+            package_removed=True,
+            package_terminal=True,
+        )
+
+        pruned = self.service.prune_completed()
+
+        self.assertEqual(1, pruned)
+        self.assertEqual([readable], self.state.operations.deleted)
+        self.assertEqual(
+            "{not json", self.state.operations.rows[terminal_operation_id(package(1))]
+        )
 
     def test_snapshot_is_a_pure_read(self):
         package_id = package(1)

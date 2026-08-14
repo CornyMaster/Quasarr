@@ -64,6 +64,7 @@ from quasarr.providers.terminal_operations import (
     NOTIFICATION_NOT_STARTED,
     NOTIFICATION_RECORDED,
     TERMINAL_OPERATION_MARKER,
+    UNREADABLE,
     TerminalOperationService,
     operation_evidence,
 )
@@ -470,6 +471,11 @@ def setup_sponsors_helper_routes(app):
                 return abort(409, "Terminal operation identity conflict")
             if opened["outcome"] == CAPACITY:
                 return abort(503, "Terminal operation capacity exhausted")
+            if opened["outcome"] == UNREADABLE:
+                # The stored record may describe an effect that already
+                # happened, so nothing may be decided from it and nothing may
+                # replace it; the operator repairs that one identity.
+                return abort(503, "Terminal operation state unavailable")
             yield {
                 "service": service,
                 "operation_id": operation_id,
@@ -499,6 +505,16 @@ def setup_sponsors_helper_routes(app):
             status=status,
             content_type="application/json",
         )
+
+    def internal_failure(event, error):
+        """Fail one request without telling the helper anything about why.
+
+        An exception text can carry a storage path, a package title, or a URL,
+        and the helper has no use for any of it. The class is logged on this
+        side and the answer is the fixed one.
+        """
+        warn(f"{event} failed ({type(error).__name__})")
+        return abort(500, "Internal server error")
 
     def filecrypt_probe_occurrence(inventory, protected_rows):
         """The exact occurrence one queued `Check now` authorizes, or None.
@@ -1098,7 +1114,7 @@ def setup_sponsors_helper_routes(app):
             except HTTPResponse:
                 raise
             except Exception as error:
-                return abort(500, str(error))
+                return internal_failure("A Filecrypt cohort block report", error)
             return render_defer_response(decision)
 
         if not crypter_blocks_deferred(shared_state):
@@ -1134,7 +1150,7 @@ def setup_sponsors_helper_routes(app):
         except HTTPResponse:
             raise
         except Exception as error:
-            return abort(500, str(error))
+            return internal_failure("A version-one linkcrypter block report", error)
 
         return {
             "success": True,
@@ -1182,7 +1198,7 @@ def setup_sponsors_helper_routes(app):
             except HTTPResponse:
                 raise
             except Exception as error:
-                return abort(500, str(error))
+                return internal_failure("A Filecrypt cohort access report", error)
             return json_response(*render_access_response(decision, offer_id=offer_id))
 
         if data["access"] != "clear":
@@ -1221,7 +1237,7 @@ def setup_sponsors_helper_routes(app):
         except ValueError as error:
             return abort(400, str(error))
         except Exception as error:
-            return abort(500, str(error))
+            return internal_failure("A version-one linkcrypter access report", error)
 
         return {"success": True, "state": "available", "cleared": True}
 
@@ -1332,7 +1348,7 @@ def setup_sponsors_helper_routes(app):
         except HTTPResponse:
             raise
         except Exception as e:
-            return abort(500, str(e))
+            return internal_failure("A SponsorsHelper handout", e)
 
     @app.post("/sponsors_helper/api/download/")
     @require_api_key

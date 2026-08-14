@@ -505,16 +505,14 @@ class DeferredPackageGaugeTests(CrypterStatisticsTestCase):
         )
 
         # A proven container disproves the linkcrypter-wide block, so the health
-        # window logically releases every Filecrypt hold at once.
+        # window logically releases every Filecrypt hold at once - and the rows
+        # themselves are cleared, so none of them can come back.
         self.assertEqual(0, self.counters()[DEFERRED_KEY])
         self.assertEqual(1, self.counters()[PROBES_KEY])
 
         self.clock.now = NOW + OBSERVATION_WINDOW + 1
 
-        # Once that window ends, the untouched legacy rows fall back to their
-        # own stored deadlines, and only the confirmed cooldown one is still
-        # in the future.
-        self.assertEqual(1, self.counters()[DEFERRED_KEY])
+        self.assertEqual(0, self.counters()[DEFERRED_KEY])
 
     def test_deleting_a_deferred_package_drops_the_gauge(self):
         self.enter_cooldown()
@@ -724,7 +722,11 @@ class CrypterEventLedgerTests(CrypterStatisticsTestCase):
         with self.state.statistics_unavailable():
             self.enter_cooldown()
             self.report_clear(PACKAGE_A)
-            self.assertEqual("deleted", self.service.delete_deferred_package(PACKAGE_B))
+            # The proven container already released every hold of this
+            # linkcrypter, generation-bound and generationless alike.
+            self.assertEqual(
+                "not_deferred", self.service.delete_deferred_package(PACKAGE_B)
+            )
 
         stored = json.loads(self.state.get_db("crypter_cooldowns").retrieve(CRYPTER))
         self.assertEqual("healthy", stored["state"])
@@ -1306,7 +1308,7 @@ class CohortSweepCounterTests(CrypterStatisticsTestCase):
     def test_a_small_cohort_counts_its_members_but_never_a_cooldown(self):
         decision = self.drive_cohort(4)
 
-        self.assertEqual("legacy_failure", decision["instruction"])
+        self.assertEqual("hold", decision["instruction"])
         counters = self.counters()
         self.assertEqual(4, counters[OBSERVATIONS_KEY])
         self.assertEqual(0, counters[COOLDOWNS_KEY])

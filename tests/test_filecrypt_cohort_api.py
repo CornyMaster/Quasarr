@@ -902,15 +902,15 @@ class CohortDeferMatrixTests(CohortApiTestCase):
         self.assertEqual(5, response["sweep_tested"])
         self.assertEqual(5, response["sweep_total"])
 
-    def test_a_small_complete_cohort_answers_legacy_failure_without_cooling(self):
+    def test_a_small_complete_cohort_holds_without_cooling(self):
         self.store(filecrypt_rows(4))
 
         response = self.drive_blocked(4)
 
-        self.assertEqual("legacy_failure", response["instruction"])
+        self.assertEqual("hold", response["instruction"])
         self.assertEqual("individual", response["state"])
-        self.assertEqual("none", response["hold_type"])
-        self.assertEqual(0, response["retry_after_epoch"])
+        self.assertEqual("provisional", response["hold_type"])
+        self.assertEqual(NOW + SWEEP_WINDOW, response["retry_after_epoch"])
         self.assertEqual(4, response["sweep_total"])
         self.assertEqual("individual", self.decision_row()["state"])
 
@@ -1049,6 +1049,72 @@ class CohortDeferMatrixTests(CohortApiTestCase):
         self.assertEqual(
             before, self.state.databases["crypter_cooldowns"].rows[CRYPTER]
         )
+
+
+class InternalFailureBodyTests(CohortApiTestCase):
+    """An unexpected failure tells the helper nothing about this server."""
+
+    SECRET = "/var/lib/quasarr/Quasarr.db is locked by Synthetic.Release.2024"
+
+    def blowing_up(self, name):
+        return mock.patch.object(
+            CrypterCooldownService, name, side_effect=RuntimeError(self.SECRET)
+        )
+
+    def unexpected(self, rule, payload, method):
+        with self.blowing_up(method), self.assertRaises(HTTPError) as context:
+            self.call(rule, payload)
+        return context.exception
+
+    def test_every_report_route_answers_one_fixed_body(self):
+        self.store(filecrypt_rows(5))
+        offer, handout = self.handout_offer()
+        cases = (
+            (
+                DEFER_RULE,
+                self.blocked_payload(offer, handout["id"]),
+                "record_cohort_blocked",
+            ),
+            (
+                ACCESS_RULE,
+                self.access_payload(offer, handout["id"]),
+                "record_cohort_access",
+            ),
+            (
+                DEFER_RULE,
+                {
+                    "package_id": handout["id"],
+                    "crypter": CRYPTER,
+                    "reason_code": REASON,
+                    "link_fingerprint": offer["link_fingerprint"],
+                },
+                "record_version_one_report",
+            ),
+        )
+
+        for rule, payload, method in cases:
+            with self.subTest(method=method):
+                error = self.unexpected(rule, payload, method)
+
+                self.assertEqual(500, error.status_code)
+                self.assertEqual("Internal server error", error.body)
+                self.assertNotIn("Synthetic", str(error.body))
+                self.assertNotIn("Quasarr.db", str(error.body))
+
+    def test_the_handout_route_answers_the_same_fixed_body(self):
+        self.store(filecrypt_rows(5))
+
+        with (
+            mock.patch(
+                "quasarr.api.sponsors_helper.select_helper_package",
+                side_effect=RuntimeError(self.SECRET),
+            ),
+            self.assertRaises(HTTPError) as context,
+        ):
+            self.to_decrypt()
+
+        self.assertEqual(500, context.exception.status_code)
+        self.assertEqual("Internal server error", context.exception.body)
 
 
 class LegacyReportPrecedenceTests(CohortApiTestCase):

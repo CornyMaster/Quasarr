@@ -1183,21 +1183,23 @@ class AcceptedOfferCodecTests(unittest.TestCase):
             "two members can never share one offer identity",
         )
 
-    def test_hold_fingerprints_are_only_retained_by_the_fail_closed_reason(self):
-        allowed = individual_record(
-            reason="inventory_unavailable", hold_fingerprints=[fingerprint(1)]
-        )
-        self.assertEqual(
-            allowed, decode_decision_record(encode_decision_record(allowed), now=NOW)
-        )
-
+    def test_hold_fingerprints_are_only_retained_by_holding_reasons(self):
         for reason in (
+            "inventory_unavailable",
             "cohort_too_small",
-            "cohort_oversized",
             "sweep_expired",
             "sweep_inconclusive",
-            "legacy_v1_hold",
         ):
+            with self.subTest(reason=reason):
+                allowed = individual_record(
+                    reason=reason, hold_fingerprints=[fingerprint(1)]
+                )
+                self.assertEqual(
+                    allowed,
+                    decode_decision_record(encode_decision_record(allowed), now=NOW),
+                )
+
+        for reason in ("cohort_oversized", "legacy_v1_hold"):
             with self.subTest(reason=reason):
                 record = individual_record(
                     reason=reason, hold_fingerprints=[fingerprint(1)]

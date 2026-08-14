@@ -675,6 +675,98 @@ class PackageDeferActivationTests(unittest.TestCase):
                 )
 
 
+class IndividualWindowActivationTests(unittest.TestCase):
+    """A generation-bound hold survives its own individual window exactly."""
+
+    HELD = (fingerprint(1),)
+
+    def window(self, reason, holds=HELD, until=NOW + PROVISIONAL_WINDOW):
+        return individual_record(
+            reason=reason,
+            generation_id=SWEEP_A,
+            until_epoch=until,
+            hold_fingerprints=holds,
+        )
+
+    def test_every_non_oversized_reason_holds_its_own_fingerprints(self):
+        for reason in (
+            "cohort_too_small",
+            "sweep_expired",
+            "sweep_inconclusive",
+            "inventory_unavailable",
+        ):
+            with self.subTest(reason=reason):
+                snapshot = snapshot_of(self.window(reason))
+
+                self.assertTrue(
+                    package_defer_is_active(generation_defer(), snapshot, now=NOW)
+                )
+                self.assertFalse(
+                    package_defer_is_active(
+                        generation_defer(link_fingerprints=[fingerprint(2)]),
+                        snapshot,
+                        now=NOW,
+                    ),
+                    "a link this window never proved blocked is not held",
+                )
+
+    def test_an_individual_hold_ends_exactly_at_its_own_deadline(self):
+        bounded = self.window("cohort_too_small", until=NOW + 60)
+
+        for now, expected in ((NOW + 59, True), (NOW + 60, False), (NOW + 61, False)):
+            with self.subTest(now=now):
+                self.assertEqual(
+                    expected,
+                    package_defer_is_active(
+                        generation_defer(), snapshot_of(bounded, now=now), now=now
+                    ),
+                )
+
+    def test_an_oversized_window_holds_nothing_and_another_generation_neither(self):
+        oversized = snapshot_of(self.window("cohort_oversized", holds=()))
+        foreign = snapshot_of(
+            individual_record(
+                reason="cohort_too_small",
+                generation_id=SWEEP_B,
+                hold_fingerprints=[fingerprint(1)],
+            )
+        )
+
+        self.assertFalse(
+            package_defer_is_active(generation_defer(), oversized, now=NOW)
+        )
+        self.assertFalse(package_defer_is_active(generation_defer(), foreign, now=NOW))
+
+
+class AbandonedSweepHoldTests(unittest.TestCase):
+    """A sweep no helper ever concludes stops holding at its own grace."""
+
+    def test_a_matching_sweeping_hold_ends_at_the_transition_grace(self):
+        record = sweeping_record()
+        grace_end = record["deadline_epoch"] + SWEEP_WINDOW_SECONDS
+
+        for offset, expected in ((-1, True), (0, False), (1, False)):
+            with self.subTest(offset=offset):
+                now = grace_end + offset
+                self.assertEqual(
+                    expected,
+                    package_defer_is_active(
+                        generation_defer(), snapshot_of(record, now=now), now=now
+                    ),
+                )
+
+    def test_the_live_window_and_its_grace_are_unchanged(self):
+        record = sweeping_record()
+
+        for now in (NOW, record["deadline_epoch"], record["deadline_epoch"] + 1):
+            with self.subTest(now=now):
+                self.assertTrue(
+                    package_defer_is_active(
+                        generation_defer(), snapshot_of(record, now=now), now=now
+                    )
+                )
+
+
 class PackageDeferFingerprintTests(unittest.TestCase):
     def test_a_generation_hold_speaks_only_for_its_own_fingerprints(self):
         deferred = generation_defer()
@@ -1119,11 +1211,25 @@ class ClearCrypterGenerationHoldsTests(unittest.TestCase):
             "filecrypt", sweep_id=SWEEP_A
         )
 
-        self.assertEqual({"cleared": [PACKAGE_A], "rejected": []}, result)
+        # A proven container is global evidence, so the generationless
+        # version-one hold of the same linkcrypter goes with this generation:
+        # nothing else could ever name it, and it would otherwise fall back to
+        # its own deadline once the health window ends.
+        self.assertEqual({"cleared": [PACKAGE_A, PACKAGE_D], "rejected": []}, result)
         self.assertIsNone(self._deferred(PACKAGE_A))
         self.assertEqual(generation_defer(sweep_id=SWEEP_B), self._deferred(PACKAGE_B))
         self.assertEqual(generation_defer(crypter="junkies"), self._deferred(PACKAGE_C))
-        self.assertEqual(legacy_defer(), self._deferred(PACKAGE_D))
+        self.assertIsNone(self._deferred(PACKAGE_D))
+
+    def test_a_generationless_hold_of_another_crypter_is_never_cleared(self):
+        self._store(PACKAGE_A, legacy_defer(crypter="junkies"))
+
+        result = self.service.clear_crypter_generation_holds(
+            "filecrypt", sweep_id=SWEEP_A
+        )
+
+        self.assertEqual({"cleared": [], "rejected": []}, result)
+        self.assertEqual(legacy_defer(crypter="junkies"), self._deferred(PACKAGE_A))
 
     def test_results_are_reported_in_deterministic_package_order(self):
         for package_id in (PACKAGE_C, PACKAGE_A, PACKAGE_B):

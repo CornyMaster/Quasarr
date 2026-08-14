@@ -27,19 +27,28 @@ MAXIMUM_OFFER_ID_ATTEMPTS = 8
 
 SWEEP_REASON_CODES = frozenset({"ip_block_suspected"})
 DEFAULT_SWEEP_REASON_CODE = "ip_block_suspected"
-# The one individual reason that still authorizes a package hold of its own
-# generation: an inventory read failure is fail-closed, not merely unresolved.
+# The one individual reason that releases every earlier hold of its generation
+# and keeps exactly the fingerprint its own report proved.
 FAIL_CLOSED_INDIVIDUAL_REASON = "inventory_unavailable"
+# An inventory nobody may test one member at a time either.
+OVERSIZED_INDIVIDUAL_REASON = "cohort_oversized"
+# A version-one hold predates fingerprints and speaks for the whole package.
+LEGACY_INDIVIDUAL_REASON = "legacy_v1_hold"
 INDIVIDUAL_REASONS = frozenset(
     {
         "cohort_too_small",
-        "cohort_oversized",
+        OVERSIZED_INDIVIDUAL_REASON,
         "sweep_expired",
         "sweep_inconclusive",
-        "legacy_v1_hold",
+        LEGACY_INDIVIDUAL_REASON,
         FAIL_CLOSED_INDIVIDUAL_REASON,
     }
 )
+# Which individual windows may name the exact links they are still holding.
+HOLDING_INDIVIDUAL_REASONS = INDIVIDUAL_REASONS - {
+    OVERSIZED_INDIVIDUAL_REASON,
+    LEGACY_INDIVIDUAL_REASON,
+}
 MEMBER_RESULTS = frozenset({"pending", "offered", "blocked", "unknown"})
 RESPONSE_INSTRUCTIONS = frozenset({"", "hold", "cooldown", "legacy_failure"})
 ACCEPTED_VALUES = frozenset({"", "unknown"})
@@ -512,9 +521,9 @@ def _build_healthy(raw):
 def _build_individual(raw):
     reason = _choice(raw["reason"], INDIVIDUAL_REASONS, "reason")
     holds = _ascending_fingerprints(raw["hold_fingerprints"], "hold_fingerprints")
-    if holds and reason != FAIL_CLOSED_INDIVIDUAL_REASON:
-        # Only the fail-closed reason keeps a package hold alive; every other
-        # individual decision releases its generation entirely.
+    if holds and reason not in HOLDING_INDIVIDUAL_REASONS:
+        # An oversized window tests nothing, and a version-one hold speaks for
+        # its whole package, so neither can name the links it holds.
         raise ValueError('Invalid linkcrypter decision field "hold_fingerprints"')
     live_offer = _live_offer(raw["live_offer"])
     used, accepted = _history(raw, (), live_offer)
@@ -899,6 +908,21 @@ def _individual(
     }
 
 
+def _holding(record, *link_fingerprints):
+    """The individual window that also holds these links, bounded by the cohort."""
+    held = sorted({*record["hold_fingerprints"], *link_fingerprints})
+    if len(held) > MAXIMUM_COHORT_SIZE:
+        raise OverflowError("Linkcrypter generation holds too many links")
+    return {**record, "hold_fingerprints": held}
+
+
+def _blocked_fingerprints(members):
+    """Exactly the members a report proved blocked, ascending."""
+    return sorted(
+        entry["link_fingerprint"] for entry in members if entry["result"] == "blocked"
+    )
+
+
 def _member_index(record, link_fingerprint):
     for position, entry in enumerate(record.get("members", ())):
         if entry["link_fingerprint"] == link_fingerprint:
@@ -1113,6 +1137,7 @@ def expire_decision(record, *, now):
             "sweep_expired",
             record["sweep_id"],
             record["deadline_epoch"] + SWEEP_WINDOW_SECONDS,
+            hold_fingerprints=_blocked_fingerprints(record["members"]),
             accepted_offers=record["accepted_offers"],
             used_offer_ids=record["used_offer_ids"],
         )
@@ -1233,10 +1258,22 @@ def lease_next_offer(
     else:
         if mode not in (None, "individual"):
             return record, None
+        if record["reason"] == "cohort_oversized":
+            # An inventory too large to freeze is too large to test one member
+            # at a time as well; the window only waits it out.
+            return record, None
         fingerprints = _inventory_fingerprints(inventory)
         if not fingerprints:
             return record, None
-        link_fingerprint = fingerprints[0]
+        # Each container is handed out at most once per window: a member this
+        # generation already accepted a result for is answered from history,
+        # never opened again, so a dead inventory cannot be replayed forever.
+        answered = {entry["link_fingerprint"] for entry in record["accepted_offers"]}
+        link_fingerprint = next(
+            (entry for entry in fingerprints if entry not in answered), None
+        )
+        if link_fingerprint is None:
+            return record, None
         mode = "individual"
 
     if preferred_fingerprint is not None and link_fingerprint != preferred_fingerprint:
@@ -1431,6 +1468,9 @@ def _conclude_sweep(record, members, index, offer, inventory, now, cooldown_seco
     if tested == total or lost:
         # An untested member that left the inventory can never be tested, so the
         # cohort ends inconclusive rather than shrinking to a easier denominator.
+        # It is still a window full of blocked containers, so every member this
+        # generation really proved blocked keeps a package-local hold until the
+        # window ends - an UNKNOWN proves nothing and is not among them.
         reason = (
             "cohort_too_small"
             if all_blocked and total < MINIMUM_CONCLUSIVE_COHORT_SIZE
@@ -1440,13 +1480,15 @@ def _conclude_sweep(record, members, index, offer, inventory, now, cooldown_seco
             reason,
             record["sweep_id"],
             now + SWEEP_WINDOW_SECONDS,
+            hold_fingerprints=_blocked_fingerprints(members),
             accepted_offers=record["accepted_offers"],
             used_offer_ids=record["used_offer_ids"],
         )
         decision = _situation(
             concluded,
             now,
-            instruction="legacy_failure",
+            instruction="hold",
+            hold=True,
             events=counted,
             total=total,
             tested=tested,
@@ -1472,13 +1514,30 @@ def _blocked_in_cooldown(record, offer, now):
 
 
 def _blocked_outside_cohort(record, offer, now):
-    """Healthy and individual windows answer ordinary failure, never evidence."""
+    """Healthy answers ordinary failure; an individual window holds its link.
+
+    An individual decision is never evidence for a linkcrypter-wide cooldown,
+    but it is still a blocked container: answering ordinary failure would spend
+    a helper attempt and eventually delete a package whose only problem is that
+    its cohort was too small, expired, or inconclusive. The hold is bound to
+    this generation and dies with it, so it is bounded by the window itself. A
+    re-test after a proven CLEAR keeps its ordinary result - there the
+    linkcrypter is known to be reachable.
+    """
     located = _located_offer(record, offer, now)
     if located is None:
         return record, _stale(record, now)
     _kind, _index, stored = located
     updated = _released_slot(record, offer)
-    decision = _situation(updated, now, instruction="legacy_failure")
+    if updated["state"] != "individual" or updated["reason"] not in (
+        HOLDING_INDIVIDUAL_REASONS
+    ):
+        decision = _situation(updated, now, instruction="legacy_failure")
+        return _store_accepted(
+            updated, offer, stored["mode"], decision, "blocked"
+        ), decision
+    updated = _holding(updated, offer.fingerprint)
+    decision = _situation(updated, now, instruction="hold", hold=True)
     return _store_accepted(
         updated, offer, stored["mode"], decision, "blocked"
     ), decision

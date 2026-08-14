@@ -10,12 +10,15 @@ from collections import namedtuple
 
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.providers.crypter_sweeps import (
-    FAIL_CLOSED_INDIVIDUAL_REASON,
+    HOLDING_INDIVIDUAL_REASONS,
+    INDIVIDUAL_REASONS,
+    LEGACY_INDIVIDUAL_REASON,
     MAXIMUM_COHORT_SIZE,
     OWNERSHIP_NOT_OWNED,
     OWNERSHIP_OWNED,
     OWNERSHIP_UNKNOWN,
     SWEEP_SCHEMA_VERSION,
+    SWEEP_WINDOW_SECONDS,
     Offer,
     bypass_decision,
     decision_snapshot,
@@ -348,7 +351,13 @@ def package_defer_is_active(deferred, decision_snapshot, *, now):
     if shape == _GENERATION_DEFER_SHAPE:
         sweep_id = deferred["sweep_id"]
         if state == "sweeping":
-            return decision_snapshot.get("sweep_id") == sweep_id
+            # A sweep nobody ever concludes still stops being authoritative:
+            # its own transition grace is where `expire_decision` would have
+            # ended it, and reading it may not move it there.
+            if decision_snapshot.get("sweep_id") != sweep_id:
+                return False
+            deadline = _epoch_or_zero(decision_snapshot, "sweep_deadline_epoch")
+            return now < deadline + SWEEP_WINDOW_SECONDS
         if state == "cooldown":
             return (
                 decision_snapshot.get("legacy_cooldown") is not True
@@ -357,17 +366,19 @@ def package_defer_is_active(deferred, decision_snapshot, *, now):
             )
         if state == "individual":
             reason = decision_snapshot.get("reason_code")
-            if reason not in ("legacy_v1_hold", FAIL_CLOSED_INDIVIDUAL_REASON):
+            if reason not in INDIVIDUAL_REASONS:
                 return False
             if decision_snapshot.get("generation_id") != sweep_id:
                 return False
             if now >= _epoch_or_zero(decision_snapshot, "until_epoch"):
                 return False
-            if reason == "legacy_v1_hold":
+            if reason == LEGACY_INDIVIDUAL_REASON:
                 return True
-            # The fail-closed reason retains exactly the fingerprints its own
-            # report proved, so every earlier hold of that generation is
-            # logically released even though its row still names the sweep.
+            if reason not in HOLDING_INDIVIDUAL_REASONS:
+                return False
+            # A window retains exactly the links its own reports proved
+            # blocked, so every other hold of that generation is logically
+            # released even though its row still names the sweep.
             retained = decision_snapshot.get("hold_fingerprints") or ()
             return any(
                 fingerprint in retained for fingerprint in deferred["link_fingerprints"]
@@ -886,6 +897,7 @@ class CrypterCooldownService:
         if ownership == OWNERSHIP_NOT_OWNED:
             return self._stale_report(crypter)
         cooldown_seconds = self._cooldown_seconds()
+        fail_closed = inventory is None
 
         def transition(record, now):
             return record_blocked(
@@ -904,9 +916,10 @@ class CrypterCooldownService:
                 link_fingerprint=link_fingerprint,
                 retry_after_epoch=decision["retry_after_epoch"],
                 observation_holds=0 if decision["instruction"] == "cooldown" else 1,
-                # An individual decision never holds a cohort, so its hold is
-                # exactly the link this report proved and nothing else.
-                retain_existing=decision["state"] != "individual",
+                # An inventory this report could not read releases every earlier
+                # hold of its generation, so that one write keeps exactly the
+                # link it proved. Every other window collects them.
+                retain_existing=not fail_closed,
             )
 
         return self._commit_transition(
@@ -1649,6 +1662,29 @@ class CrypterCooldownService:
             return "cleared"
         return "generation_mismatch" if status == "deferred" else status
 
+    def _clear_legacy_hold(self, package_id, crypter):
+        """Drop a version-one hold only while it is still generationless.
+
+        A proven container ends every hold of that linkcrypter, and the holds
+        the version-one accumulator wrote name no generation at all, so nothing
+        else can ever release them. The comparison runs inside the clearing
+        transaction: a generation-bound hold written after the proof is newer
+        than it and survives untouched.
+        """
+        cleared = {"done": False}
+
+        def clear_generationless(current_value, package, deferred):
+            if deferred["crypter"] != crypter or "sweep_id" in deferred:
+                return current_value
+            package.pop(PACKAGE_DEFER_KEY)
+            cleared["done"] = True
+            return json.dumps(package)
+
+        status = self._mutate_deferred_package(package_id, clear_generationless)
+        if cleared["done"]:
+            return "cleared"
+        return "generation_mismatch" if status == "deferred" else status
+
     def compare_and_clear_package_defer(
         self, package_id, *, sweep_id, link_fingerprint=None
     ):
@@ -1663,7 +1699,12 @@ class CrypterCooldownService:
         )
 
     def clear_crypter_generation_holds(self, crypter, *, sweep_id):
-        """Best-effort removal of every package hold of one sweep generation.
+        """Best-effort removal of every package hold one proven CLEAR invalidated.
+
+        That is the holds of this sweep generation plus the generationless ones
+        the version-one accumulator wrote: a validated CLEAR is global evidence,
+        and a hold no generation can name would otherwise fall back to its own
+        stored deadline once the health window ends and resurrect.
 
         Rows are enumerated and validated before any mutation runs, so no scan
         ever happens inside a mutation callback, and each removal re-compares
@@ -1683,6 +1724,7 @@ class CrypterCooldownService:
         sweep_id = _validate_sweep_id(sweep_id)
         rows = self._shared_state.get_db("protected").retrieve_all_titles() or []
         targets = set()
+        generationless = set()
         unreadable = set()
 
         for row in rows:
@@ -1699,14 +1741,16 @@ class CrypterCooldownService:
             if package is None:
                 unreadable.add(package_id)
                 continue
-            if deferred is None:
+            if deferred is None or deferred["crypter"] != crypter:
                 continue
-            if deferred.get("sweep_id") == sweep_id and deferred["crypter"] == crypter:
+            if "sweep_id" not in deferred:
+                generationless.add(package_id)
+            elif deferred["sweep_id"] == sweep_id:
                 targets.add(package_id)
 
         cleared = []
         rejected = []
-        for package_id in sorted(targets | unreadable):
+        for package_id in sorted(targets | generationless | unreadable):
             try:
                 _validate_package_id(package_id)
             except ValueError:
@@ -1718,7 +1762,10 @@ class CrypterCooldownService:
                 rejected.append({"package_id": package_id, "reason": "not_deferred"})
                 continue
             try:
-                status = self._compare_and_clear(package_id, crypter, sweep_id)
+                if package_id in generationless:
+                    status = self._clear_legacy_hold(package_id, crypter)
+                else:
+                    status = self._compare_and_clear(package_id, crypter, sweep_id)
             except Exception:
                 rejected.append({"package_id": package_id, "reason": "storage_error"})
                 continue

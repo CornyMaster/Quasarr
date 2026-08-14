@@ -789,6 +789,81 @@ class TerminalCleanupTests(CombinedCohortTestCase):
         )
 
 
+class NonDestructiveWindowMixin:
+    """What an inconclusive Filecrypt window may never cost a package."""
+
+    def held_fingerprints(self):
+        rows = self.server.get_db("protected").retrieve_all_titles() or ()
+        return {
+            row[0]: json.loads(row[1]).get("deferred", {}).get("link_fingerprints")
+            for row in rows
+        }
+
+    def assert_nothing_was_destroyed(self, adapter, expected_containers):
+        self.assertEqual(
+            expected_containers,
+            len(adapter.payloads),
+            "no container is opened more than once in one window",
+        )
+        self.assertEqual(
+            expected_containers,
+            len({payload["url"] for payload in adapter.payloads}),
+            "the same container is never offered twice",
+        )
+        self.assertEqual(
+            [], self.server.events("terminal"), "no terminal request may follow"
+        )
+        self.assertEqual([], self.server.events("submission"))
+        self.assertEqual(
+            [package(index) for index in range(1, self.packages + 1)],
+            self.server.protected_ids(),
+            "every protected package survives an inconclusive window",
+        )
+        self.assertEqual("individual", self.server.decision_row()["state"])
+        for package_id, held in self.held_fingerprints().items():
+            self.assertTrue(held, f"{package_id} keeps a package-local hold")
+
+    def assert_no_terminal_request_was_sent(self):
+        paths = [call[1] for call in self.server.calls]
+        for endpoint in ("fail", "download", "disable"):
+            self.assertNotIn(f"/sponsors_helper/api/{endpoint}/", paths)
+
+
+class LoneContainerTests(NonDestructiveWindowMixin, CombinedCohortTestCase):
+    """One unique container can never be a cohort, and never a failure."""
+
+    packages = 1
+
+    def test_a_lone_filecrypt_package_is_held_rather_than_failed(self):
+        adapter = self.sweep(["blocked"] * 4, stop_after_sleeps=3)
+
+        self.assertEqual(
+            ["hold"],
+            [entry["body"]["instruction"] for entry in self.answers("defer")],
+        )
+        self.assert_nothing_was_destroyed(adapter, 1)
+        self.assert_no_terminal_request_was_sent()
+        self.assertEqual("cohort_too_small", self.server.decision_row()["reason"])
+
+
+class SmallCohortTests(NonDestructiveWindowMixin, CombinedCohortTestCase):
+    """Four unique containers are a complete cohort that may never cool."""
+
+    packages = 4
+
+    def test_a_complete_small_cohort_holds_every_member_it_blocked(self):
+        adapter = self.sweep(["blocked"] * 8, stop_after_sleeps=2)
+
+        self.assertEqual(
+            ["hold"] * 4,
+            [entry["body"]["instruction"] for entry in self.answers("defer")],
+        )
+        self.assert_nothing_was_destroyed(adapter, 4)
+        self.assert_no_terminal_request_was_sent()
+        self.assertEqual("cohort_too_small", self.server.decision_row()["reason"])
+        self.assertNotEqual("cooldown", self.server.decision_row()["state"])
+
+
 class ContractOracleTests(CombinedCohortTestCase):
     """The other repository's oracle really discriminates this harness."""
 

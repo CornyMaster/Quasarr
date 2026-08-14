@@ -94,6 +94,8 @@ RESUMED = "resumed"
 APPLIED = "applied"
 CONFLICT = "conflict"
 CAPACITY = "capacity"
+# A stored row this build cannot decode: not an absent one, and not garbage.
+UNREADABLE = "unreadable"
 
 _OPERATION_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SUBMISSION_COMMENT_PATTERN = re.compile(
@@ -334,15 +336,16 @@ class TerminalOperationService:
         """Drop expired complete rows, oldest first, comparing what was read.
 
         Deletion compares the exact value this enumeration saw, so a row another
-        process replaced meanwhile survives. An unreadable row authorizes
-        nothing and is dropped the same way, because keeping it would deny
-        capacity forever.
+        process replaced meanwhile survives. A row this build cannot read is
+        never reclaimed: it may be the record of an effect that already
+        happened, and deleting it would let the same identity open a fresh
+        operation and apply that effect a second time. It still occupies its
+        slot, so capacity stays bounded and an operator repairs it.
         """
         now = int(self._clock())
         expirable = []
         for key, raw, record in self._entries():
             if record is None:
-                expirable.append((0, key, raw))
                 continue
             if record["state"] != "complete":
                 continue
@@ -365,7 +368,11 @@ class TerminalOperationService:
 
         A repeated identity resumes at whatever phase it reached, so the caller
         can replay instead of repeating a side effect. A stored row naming
-        another package or terminal state is a conflict and writes nothing.
+        another package or terminal state is a conflict and writes nothing, and
+        a stored row this build cannot read at all is neither: an absent row
+        proves nothing happened, an unreadable one proves nothing either way,
+        so it authorizes no side effect and is answered as unavailable rather
+        than reopened.
 
         Retention runs first, on every request rather than only on a full
         table: an operation ID names a package, so a package that is added
@@ -376,7 +383,8 @@ class TerminalOperationService:
         with _operation_lock:
             self.prune_completed()
             table = self._table()
-            if decode_operation_record(table.retrieve(operation_id)) is None:
+            stored = table.retrieve(operation_id)
+            if stored is None:
                 # Capacity is proven before any terminal side effect, never inside
                 # the transaction: a mutation callback may not enumerate storage.
                 if not self._capacity_available():
@@ -390,6 +398,9 @@ class TerminalOperationService:
 
             def decide(current_value):
                 record = decode_operation_record(current_value)
+                if record is None and current_value is not None:
+                    decided.update(outcome=UNREADABLE, record=None)
+                    return current_value
                 if record is None:
                     opened = {
                         "state": "prepared",
@@ -418,6 +429,11 @@ class TerminalOperationService:
             table.mutate_value(operation_id, decide)
         if decided["outcome"] == CONFLICT:
             debug("Refusing a terminal operation identity bound to another report")
+        elif decided["outcome"] == UNREADABLE:
+            warn(
+                "Refusing a terminal operation whose stored record cannot be read; "
+                "it is preserved for repair"
+            )
         return self._result(decided["outcome"], decided["record"])
 
     def _advance(self, operation_id, package_id, terminal_state, target, flags=None):
