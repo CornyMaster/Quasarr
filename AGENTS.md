@@ -183,4 +183,5 @@ When the user requests a durable behavior change, record it here or in the relev
 
 - `quasarr/AGENTS.md` - application package: layout, entrypoint and constants contracts, cross-cutting Python conventions; indexes the five subsystem docs (`api/`, `downloads/`, `search/`, `providers/`, `storage/`)
 - `tests/AGENTS.md` - unit-test suite: unittest-only contract, hermetic mocking rules, synthetic-hostname rules, exact run command
+- `integration_tests/AGENTS.md` - cross-repository end-to-end harness: runs the real SponsorsHelper loop against the real Quasarr callbacks in one process, deliberately outside the unit-test discovery root
 - `docker/AGENTS.md` - container build and compose assets: restart-loop ENTRYPOINT contract, end-user and dev compose files
