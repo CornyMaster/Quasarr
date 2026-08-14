@@ -119,6 +119,10 @@ FAIL_RULE = "/sponsors_helper/api/fail/"
 MIRRORS_RULE = "/sponsors_helper/api/mirrors/<package_id>/"
 CREDENTIALS_RULE = "/sponsors_helper/api/credentials/<hostname>/"
 
+# The literal the other repository's oracle reads as "this exchange ran out",
+# restated here so the harness owes the oracle nothing but the trace itself.
+COMPLETION_EVENT = "complete"
+
 
 def package(index):
     return f"Quasarr_movies_{index:032x}"
@@ -240,7 +244,7 @@ class QuasarrServer:
         self.device = FakeDevice()
         self.trace = []
         self.calls = []
-        # Transport failures the harness injects, by route path suffix.
+        # Answers the harness loses on the way back, by route path suffix.
         self.drop_next = {}
         self.values = {
             "dbfile": dbfile,
@@ -330,9 +334,17 @@ class QuasarrServer:
     def _route(self, method, url, payload):
         path = urlsplit(url).path
         self.calls.append((method, path))
-        if self.drop_next.get(path):
+        lost = bool(self.drop_next.get(path))
+        if lost:
             self.drop_next[path] -= 1
-            raise ConnectionError("synthetic transport failure")
+        response = self._dispatch(method, path, payload)
+        if lost:
+            # The server ran, committed and answered; only the answer is lost.
+            # Anything the helper does next has to survive work already done.
+            raise ConnectionError("synthetic lost response")
+        return response
+
+    def _dispatch(self, method, path, payload):
         if path.endswith("/sponsors_helper/api/to_decrypt/"):
             return self._to_decrypt(payload)
         if path.endswith("/sponsors_helper/api/defer/"):
@@ -367,7 +379,15 @@ class QuasarrServer:
                     "fingerprint": offer["link_fingerprint"],
                 }
             )
+        if handout is None:
+            # Quasarr has nothing left to hand out, so whatever this exchange
+            # still owed is owed no longer: the trace may be judged in full.
+            self._note_completion()
         return response
+
+    def _note_completion(self):
+        if not self.trace or self.trace[-1]["event"] != COMPLETION_EVENT:
+            self.trace.append({"event": COMPLETION_EVENT})
 
     def _report(self, rule, route, payload):
         access = "blocked" if route == "defer" else payload.get("access")
@@ -658,10 +678,22 @@ class LostAcknowledgementTests(CombinedCohortTestCase):
             kinds[first:second],
             "an owed acknowledgement is settled before new work",
         )
-        acknowledged = self.answers("access")[-1]
-        self.assertEqual(200, acknowledged["status"])
-        self.assertIs(True, acknowledged["body"]["cleared"])
+        # The first report reached the routes and committed; the answer to it
+        # is what was lost, so the retry is a replay of a decided generation.
+        reported = [
+            entry
+            for entry in self.server.events("report")
+            if entry["route"] == "access"
+        ]
+        self.assertEqual(2, len(reported))
+        self.assertEqual(1, len({entry["offer_id"] for entry in reported}))
+        answered = self.answers("access")
+        self.assertEqual([200, 200], [entry["status"] for entry in answered])
+        self.assertEqual([True, True], [entry["body"]["cleared"] for entry in answered])
+        self.assertEqual(answered[0]["body"], answered[1]["body"])
         self.assertEqual("healthy", self.server.decision_row()["state"])
+        self.assertEqual([], self.server.events("submission"))
+        self.assertEqual([], self.server.device.add_links_calls)
         self.assert_no_violations()
 
     def test_the_owed_result_survives_a_restart_of_the_loop(self):
@@ -720,9 +752,24 @@ class TerminalCleanupTests(CombinedCohortTestCase):
             len(self.server.events("submission")),
             "the retried operation replays instead of submitting again",
         )
-        confirmations = [
-            entry for entry in self.server.events("terminal") if entry["status"] == 200
-        ]
+        self.assertEqual(1, len(self.server.device.add_links_calls))
+        terminal = self.server.events("terminal")
+        self.assertEqual(2, len(terminal), "the lost answer cost one extra request")
+        self.assertEqual([200, 200], [entry["status"] for entry in terminal])
+        self.assertEqual(
+            terminal[0]["body"],
+            terminal[1]["body"],
+            "the operation answers the retry with the verdict it already reached",
+        )
+        kinds = [call[1] for call in self.server.calls]
+        first = kinds.index("/sponsors_helper/api/download/")
+        second = kinds.index("/sponsors_helper/api/download/", first + 1)
+        self.assertNotIn(
+            "/decrypt",
+            kinds[first:second],
+            "the retry replays the operation instead of solving again",
+        )
+        confirmations = [entry for entry in terminal if entry["status"] == 200]
         self.assertTrue(confirmations)
         self.assertIs(True, confirmations[-1]["body"]["success"])
         self.assertNotIn(confirmations[-1]["package_id"], self.server.protected_ids())

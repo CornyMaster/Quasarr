@@ -18,6 +18,7 @@ confirmation of the package a sweep handed out is still exactly once.
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -475,6 +476,7 @@ class CompleteSweepTests(CohortIntegrationTestCase):
         )
         sweep_ids = {exchange["offer"]["sweep_id"] for exchange in exchanges}
         self.assertEqual(1, len(sweep_ids), "one generation owns the whole sweep")
+        (offered_sweep_id,) = sweep_ids
 
         stored = self.decision_row()
         self.assertEqual("cooldown", stored["state"])
@@ -482,13 +484,17 @@ class CompleteSweepTests(CohortIntegrationTestCase):
         self.assertEqual(
             ["blocked"] * 5, [member["result"] for member in stored["members"]]
         )
-        for index in range(1, 6):
-            deferred = self.protected_row(package(index))["deferred"]
-            self.assertEqual(CRYPTER, deferred["crypter"])
-            self.assertEqual(
-                sweep_ids.pop() if not sweep_ids else deferred["sweep_id"],
-                deferred["sweep_id"],
-            )
+        self.assertEqual(
+            [(CRYPTER, offered_sweep_id)] * 5,
+            [
+                (
+                    self.protected_row(package(index))["deferred"]["crypter"],
+                    self.protected_row(package(index))["deferred"]["sweep_id"],
+                )
+                for index in range(1, 6)
+            ],
+            "every hold names the generation the offers were issued under",
+        )
         self.assertEqual(5, self.service().count_active_deferred_packages())
 
     def test_the_sweep_counters_advance_one_tested_member_at_a_time(self):
@@ -552,11 +558,23 @@ class ClearPositionTests(CohortIntegrationTestCase):
             self.assertIsNone(self.service().get_package_defer(package(index)))
         return exchanges
 
-    def test_a_clear_ends_the_sweep_at_every_member_position(self):
-        for position in range(1, 6):
-            with self.subTest(position=position):
-                self.setUp()
-                self.assert_clear_at(position)
+    # One method per position: a fixture may only ever be entered by the
+    # framework, so each of the five sweeps gets its own database, its own
+    # globals and its own teardown.
+    def test_a_clear_as_the_first_result_ends_the_sweep(self):
+        self.assert_clear_at(1)
+
+    def test_a_clear_as_the_second_result_ends_the_sweep(self):
+        self.assert_clear_at(2)
+
+    def test_a_clear_as_the_third_result_ends_the_sweep(self):
+        self.assert_clear_at(3)
+
+    def test_a_clear_as_the_fourth_result_ends_the_sweep(self):
+        self.assert_clear_at(4)
+
+    def test_a_clear_as_the_fifth_result_ends_the_sweep(self):
+        self.assert_clear_at(5)
 
     def test_a_clear_invalidates_the_holds_the_same_sweep_had_written(self):
         exchanges = self.assert_clear_at(4)
@@ -596,6 +614,64 @@ class ClearPositionTests(CohortIntegrationTestCase):
         self.assertEqual("healthy", stored["state"])
         self.assertNotIn(first["link_fingerprint"], stored["retest_members"])
         self.assertEqual(3, len(stored["retest_members"]))
+
+
+class FixtureIsolationTests(unittest.TestCase):
+    """What every case of this module borrows, it has to give back.
+
+    The fixture replaces two process-global names and opens real SQLite files,
+    so an isolation defect here is invisible in the case that causes it and
+    corrupts whichever module runs next. This runs the five CLEAR-position
+    cases through the framework and then audits the world they left behind.
+    """
+
+    CLEAR_POSITION_TESTS = (
+        "test_a_clear_as_the_first_result_ends_the_sweep",
+        "test_a_clear_as_the_second_result_ends_the_sweep",
+        "test_a_clear_as_the_third_result_ends_the_sweep",
+        "test_a_clear_as_the_fourth_result_ends_the_sweep",
+        "test_a_clear_as_the_fifth_result_ends_the_sweep",
+    )
+
+    def test_every_clear_position_case_returns_the_globals_and_the_handles(self):
+        before_values = provider_shared_state.values
+        before_lock = provider_shared_state.lock
+        opened = []
+        directories = []
+        original_get_db = RealSharedState.get_db
+        original_directory = tempfile.TemporaryDirectory
+
+        def record_database(state, table):
+            database = original_get_db(state, table)
+            if database not in opened:
+                opened.append(database)
+            return database
+
+        def record_directory(*args, **kwargs):
+            directory = original_directory(*args, **kwargs)
+            directories.append(directory.name)
+            return directory
+
+        suite = unittest.TestSuite(
+            ClearPositionTests(name) for name in self.CLEAR_POSITION_TESTS
+        )
+        result = unittest.TestResult()
+        with (
+            mock.patch.object(RealSharedState, "get_db", record_database),
+            mock.patch.object(tempfile, "TemporaryDirectory", record_directory),
+        ):
+            suite.run(result)
+
+        self.assertEqual([], result.errors + result.failures)
+        self.assertEqual(len(self.CLEAR_POSITION_TESTS), result.testsRun)
+        self.assertIs(before_values, provider_shared_state.values)
+        self.assertIs(before_lock, provider_shared_state.lock)
+        self.assertEqual(len(self.CLEAR_POSITION_TESTS), len(directories))
+        self.assertEqual([], [name for name in directories if os.path.exists(name)])
+        self.assertTrue(opened, "the cases really opened SQLite handles")
+        for database in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                database._conn.execute("SELECT 1")
 
 
 class InventoryShapeTests(CohortIntegrationTestCase):
