@@ -43,6 +43,7 @@ from quasarr.storage.setup import (
     flaresolverr_config,
     hostname_credentials_config,
     hostnames_config,
+    initialize_crypter_block_settings,
     initialize_filecrypt_setting,
     initialize_notification_settings,
     initialize_radarr_client,
@@ -283,6 +284,7 @@ def run():
         initialize_notification_settings(shared_state)
         initialize_timeout_slow_mode_settings(shared_state)
         initialize_filecrypt_setting(shared_state)
+        initialize_crypter_block_settings(shared_state)
 
         api_key = Config("API").get("key")
         if not api_key:

@@ -2,9 +2,45 @@
 # Quasarr
 # Project by https://github.com/rix1337
 
+import time
 from datetime import datetime
 from json import loads
 from typing import Any, Dict
+
+from quasarr.providers.crypter_cooldowns import (
+    CRYPTER_EVENT_FIELDS,
+    CRYPTER_EVENT_KEY,
+    CRYPTER_EVENT_TABLE,
+    CrypterCooldownService,
+    crypter_blocks_deferred,
+    decode_pending_crypter_events,
+)
+from quasarr.providers.log import debug, warn
+from quasarr.providers.terminal_operations import TerminalOperationService
+
+# The linkcrypter services record their transitions in one durable ledger row;
+# these are the cumulative counters that row is drained into.
+CRYPTER_EVENT_COUNTERS = {
+    "observations": "crypter_block_observations",
+    "cooldowns": "crypter_cooldowns",
+    "probes": "crypter_probes",
+}
+# The ledger and its counters are always read and written as one unit, so a
+# flush by another process can never be counted in both halves of a total.
+CRYPTER_SNAPSHOT_TARGETS = ((CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY),) + tuple(
+    ("statistics", key) for key in CRYPTER_EVENT_COUNTERS.values()
+)
+
+
+def _counts_of(values) -> Dict[str, int]:
+    """Read one stored counter per field, treating an unusable row as zero."""
+    counts = {}
+    for field, value in zip(CRYPTER_EVENT_FIELDS, values, strict=True):
+        try:
+            counts[field] = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            counts[field] = 0
+    return counts
 
 
 class StatsHelper:
@@ -13,8 +49,9 @@ class StatsHelper:
     Uses shared_state for database access across processes.
     """
 
-    def __init__(self, shared_state):
+    def __init__(self, shared_state, clock=time.time):
         self.shared_state = shared_state
+        self._clock = clock
         self._ensure_stats_exist()
 
     def _get_db(self):
@@ -31,6 +68,9 @@ class StatsHelper:
             "failed_downloads": 0,
             "failed_decryptions_automatic": 0,
             "failed_decryptions_manual": 0,
+            "crypter_block_observations": 0,
+            "crypter_cooldowns": 0,
+            "crypter_probes": 0,
         }
 
         db = self._get_db()
@@ -52,6 +92,68 @@ class StatsHelper:
         db = self._get_db()
         current = self._get_stat(key, 0)
         db.update_store(key, str(current + count))
+
+    def _read_crypter_snapshot(self):
+        """Read the ledger and all three counters in one transaction.
+
+        Reading them separately lets another process flush in between, which
+        counts the same events in the stored half and the pending half of the
+        sum.
+        """
+        values = self._get_db().retrieve_values(CRYPTER_SNAPSHOT_TARGETS)
+        pending, readable = decode_pending_crypter_events(values[0])
+        return _counts_of(values[1:]), pending, readable
+
+    def flush_crypter_events(self) -> Dict[str, int]:
+        """Move the durable linkcrypter ledger into the cumulative counters.
+
+        One transaction adds the pending counts, clears the ledger, and returns
+        the committed totals, so an interrupted flush leaves every event
+        pending, a repeated flush can never count one twice, and the caller
+        never has to read the counters back. The ledger is decoded inside that
+        transaction: a row that is still unreadable there is dropped, while a
+        valid row written since is counted instead of erased.
+        """
+
+        discarded = {"row": False}
+
+        def move(current_values):
+            counts, readable = decode_pending_crypter_events(current_values[0])
+            discarded["row"] = not readable
+            stored = _counts_of(current_values[1:])
+            return [None] + [
+                str(stored[field] + counts[field]) for field in CRYPTER_EVENT_FIELDS
+            ]
+
+        committed = self._get_db().mutate_values(CRYPTER_SNAPSHOT_TARGETS, move)
+        if discarded["row"]:
+            warn("Discarding an unreadable linkcrypter transition ledger row")
+        return _counts_of(committed[1:])
+
+    def crypter_transition_totals(self) -> Dict[str, int]:
+        """The cumulative linkcrypter counters, including unflushed events.
+
+        Reading statistics must never fail on a write problem, and an event
+        that stays pending must still be visible, so a failed flush falls back
+        to the snapshot it already holds instead of reading a second time.
+        """
+        stored = pending = None
+        try:
+            stored, pending, readable = self._read_crypter_snapshot()
+            if readable and not any(pending.values()):
+                return stored
+        except Exception as error:
+            debug(f"Reading the linkcrypter transition snapshot failed: {error}")
+        try:
+            return self.flush_crypter_events()
+        except Exception as error:
+            debug(f"Deferring the linkcrypter statistics flush: {error}")
+        if stored is None:
+            return {
+                field: self._get_stat(key, 0)
+                for field, key in CRYPTER_EVENT_COUNTERS.items()
+            }
+        return {field: stored[field] + pending[field] for field in CRYPTER_EVENT_FIELDS}
 
     def increment_package_with_links(self, links):
         """Increment package downloaded and links processed for one package, or failed download if no links
@@ -207,8 +309,77 @@ class StatsHelper:
                 "xem_total_valid_cached": 0,
             }
 
+    def get_crypter_defer_stats(self) -> Dict[str, int]:
+        """
+        Get the current number of packages held by a linkcrypter block.
+
+        This is a live gauge over the protected packages, never a counter: in
+        `fail` block mode no package is held at all, and in `defer` mode holds
+        also end silently by expiry.
+        """
+        try:
+            if not crypter_blocks_deferred(self.shared_state):
+                return {"deferred_packages": 0}
+            service = CrypterCooldownService(self.shared_state, clock=self._clock)
+            return {"deferred_packages": service.count_active_deferred_packages()}
+        except Exception:
+            return {"deferred_packages": 0}
+
+    def get_operator_projection(self) -> Dict[str, Any]:
+        """Fixed-cardinality Filecrypt and terminal-operation state for operators."""
+        projection = {
+            "crypter_sweep_state": "available",
+            "crypter_sweep_tested": 0,
+            "crypter_sweep_total": 0,
+            "crypter_sweep_deadline_epoch": 0,
+            "crypter_cooldown_count": 0,
+            "crypter_retest_depth": 0,
+            "crypter_individual_mode": "",
+            "terminal_operations_prepared": 0,
+            "terminal_operations_submitted": 0,
+            "terminal_operations_complete": 0,
+        }
+        if crypter_blocks_deferred(self.shared_state):
+            try:
+                decision = CrypterCooldownService(
+                    self.shared_state, clock=self._clock
+                ).crypter_decision("filecrypt")
+                if decision is not None:
+                    state = decision["state"]
+                    if state == "sweeping":
+                        deadline = decision["sweep_deadline_epoch"]
+                    elif state == "cooldown":
+                        deadline = decision["retry_after_epoch"]
+                    else:
+                        deadline = decision["until_epoch"]
+                    projection.update(
+                        {
+                            "crypter_sweep_state": state,
+                            "crypter_sweep_tested": decision["sweep_tested"],
+                            "crypter_sweep_total": decision["sweep_total"],
+                            "crypter_sweep_deadline_epoch": deadline,
+                            "crypter_cooldown_count": int(state == "cooldown"),
+                            "crypter_retest_depth": len(decision["retest_members"]),
+                            "crypter_individual_mode": (
+                                decision["reason_code"] if state == "individual" else ""
+                            ),
+                        }
+                    )
+            except Exception as error:
+                debug(f"Reading the Filecrypt operator projection failed: {error}")
+        try:
+            terminal_counts = TerminalOperationService(
+                self.shared_state, clock=self._clock
+            ).count_by_state()
+            for state, count in terminal_counts.items():
+                projection[f"terminal_operations_{state}"] = count
+        except Exception as error:
+            debug(f"Reading the terminal-operation projection failed: {error}")
+        return projection
+
     def get_stats(self) -> Dict[str, Any]:
         """Get all current statistics"""
+        crypter_totals = self.crypter_transition_totals()
         stats = {
             "packages_downloaded": self._get_stat("packages_downloaded", 0),
             "links_processed": self._get_stat("links_processed", 0),
@@ -224,6 +395,8 @@ class StatsHelper:
             ),
             "failed_decryptions_manual": self._get_stat("failed_decryptions_manual", 0),
         }
+        for field, key in CRYPTER_EVENT_COUNTERS.items():
+            stats[key] = crypter_totals[field]
 
         # Calculate totals and rates
         total_captcha_decryptions = (
@@ -288,6 +461,8 @@ class StatsHelper:
         # Add metadata cache stats
         stats.update(self.get_imdb_cache_stats())
         stats.update(self.get_xem_cache_stats())
+        stats.update(self.get_crypter_defer_stats())
+        stats.update(self.get_operator_projection())
         stats["metadata_total_cached"] = (
             stats["imdb_total_cached"] + stats["xem_total_cached"]
         )

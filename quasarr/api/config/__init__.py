@@ -42,6 +42,7 @@ from quasarr.storage.setup import (
     check_credentials,
     clear_skip_login,
     delete_skip_flaresolverr_preference,
+    get_crypter_block_settings_data,
     get_filecrypt_setting_data,
     get_flaresolverr_status_data,
     get_notification_settings_data,
@@ -51,6 +52,7 @@ from quasarr.storage.setup import (
     get_timeout_slow_mode_settings_data,
     hostname_form_html,
     import_hostnames_from_url,
+    save_crypter_block_settings,
     save_filecrypt_setting,
     save_flaresolverr_url,
     save_hostnames,
@@ -203,6 +205,16 @@ def setup_config(app, shared_state):
     @require_api_key
     def save_timeout_slow_mode_settings_api():
         return save_timeout_slow_mode_settings(shared_state)
+
+    @app.get("/api/crypter-block/settings")
+    @require_api_key
+    def get_crypter_block_settings_api():
+        return get_crypter_block_settings_data(shared_state)
+
+    @app.post("/api/crypter-block/settings")
+    @require_api_key
+    def save_crypter_block_settings_api():
+        return save_crypter_block_settings(shared_state)
 
     @app.get("/api/filecrypt/settings")
     @require_api_key

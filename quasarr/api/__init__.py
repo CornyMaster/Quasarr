@@ -239,6 +239,18 @@ def get_api(shared_state_dict, shared_state_lock):
         filecrypt_checked = (
             "checked" if shared_state.values.get("filecrypt_enabled", True) else ""
         )
+        crypter_block_mode = shared_state.values.get("crypter_block_mode", "defer")
+        if crypter_block_mode not in {"defer", "fail"}:
+            crypter_block_mode = "defer"
+        defer_selected = "selected" if crypter_block_mode == "defer" else ""
+        fail_selected = "selected" if crypter_block_mode == "fail" else ""
+        try:
+            crypter_cooldown_hours = int(
+                shared_state.values.get("crypter_cooldown_hours", 24)
+            )
+        except (TypeError, ValueError):
+            crypter_cooldown_hours = 24
+        crypter_cooldown_hours = max(24, crypter_cooldown_hours)
 
         def render_switch(input_id, checked):
             return (
@@ -393,6 +405,27 @@ def get_api(shared_state_dict, shared_state_lock):
                     </p>
                     <div id="filecrypt-status" class="notification-status"></div>
                     <p>{render_button("Save Filecrypt Setting", "primary", {"onclick": "saveFilecryptSettings()", "type": "button", "id": "filecryptSaveBtn"})}</p>
+
+                    <div class="input-group">
+                        <label for="crypter-block-mode">Linkcrypter-wide access blocks</label>
+                        <div class="input-row">
+                            <select id="crypter-block-mode">
+                                <option value="defer" {defer_selected}>Defer</option>
+                                <option value="fail" {fail_selected}>Fail</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="input-group">
+                        <label for="crypter-cooldown-hours">Cooldown (hours)</label>
+                        <div class="input-row">
+                            <input type="number" id="crypter-cooldown-hours" min="24" step="1" value="{crypter_cooldown_hours}">
+                        </div>
+                    </div>
+                    <p class="api-hint setting-row-hint">
+                        Defer keeps affected releases waiting in the queue until the cooldown expires. Fail restores the legacy behavior immediately: releases fail again so *arr grabs an alternative, and recorded blocks are kept but ignored until you switch back.
+                    </p>
+                    <div id="crypter-block-status" class="notification-status"></div>
+                    <p>{render_button("Save Block Settings", "primary", {"onclick": "saveCrypterBlockSettings()", "type": "button", "id": "crypterBlockSaveBtn"})}</p>
                 </div>
             </details>
         </div>
@@ -1521,6 +1554,58 @@ def get_api(shared_state_dict, shared_state_lock):
                     }}
                     if (checkbox) {{
                         checkbox.disabled = false;
+                    }}
+                }}
+            }}
+
+            async function saveCrypterBlockSettings() {{
+                var saveButton = document.getElementById('crypterBlockSaveBtn');
+                var modeSelect = document.getElementById('crypter-block-mode');
+                var cooldownInput = document.getElementById('crypter-cooldown-hours');
+                setNotificationStatus('crypter-block-status', 'Saving block settings...', true);
+
+                if (saveButton) {{
+                    saveButton.disabled = true;
+                    saveButton.textContent = 'Saving...';
+                }}
+                if (modeSelect) {{
+                    modeSelect.disabled = true;
+                }}
+                if (cooldownInput) {{
+                    cooldownInput.disabled = true;
+                }}
+
+                try {{
+                    var response = await quasarrApiFetch('/api/crypter-block/settings', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify({{
+                            mode: modeSelect.value,
+                            cooldown_hours: Number.parseInt(cooldownInput.value, 10)
+                        }})
+                    }});
+                    var data = await response.json();
+                    if (!response.ok || !data.success) {{
+                        throw new Error(data.message || 'Failed to save block settings');
+                    }}
+
+                    if (data.settings) {{
+                        modeSelect.value = data.settings.mode;
+                        cooldownInput.value = data.settings.cooldown_hours;
+                    }}
+                    setNotificationStatus('crypter-block-status', '✅ ' + data.message, true);
+                }} catch (error) {{
+                    setNotificationStatus('crypter-block-status', '❌ ' + error.message, false);
+                }} finally {{
+                    if (saveButton) {{
+                        saveButton.disabled = false;
+                        saveButton.textContent = 'Save Block Settings';
+                    }}
+                    if (modeSelect) {{
+                        modeSelect.disabled = false;
+                    }}
+                    if (cooldownInput) {{
+                        cooldownInput.disabled = false;
                     }}
                 }}
             }}

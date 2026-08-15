@@ -23,6 +23,10 @@ from quasarr.providers.notifications import (
 )
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
 from quasarr.providers.statistics import StatsHelper
+from quasarr.providers.terminal_operations import (
+    TERMINAL_OPERATION_MARKER,
+    submission_comment,
+)
 from quasarr.providers.utils import (
     download_package,
     extract_client_type,
@@ -34,6 +38,24 @@ from quasarr.storage.categories import (
     get_download_category_from_package_id,
     get_download_category_mirrors,
 )
+
+_PROTECTED_MIRROR_KEYS = frozenset({"junkies"})
+
+# The whole funnel, or only the half that ends at the JDownloader submission.
+# Splitting it lets a caller that has to confirm a terminal package state put a
+# durable marker between the one irreversible step and the cleanup after it.
+SUBMIT_PHASE_ALL = "all"
+SUBMIT_PHASE_SUBMIT = "submit"
+
+# The rows one terminal failure commits together. They are named here because
+# this module owns the shape of a failed row and the meaning of the counters;
+# the operation service owns the transaction that writes them.
+FAILED_TABLE = "failed"
+STATISTICS_TABLE = "statistics"
+TERMINAL_FAILURE_COUNTERS = ("failed_downloads", "failed_decryptions_automatic")
+# Told apart from "there is no row": a store that cannot be read proves nothing
+# either way and may never authorize a second terminal side effect.
+_UNREADABLE = object()
 
 # =============================================================================
 # DETERMINISTIC PACKAGE ID GENERATION
@@ -97,6 +119,26 @@ def detect_crypter(url):
     return None, None
 
 
+def protected_crypter_keys():
+    return frozenset(PROTECTED_PATTERNS) | _PROTECTED_MIRROR_KEYS
+
+
+def resolve_protected_crypter_key(link):
+    if not isinstance(link, (list, tuple)) or not link:
+        return None
+
+    url = link[0]
+    if not isinstance(url, str):
+        return None
+
+    mirror = link[1] if len(link) > 1 else ""
+    if isinstance(mirror, str) and mirror.lower() in _PROTECTED_MIRROR_KEYS:
+        return mirror.lower()
+
+    crypter, crypter_type = detect_crypter(url)
+    return crypter if crypter_type == "protected" else None
+
+
 def _drop_filecrypt_if_disabled(shared_state, classified, title):
     """Drop filecrypt links from the protected bucket when the kill switch is off."""
     if shared_state.values.get("filecrypt_enabled", True):
@@ -128,9 +170,7 @@ def classify_links(links):
 
     for link in links:
         url = link[0]
-        mirror = link[1] if len(link) > 1 else ""
-
-        if isinstance(mirror, str) and mirror.lower() == "junkies":
+        if resolve_protected_crypter_key(link):
             classified["protected"].append(link)
             continue
 
@@ -152,7 +192,11 @@ def classify_links(links):
 
 
 def _persist_failed_package(
-    shared_state, title, package_id, reason, remove_protected=False
+    shared_state,
+    title,
+    package_id,
+    reason,
+    remove_protected=False,
 ):
     if remove_protected:
         try:
@@ -185,6 +229,182 @@ def _format_mirror_token_list(tokens):
     return ", ".join(cleaned) if cleaned else "unknown"
 
 
+def project_final_download_urls(urls, package_id):
+    """Apply the package category's final mirror policy without side effects."""
+    category = get_download_category_from_package_id(package_id)
+    mirrors = get_download_category_mirrors(category, lowercase=True)
+    return category, mirrors, filter_final_download_urls(urls, mirrors)
+
+
+def _protected_package_present(shared_state, package_id):
+    """Whether the protected row exists, or None when that cannot be read."""
+    try:
+        return shared_state.get_db("protected").retrieve(package_id) is not None
+    except Exception as e:
+        info(f'Error reading protected package "{package_id}": {e}')
+        return None
+
+
+def failed_package_records_operation(shared_state, package_id, terminal_operation):
+    """Whether failed history proves THIS operation wrote it, or None if unreadable.
+
+    The mere presence of a row proves nothing: package IDs are derived from the
+    release, and the automatic download path, the legacy fail route and every
+    earlier life of the same release write one too. Only the operation marker
+    the row was stored with answers for the operation asking.
+    """
+    blob = _failed_package_blob(shared_state, package_id)
+    if blob is None or blob is _UNREADABLE:
+        return None if blob is _UNREADABLE else False
+    return blob.get(TERMINAL_OPERATION_MARKER) == terminal_operation
+
+
+def failed_package_reason(shared_state, package_id, terminal_operation):
+    """The reason THIS operation recorded, or None when it recorded none.
+
+    An interrupted failure has to be able to finish telling the operator what
+    it already wrote down, and the row it wrote is the only place that reason
+    still exists - the operation record itself stays bounded and secret-free.
+    """
+    blob = _failed_package_blob(shared_state, package_id)
+    if not isinstance(blob, dict):
+        return None
+    if blob.get(TERMINAL_OPERATION_MARKER) != terminal_operation:
+        return None
+    reason = blob.get("error")
+    return reason if isinstance(reason, str) else None
+
+
+def _failed_package_blob(shared_state, package_id):
+    """The decoded failed row, None when there is none, `_UNREADABLE` on error."""
+    try:
+        raw = shared_state.get_db(FAILED_TABLE).retrieve(package_id)
+    except Exception as e:
+        info(f'Error reading failed package "{package_id}": {e}')
+        return _UNREADABLE
+    if raw is None:
+        return None
+    try:
+        blob = json.loads(raw)
+        if isinstance(blob, str):
+            blob = json.loads(blob)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return blob if isinstance(blob, dict) else None
+
+
+def failed_row_value(title, reason, terminal_operation=None):
+    """The exact stored value of one failed-history row.
+
+    Kept as a pure projection so the same bytes can be written by the legacy
+    path and inside the transaction that commits a terminal failure with its
+    counters, and so nothing but the marker ever changes between the two.
+    """
+    entry = {"title": title, "error": reason}
+    if terminal_operation:
+        # Written with the row itself, so a retry of the operation that
+        # recorded this failure can recognize its own work.
+        entry[TERMINAL_OPERATION_MARKER] = terminal_operation
+    return json.dumps(json.dumps(entry))
+
+
+def commit_terminal_failure(
+    service, operation_id, package_id, terminal_state, title, reason, evidence
+):
+    """Persist one operation's failure, its counters and its marker as one commit.
+
+    Everything a helper can observe about a failure - the history row, the two
+    counters, the notification, the removal of the protected package - waits
+    behind this, because a failure that was never written down must never be
+    reported, counted or cleaned up after.
+    """
+    return service.record_failure(
+        operation_id,
+        package_id,
+        terminal_state,
+        failed_target=(FAILED_TABLE, package_id),
+        failed_value=failed_row_value(title, reason, evidence),
+        counter_targets=tuple(
+            (STATISTICS_TABLE, counter) for counter in TERMINAL_FAILURE_COUNTERS
+        ),
+    )
+
+
+def finalize_protected_removal(
+    shared_state, package_id, notification_details=None, *, notify_solved=True
+):
+    """Remove and verify one protected row, reporting whether this call removed it."""
+    present = _protected_package_present(shared_state, package_id)
+    if present is None:
+        return {"package_removed": False, "removed_now": False}
+    if not present:
+        return {"package_removed": True, "removed_now": False}
+
+    protected_release = _get_protected_release(shared_state, package_id)
+    _delete_protected_package(shared_state, package_id)
+    if _protected_package_present(shared_state, package_id) is not False:
+        return {"package_removed": False, "removed_now": False}
+    if notify_solved and protected_release:
+        update_release_notification(
+            shared_state,
+            protected_release,
+            NotificationType.SOLVED,
+            details=notification_details,
+        )
+    return {"package_removed": True, "removed_now": True}
+
+
+def confirm_protected_removal(shared_state, package_id, notification_details=None):
+    """Prove the protected row of a submitted package is gone, removing it once.
+
+    A delete call is not a proof, so the row is read back and an unreadable
+    store never reports success. Safe to repeat: a package that is already
+    absent counts as removed and sends no second solved notification, because
+    only the call that actually removed the row notifies.
+    """
+    return finalize_protected_removal(shared_state, package_id, notification_details)[
+        "package_removed"
+    ]
+
+
+def jdownloader_holds_operation(shared_state, package_id, terminal_operation):
+    """Whether JDownloader carries what THIS operation submitted, or None.
+
+    An earlier HTTP 200 never proved that a submission was recorded here, so an
+    operation that already began its attempt asks JDownloader itself before it
+    may submit again. The bare package ID in a comment only shows that some
+    submission happened - a legacy one, a manual one, or an earlier life of the
+    same release - so the operation marker the submission travelled with is
+    what is matched. Both JDownloader lists are consulted because a package can
+    already have left the linkgrabber. `None` means the answer could not be
+    obtained and never authorizes a second submission.
+    """
+    unknown = object()
+    comment = submission_comment(package_id, terminal_operation)
+
+    def carries(entries):
+        for entry in entries or ():
+            if isinstance(entry, dict) and entry.get("comment") == comment:
+                return True
+        return False
+
+    def query(device):
+        if carries(device.linkgrabber.query_packages()):
+            return True
+        if carries(device.linkgrabber.query_links()):
+            return True
+        if carries(device.downloads.query_packages()):
+            return True
+        return carries(device.downloads.query_links())
+
+    held = shared_state.run_device_request(
+        "check whether a package was already submitted",
+        query,
+        default=unknown,
+    )
+    return None if held is unknown else bool(held)
+
+
 def submit_final_download_urls(
     shared_state,
     urls,
@@ -193,6 +413,8 @@ def submit_final_download_urls(
     package_id,
     remove_protected=False,
     notification_details=None,
+    phase=SUBMIT_PHASE_ALL,
+    terminal_operation=None,
 ):
     """
     Final mirror whitelist check before sending direct HTTP links to JDownloader.
@@ -202,9 +424,7 @@ def submit_final_download_urls(
         protected_release = _get_protected_release(shared_state, package_id) or {
             "title": title
         }
-    category = get_download_category_from_package_id(package_id)
-    mirrors = get_download_category_mirrors(category, lowercase=True)
-    filtered = filter_final_download_urls(urls, mirrors)
+    category, mirrors, filtered = project_final_download_urls(urls, package_id)
     final_urls = filtered["urls"]
     dropped = filtered["dropped"]
 
@@ -222,6 +442,11 @@ def submit_final_download_urls(
             f"Allowed mirrors: {_format_mirror_token_list(filtered['allowed_tokens'])}. "
             f"Received mirrors: {_format_mirror_token_list({item['token'] for item in dropped})}."
         )
+        if phase == SUBMIT_PHASE_SUBMIT:
+            # A terminal caller owns the whole failure: it has to persist it
+            # against its operation before anything is counted, announced or
+            # removed, so this half only reports that nothing was submitted.
+            return {"success": False, "mirror_rejected": True, "reason": reason}
         result = _persist_failed_package(
             shared_state,
             title,
@@ -239,8 +464,15 @@ def submit_final_download_urls(
         return result
 
     info(f"Sending {len(final_urls)} direct download links for {title}")
-    if download_package(final_urls, title, password, package_id, shared_state):
-        if remove_protected:
+    if download_package(
+        final_urls,
+        title,
+        password,
+        package_id,
+        shared_state,
+        comment=submission_comment(package_id, terminal_operation),
+    ):
+        if remove_protected and phase != SUBMIT_PHASE_SUBMIT:
             _delete_protected_package(shared_state, package_id)
             if protected_release:
                 update_release_notification(
@@ -313,8 +545,24 @@ def store_protected_links(
     if notifications:
         blob_data["notifications"] = notifications
 
-    shared_state.values["database"]("protected").update_store(
-        package_id, json.dumps(blob_data)
+    def create_or_merge(current_value):
+        """Never let a stale duplicate grab overwrite the live protected row.
+
+        Duplicate detection happens before this call, so a concurrent request
+        can create and defer the package in between. Existing fields therefore
+        win and only genuinely missing ones are added.
+        """
+        try:
+            existing = json.loads(current_value) if current_value is not None else None
+        except (TypeError, json.JSONDecodeError):
+            existing = None
+        if not isinstance(existing, dict):
+            return json.dumps(blob_data)
+        merged = {**blob_data, **existing}
+        return current_value if merged == existing else json.dumps(merged)
+
+    shared_state.values["database"]("protected").mutate_value(
+        package_id, create_or_merge
     )
     info(
         f'CAPTCHA-Solution required for <b>{title}</b> at: "{shared_state.values["external_address"]}/captcha"'
@@ -637,13 +885,25 @@ def download(
 
 
 def fail(title, package_id, shared_state, reason="Unknown error"):
-    """Mark download as failed."""
+    """Mark download as failed.
+
+    The row is stored before anything is counted or announced, so a store that
+    never lands cannot leave a counter answering for history nobody has, and
+    the result says whether the failure was really recorded.
+    """
+    persisted = False
     try:
         error(f"Reason for failure: {reason}")
-        StatsHelper(shared_state).increment_failed_downloads()
-        blob = json.dumps({"title": title, "error": reason})
-        shared_state.get_db("failed").store(package_id, json.dumps(blob))
-        warn(f'Package "{title}" marked as failed!')
+        shared_state.get_db(FAILED_TABLE).store(
+            package_id, failed_row_value(title, reason)
+        )
+        persisted = True
     except Exception as e:
         error(f'Error marking package "{package_id}" as failed: {e}')
-    return {"success": True, "title": title, "failed": True}
+    if persisted:
+        try:
+            StatsHelper(shared_state).increment_failed_downloads()
+        except Exception as e:
+            error(f'Error counting the failure of package "{package_id}": {e}')
+        warn(f'Package "{title}" marked as failed!')
+    return {"success": persisted, "title": title, "failed": True}
