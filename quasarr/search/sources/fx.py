@@ -24,6 +24,11 @@ from quasarr.providers.utils import (
     is_valid_release,
     sanitize_title,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -50,10 +55,15 @@ class Source(AbstractSearchSource):
         }
 
         try:
-            r = requests.get(url, headers=headers, timeout=FEED_REQUEST_TIMEOUT_SECONDS)
+            checkpoint()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
+            r = requests.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             feed = BeautifulSoup(r.content, "html.parser")
             items = feed.find_all("article")
+        except SearchBudgetExhausted:
+            debug("Feed budget spent before the request could start")
+            return releases
         except Exception as e:
             warn(f"Error loading feed: {e}")
             mark_hostname_issue(
@@ -176,15 +186,20 @@ class Source(AbstractSearchSource):
         }
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
             r = requests.get(
                 url,
                 headers=headers,
-                timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             r.raise_for_status()
             search = BeautifulSoup(r.content, "html.parser")
             results = search.find("h2", class_="entry-title")
 
+        except SearchBudgetExhausted:
+            debug("Search budget spent before the request could start")
+            return releases
         except Exception as e:
             warn(f"Error loading feed: {e}")
             mark_hostname_issue(
@@ -196,14 +211,19 @@ class Source(AbstractSearchSource):
             for result in results:
                 try:
                     result_source = result["href"]
+                    checkpoint()
+                    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                     result_r = requests.get(
                         result_source,
                         headers=headers,
-                        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout=timeout,
                     )
                     result_r.raise_for_status()
                     feed = BeautifulSoup(result_r.content, "html.parser")
                     items = feed.find_all("article")
+                except SearchBudgetExhausted:
+                    debug("Search budget spent; returning partial results")
+                    break
                 except Exception as e:
                     warn(f"Error loading feed: {e}")
                     mark_hostname_issue(

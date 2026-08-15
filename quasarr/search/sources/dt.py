@@ -32,6 +32,11 @@ from quasarr.providers.utils import (
     is_valid_release,
     normalize_magazine_title,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -74,7 +79,9 @@ class Source(AbstractSearchSource):
         headers = {"User-Agent": shared_state.values["user_agent"]}
 
         try:
-            r = requests.get(url, headers=headers, timeout=FEED_REQUEST_TIMEOUT_SECONDS)
+            checkpoint()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
+            r = requests.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             feed = BeautifulSoup(r.content, "html.parser")
 
@@ -154,6 +161,8 @@ class Source(AbstractSearchSource):
                     }
                 )
 
+        except SearchBudgetExhausted:
+            debug("Feed budget spent before the request could start")
         except Exception as e:
             error(f"Error loading feed: {e}")
             mark_hostname_issue(
@@ -227,10 +236,12 @@ class Source(AbstractSearchSource):
             )
             headers = {"User-Agent": shared_state.values["user_agent"]}
 
+            checkpoint()
+            timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
             r = requests.get(
                 url,
                 headers=headers,
-                timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             r.raise_for_status()
             page = BeautifulSoup(r.content, "html.parser")
@@ -315,6 +326,8 @@ class Source(AbstractSearchSource):
                     }
                 )
 
+        except SearchBudgetExhausted:
+            debug("Search budget spent; returning partial results")
         except Exception as e:
             error(f"Error loading search page: {e}")
             mark_hostname_issue(

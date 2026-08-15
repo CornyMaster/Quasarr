@@ -35,6 +35,11 @@ from quasarr.providers.utils import (
     release_matches_search_category,
     search_string_in_sanitized_title,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -76,6 +81,8 @@ class Source(AbstractSearchSource):
                 is_feed=True,
             )
             releases = releases[:20]
+        except SearchBudgetExhausted:
+            pass
         except Exception as e:
             warn(f"Error loading feed: {e}")
             mark_hostname_issue(
@@ -121,6 +128,7 @@ class Source(AbstractSearchSource):
             ):
                 search_string += f" {year}"
 
+        search_session = None
         try:
             release_items = []
             search_session, productions = _load_search_productions(
@@ -129,10 +137,12 @@ class Source(AbstractSearchSource):
                 SEARCH_REQUEST_TIMEOUT_SECONDS,
             )
             if productions:
+                checkpoint()
+                timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                 release_items = _fetch_releases_by_production_ids(
                     shared_state,
                     [production.get("id") for production in productions],
-                    SEARCH_REQUEST_TIMEOUT_SECONDS,
+                    timeout,
                     session=search_session,
                 )
 
@@ -145,6 +155,8 @@ class Source(AbstractSearchSource):
                 season=season,
                 episode=episode,
             )
+        except SearchBudgetExhausted:
+            pass
         except Exception as e:
             warn(f"Error loading search: {e}")
             mark_hostname_issue(
@@ -152,6 +164,9 @@ class Source(AbstractSearchSource):
                 "search",
                 str(e) if "e" in dir() else "Error occurred",
             )
+        finally:
+            if search_session is not None:
+                search_session.close()
 
         elapsed_time = time.time() - start_time
         debug(f"Time taken: {elapsed_time:.2f}s")
@@ -164,37 +179,46 @@ class Source(AbstractSearchSource):
 def _load_feed_release_items(
     shared_state, search_category, max_production_pages, timeout
 ):
-    session = _bootstrap_session(shared_state, timeout)
-    production_ids = []
-    base_search_category = get_base_search_category_id(search_category)
+    checkpoint()
+    request_timeout = clamp_timeout(timeout)
+    session = _bootstrap_session(shared_state, request_timeout)
+    try:
+        production_ids = []
+        base_search_category = get_base_search_category_id(search_category)
 
-    for page in range(1, max_production_pages + 1):
-        payload = _fetch_productions_page(
+        for page in range(1, max_production_pages + 1):
+            checkpoint()
+            request_timeout = clamp_timeout(timeout)
+            payload = _fetch_productions_page(
+                shared_state,
+                page,
+                request_timeout,
+                session=session,
+            )
+            productions = payload.get("productions") or []
+            if not productions:
+                break
+
+            for production in productions:
+                if not _matches_production_category(production, base_search_category):
+                    continue
+                production_id = production.get("id")
+                if production_id:
+                    production_ids.append(production_id)
+
+        if not production_ids:
+            return []
+
+        checkpoint()
+        request_timeout = clamp_timeout(timeout)
+        return _fetch_releases_by_production_ids(
             shared_state,
-            page,
-            timeout,
+            production_ids,
+            request_timeout,
             session=session,
         )
-        productions = payload.get("productions") or []
-        if not productions:
-            break
-
-        for production in productions:
-            if not _matches_production_category(production, base_search_category):
-                continue
-            production_id = production.get("id")
-            if production_id:
-                production_ids.append(production_id)
-
-    if not production_ids:
-        return []
-
-    return _fetch_releases_by_production_ids(
-        shared_state,
-        production_ids,
-        timeout,
-        session=session,
-    )
+    finally:
+        session.close()
 
 
 def _build_search_variants(search_string):
@@ -241,17 +265,23 @@ def _build_search_variants(search_string):
 
 
 def _load_search_productions(shared_state, search_string, timeout):
-    session = _bootstrap_session(shared_state, timeout)
+    checkpoint()
+    request_timeout = clamp_timeout(timeout)
+    session = _bootstrap_session(shared_state, request_timeout)
     productions_by_id = {}
 
     for variant in _build_search_variants(search_string):
         try:
+            checkpoint()
+            request_timeout = clamp_timeout(timeout)
             productions = _search_productions(
                 shared_state,
                 variant,
-                timeout,
+                request_timeout,
                 session=session,
             )
+        except SearchBudgetExhausted:
+            break
         except Exception as e:
             trace(f'RM production search failed for variant "{variant}": {e}')
             continue

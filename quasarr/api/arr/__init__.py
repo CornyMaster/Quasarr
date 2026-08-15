@@ -30,6 +30,7 @@ from quasarr.providers.utils import (
 )
 from quasarr.providers.version import get_version
 from quasarr.search import get_search_results
+from quasarr.search.runtime import search_runtime
 from quasarr.search.sources import get_sources
 from quasarr.storage.categories import get_download_categories, get_search_categories
 
@@ -396,147 +397,174 @@ def setup_arr_routes(app):
                     cache_family_groups = get_search_cache_family_groups(
                         requested_categories
                     )
-
-                    if len(search_categories) > 1:
-                        debug(
-                            "Executing multi-category search request "
-                            f"<g>{requested_cat}</g> as categories "
-                            f"<g>{','.join(str(cat) for cat in search_categories)}</g> "
-                            "with cache groups "
-                            f"<g>{format_search_cache_family_groups(cache_family_groups)}</g>"
-                        )
-
-                    def run_search_for_categories(search_runner):
-                        if not search_categories:
-                            return []
-                        if len(search_categories) == 1:
-                            return search_runner(search_categories[0], offset, limit)
-
-                        # Run each cache-sharing family in sequence to ensure
-                        # lower/less-restrictive categories populate cache first.
-                        # Different families can run independently.
-                        fetch_limit = max(offset + limit, 1000)
-
-                        def run_cache_group(group_categories):
-                            group_results = []
-                            for category_id in group_categories:
-                                group_results.extend(
-                                    search_runner(category_id, 0, fetch_limit)
+                    runtime_before = search_runtime.snapshot()
+                    try:
+                        with search_runtime.request(
+                            category_count=len(search_categories),
+                            family_count=len(cache_family_groups),
+                        ):
+                            if len(search_categories) > 1:
+                                debug(
+                                    "Executing multi-category search request "
+                                    f"<g>{requested_cat}</g> as categories "
+                                    f"<g>{','.join(str(cat) for cat in search_categories)}</g> "
+                                    "with cache groups "
+                                    f"<g>{format_search_cache_family_groups(cache_family_groups)}</g>"
                                 )
-                            return group_results
 
-                        combined_results = []
-                        if len(cache_family_groups) == 1:
-                            combined_results = run_cache_group(search_categories)
-                        else:
-                            group_results = {}
-                            with ThreadPoolExecutor(
-                                max_workers=len(cache_family_groups)
-                            ) as executor:
-                                futures = {
-                                    executor.submit(
-                                        run_cache_group, group_categories
-                                    ): owner
-                                    for owner, group_categories in cache_family_groups
-                                }
-                                for future in as_completed(futures):
-                                    owner = futures[future]
-                                    group_results[owner] = future.result()
+                            def run_search_for_categories(search_runner):
+                                if not search_categories:
+                                    return []
+                                if len(search_categories) == 1:
+                                    return search_runner(
+                                        search_categories[0], offset, limit
+                                    )
 
-                            for owner, _ in cache_family_groups:
-                                combined_results.extend(group_results.get(owner, []))
+                                # Run each cache-sharing family in sequence to ensure
+                                # lower/less-restrictive categories populate cache first.
+                                # Different families can run independently.
+                                fetch_limit = max(offset + limit, 1000)
 
-                        deduped_results, removed_duplicates = _dedupe_releases(
-                            combined_results
-                        )
-                        if removed_duplicates > 0:
-                            debug(
-                                "Removed duplicate releases from multi-category response: "
-                                f"<r>{removed_duplicates}</r> duplicate entries filtered"
-                            )
+                                def run_cache_group(group_categories):
+                                    group_results = []
+                                    for category_id in group_categories:
+                                        group_results.extend(
+                                            search_runner(category_id, 0, fetch_limit)
+                                        )
+                                    return group_results
 
-                        return deduped_results[offset : offset + limit]
+                                combined_results = []
+                                if len(cache_family_groups) == 1:
+                                    combined_results = run_cache_group(
+                                        search_categories
+                                    )
+                                else:
+                                    group_results = {}
+                                    with ThreadPoolExecutor(
+                                        max_workers=len(cache_family_groups)
+                                    ) as executor:
+                                        futures = {
+                                            executor.submit(
+                                                run_cache_group, group_categories
+                                            ): owner
+                                            for owner, group_categories in cache_family_groups
+                                        }
+                                        for future in as_completed(futures):
+                                            owner = futures[future]
+                                            group_results[owner] = future.result()
 
-                    if mode in ["movie", "tvsearch"]:
-                        imdb_id = getattr(request.query, "imdbid", "")
-                        season = getattr(request.query, "season", None)
-                        episode = getattr(request.query, "ep", None)
-                        q = getattr(request.query, "q", None)
-                        supported = False if q else True
+                                    for owner, _ in cache_family_groups:
+                                        combined_results.extend(
+                                            group_results.get(owner, [])
+                                        )
 
-                        if q and mode == "tvsearch" and imdb_id:
-                            try:
-                                episode = int(q)
-                                supported = True
-                            except:
-                                pass
+                                deduped_results, removed_duplicates = _dedupe_releases(
+                                    combined_results
+                                )
+                                if removed_duplicates > 0:
+                                    debug(
+                                        "Removed duplicate releases from multi-category response: "
+                                        f"<r>{removed_duplicates}</r> duplicate entries filtered"
+                                    )
 
-                        if supported:
-                            releases = run_search_for_categories(
-                                lambda category_id, request_offset, request_limit: (
-                                    get_search_results(
-                                        shared_state,
-                                        request_from,
-                                        category_id,
-                                        imdb_id=imdb_id,
-                                        season=season,
-                                        episode=episode,
-                                        offset=request_offset,
-                                        limit=request_limit,
-                                        deadline=request_deadline,
+                                return deduped_results[offset : offset + limit]
+
+                            if mode in ["movie", "tvsearch"]:
+                                imdb_id = getattr(request.query, "imdbid", "")
+                                season = getattr(request.query, "season", None)
+                                episode = getattr(request.query, "ep", None)
+                                q = getattr(request.query, "q", None)
+                                supported = False if q else True
+
+                                if q and mode == "tvsearch" and imdb_id:
+                                    try:
+                                        episode = int(q)
+                                        supported = True
+                                    except:
+                                        pass
+
+                                if supported:
+                                    releases = run_search_for_categories(
+                                        lambda category_id, request_offset, request_limit: (
+                                            get_search_results(
+                                                shared_state,
+                                                request_from,
+                                                category_id,
+                                                imdb_id=imdb_id,
+                                                season=season,
+                                                episode=episode,
+                                                offset=request_offset,
+                                                limit=request_limit,
+                                                deadline=request_deadline,
+                                            )
+                                        )
+                                    )
+                                else:
+                                    # sonarr expects this but we will not support non-imdbid searches
+                                    debug(
+                                        f"Ignoring search request from <d>{request_from}</d> - only imdbid searches are supported"
+                                    )
+
+                            elif mode in ["book", "music"]:
+                                author = getattr(request.query, "author", "")
+                                title = getattr(request.query, "title", "")
+                                search_phrase = " ".join(filter(None, [author, title]))
+                                releases = run_search_for_categories(
+                                    lambda category_id, request_offset, request_limit: (
+                                        get_search_results(
+                                            shared_state,
+                                            request_from,
+                                            category_id,
+                                            search_phrase=search_phrase,
+                                            offset=request_offset,
+                                            limit=request_limit,
+                                            deadline=request_deadline,
+                                        )
                                     )
                                 )
-                            )
-                        else:
-                            # sonarr expects this but we will not support non-imdbid searches
-                            debug(
-                                f"Ignoring search request from <d>{request_from}</d> - only imdbid searches are supported"
-                            )
 
-                    elif mode in ["book", "music"]:
-                        author = getattr(request.query, "author", "")
-                        title = getattr(request.query, "title", "")
-                        search_phrase = " ".join(filter(None, [author, title]))
-                        releases = run_search_for_categories(
-                            lambda category_id, request_offset, request_limit: (
-                                get_search_results(
-                                    shared_state,
-                                    request_from,
-                                    category_id,
-                                    search_phrase=search_phrase,
-                                    offset=request_offset,
-                                    limit=request_limit,
-                                    deadline=request_deadline,
-                                )
-                            )
-                        )
-
-                    elif mode == "search":
-                        if extract_client_type(request_from) in [
-                            "magazarr",
-                            "lidarr",
-                        ]:
-                            search_phrase = getattr(request.query, "q", "")
-                            releases = run_search_for_categories(
-                                lambda category_id, request_offset, request_limit: (
-                                    get_search_results(
-                                        shared_state,
-                                        request_from,
-                                        category_id,
-                                        search_phrase=search_phrase,
-                                        offset=request_offset,
-                                        limit=request_limit,
-                                        deadline=request_deadline,
+                            elif mode == "search":
+                                if extract_client_type(request_from) in [
+                                    "magazarr",
+                                    "lidarr",
+                                ]:
+                                    search_phrase = getattr(request.query, "q", "")
+                                    releases = run_search_for_categories(
+                                        lambda category_id, request_offset, request_limit: (
+                                            get_search_results(
+                                                shared_state,
+                                                request_from,
+                                                category_id,
+                                                search_phrase=search_phrase,
+                                                offset=request_offset,
+                                                limit=request_limit,
+                                                deadline=request_deadline,
+                                            )
+                                        )
                                     )
-                                )
-                            )
-                        else:
-                            debug(
-                                f"Unsupported search mode '{mode}' from <d>{request_from}</d>"
-                            )
+                                else:
+                                    debug(
+                                        f"Unsupported search mode '{mode}' from <d>{request_from}</d>"
+                                    )
 
-                    else:
-                        warn(f"Unknown search mode '{mode}' from <d>{request_from}</d>")
+                            else:
+                                warn(
+                                    f"Unknown search mode '{mode}' from <d>{request_from}</d>"
+                                )
+                    finally:
+                        runtime_after = search_runtime.snapshot()
+                        memory_fields = ("rss_kib", "pss_kib", "threads")
+                        runtime_summary = {
+                            "delta": {
+                                key: runtime_after[key] - runtime_before[key]
+                                for key in runtime_after
+                                if key not in memory_fields
+                            },
+                            "memory": {
+                                key: runtime_after[key] for key in memory_fields
+                            },
+                        }
+                        debug(f"Search runtime summary: {runtime_summary}")
 
                     # XML Generation (releases are already sliced)
                     items = ""

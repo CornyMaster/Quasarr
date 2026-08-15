@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from quasarr.constants import SEARCH_CAT_MOVIES, SEARCH_CAT_SHOWS
 from quasarr.downloads.sources.mx import Source as DownloadSource
+from quasarr.search.sources.helpers.budget import checkpoint, use_search_budget
 from quasarr.search.sources.mx import (
     FeedBudgetSpent,
     _normalize_quality,
@@ -49,6 +50,14 @@ class FakeResponse:
 
     def json(self):
         return self._json
+
+
+class ManualClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 # A wrong first entry (imdb_id None) must be skipped in favour of the IMDb match.
@@ -283,6 +292,60 @@ class MxSearchTests(unittest.TestCase):
 
 
 class MxFeedTests(unittest.TestCase):
+    def test_get_uses_the_stricter_feed_and_worker_budget(self):
+        response = FakeResponse({"results": []})
+        with (
+            patch(
+                "quasarr.search.sources.mx.requests.get", return_value=response
+            ) as get,
+            use_search_budget(0.25, clock=ManualClock()),
+        ):
+            SearchSource()._get(
+                "https://api.source.invalid/api",
+                "source.invalid",
+                "/search",
+                {},
+                make_shared_state(),
+                lambda: 5.0,
+            )
+
+        self.assertEqual(0.25, get.call_args.kwargs["timeout"])
+
+    def test_worker_budget_spent_mid_seed_keeps_the_unfinished_seed(self):
+        shared_state = make_shared_state(radarr=True)
+        source = SearchSource()
+        clock = ManualClock()
+        queried = []
+
+        def fake_lookup(_self, _api_base, _host, imdb_id, *args, **kwargs):
+            queried.append(imdb_id)
+            if imdb_id == "tt0000002":
+                clock.now = 10.0
+                checkpoint()
+            return []
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(SearchSource, "_releases_for_imdb", fake_lookup)
+            )
+            stack.enter_context(
+                patch(
+                    "quasarr.search.sources.mx.radarr_api.get_wanted_imdb_ids",
+                    wanted_returning(["tt0000001", "tt0000002", "tt0000003"]),
+                )
+            )
+            marked = stack.enter_context(
+                patch("quasarr.search.sources.mx.mark_hostname_issue")
+            )
+            stack.enter_context(patch("quasarr.search.sources.mx.clear_hostname_issue"))
+            stack.enter_context(use_search_budget(10.0, clock=clock))
+            releases = source.feed(shared_state, time.time(), SEARCH_CAT_MOVIES)
+
+        self.assertEqual([], releases)
+        self.assertEqual(["tt0000001", "tt0000002"], queried)
+        self.assertEqual(1, source._feed_offsets[SEARCH_CAT_MOVIES])
+        marked.assert_not_called()
+
     def test_movie_feed_seeds_from_radarr_wanted(self):
         ss = make_shared_state(radarr=True)
         with ExitStack() as stack:

@@ -34,6 +34,11 @@ from quasarr.providers.utils import (
     sanitize_string,
 )
 from quasarr.providers.xem_metadata import get_season_name
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -68,13 +73,17 @@ class Source(AbstractSearchSource):
             return releases
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
             r = fetch_via_requests_session(
                 shared_state,
                 method="GET",
                 target_url=f"https://www.{host}/",
-                timeout=FEED_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             r.raise_for_status()
+        except SearchBudgetExhausted:
+            return releases
         except Exception as e:
             error(f"Could not fetch feed: {e}")
             mark_hostname_issue(
@@ -240,21 +249,25 @@ class Source(AbstractSearchSource):
             if variant is None:
                 continue
 
-            encoded_search_string = quote_plus(variant)
-            year = None
-            if imdb_id is not None and variant == search_string:
-                year = get_year(imdb_id)
-
             try:
+                checkpoint()
+                encoded_search_string = quote_plus(variant)
+                year = None
+                if imdb_id is not None and variant == search_string:
+                    year = get_year(imdb_id)
+
                 url = f"https://www.{host}/search?q={encoded_search_string}"
+                timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                 r = fetch_via_requests_session(
                     shared_state,
                     method="GET",
                     target_url=url,
-                    timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                    timeout=timeout,
                     year=year,
                 )
                 r.raise_for_status()
+            except SearchBudgetExhausted:
+                break
             except Exception as e:
                 info(f"Search load error: {e}")
                 mark_hostname_issue(
@@ -322,6 +335,7 @@ class Source(AbstractSearchSource):
 
         for result in results:
             try:
+                checkpoint()
                 url = result["url"]
                 title = result.get("title") or ""
                 trace(
@@ -343,11 +357,12 @@ class Source(AbstractSearchSource):
                     data_html = entry["html"]
                 else:
                     entry = {"timestamp": datetime.now()}
+                    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                     data_html = fetch_via_requests_session(
                         shared_state,
                         method="GET",
                         target_url=url,
-                        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout=timeout,
                     ).text
 
                 entry["html"] = data_html
@@ -463,6 +478,8 @@ class Source(AbstractSearchSource):
                         }
                     )
 
+            except SearchBudgetExhausted:
+                break
             except Exception as e:
                 info(f"Error parsing search item: {e}")
                 mark_hostname_issue(

@@ -8,6 +8,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from urllib.parse import quote_plus
 
 import requests
@@ -35,6 +36,11 @@ from quasarr.providers.utils import (
     is_imdb_id,
     is_valid_release,
     normalize_magazine_title,
+)
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
 )
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
@@ -80,15 +86,19 @@ class Source(AbstractSearchSource):
         url = f"https://{sl}/{feed_type}/feed/"
         headers = {"User-Agent": shared_state.values["user_agent"]}
 
+        created_session = None
+        session = None
         try:
-            session = requests.Session()
+            checkpoint()
+            created_session = requests.Session()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
             session, headers, r = ensure_session_cf_bypassed(
                 info,
                 shared_state,
-                session,
+                created_session,
                 url,
                 headers,
-                timeout=FEED_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             if not r:
                 raise requests.RequestException("Cloudflare bypass failed")
@@ -158,11 +168,18 @@ class Source(AbstractSearchSource):
                     )
                     continue
 
+        except SearchBudgetExhausted:
+            pass
         except Exception as e:
             warn(f"Error loading feed: {e}")
             mark_hostname_issue(
                 self.initials, "feed", str(e) if "e" in dir() else "Error occurred"
             )
+        finally:
+            if created_session is not None:
+                created_session.close()
+            if session is not None and session is not created_session:
+                session.close()
 
         elapsed = time.time() - start_time
         debug(f"Time taken: {elapsed:.2f}s")
@@ -228,21 +245,27 @@ class Source(AbstractSearchSource):
 
             # Fetch pages in parallel (so we don't double the slow site latency)
             def fetch(url):
+                created_session = None
+                session = None
                 try:
+                    checkpoint()
                     debug(f"Fetching {url}")
-                    session = requests.Session()
+                    created_session = requests.Session()
+                    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                     session, _, r = ensure_session_cf_bypassed(
                         info,
                         shared_state,
-                        session,
+                        created_session,
                         url,
                         headers,
-                        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout=timeout,
                     )
                     if not r:
                         raise requests.RequestException("Cloudflare bypass failed")
                     r.raise_for_status()
                     return r.text
+                except SearchBudgetExhausted:
+                    raise
                 except Exception as e:
                     info(f"Error fetching url {url}: {e}")
                     mark_hostname_issue(
@@ -251,13 +274,27 @@ class Source(AbstractSearchSource):
                         str(e) if "e" in dir() else "Error occurred",
                     )
                     return ""
+                finally:
+                    if created_session is not None:
+                        created_session.close()
+                    if session is not None and session is not created_session:
+                        session.close()
 
             html_texts = []
             with ThreadPoolExecutor(max_workers=len(urls)) as tpe:
-                futures = {tpe.submit(fetch, u): u for u in urls}
+                futures = {}
+                for url in urls:
+                    try:
+                        checkpoint()
+                    except SearchBudgetExhausted:
+                        break
+                    context = copy_context()
+                    futures[tpe.submit(context.run, fetch, url)] = url
                 for future in as_completed(futures):
                     try:
                         html_texts.append(future.result())
+                    except SearchBudgetExhausted:
+                        break
                     except Exception as e:
                         warn(f"Error fetching search page: {e}")
                         mark_hostname_issue(
@@ -355,6 +392,8 @@ class Source(AbstractSearchSource):
                     )
                     continue
 
+        except SearchBudgetExhausted:
+            pass
         except Exception as e:
             warn(f"Error loading search page: {e}")
             mark_hostname_issue(

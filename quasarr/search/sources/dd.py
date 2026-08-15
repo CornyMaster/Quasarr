@@ -28,6 +28,11 @@ from quasarr.providers.utils import (
     is_imdb_id,
     is_valid_release,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -63,7 +68,10 @@ class Source(AbstractSearchSource):
         password = dd
 
         try:
+            checkpoint()
             dd_session = retrieve_and_validate_session(shared_state)
+        except SearchBudgetExhausted:
+            return releases
         except Exception as e:
             mark_hostname_issue(self.initials, "search", str(e))
             return releases
@@ -98,10 +106,10 @@ class Source(AbstractSearchSource):
 
         if not search_string:
             search_type = "feed"
-            timeout = FEED_REQUEST_TIMEOUT_SECONDS
+            timeout_default = FEED_REQUEST_TIMEOUT_SECONDS
         else:
             search_type = "search"
-            timeout = SEARCH_REQUEST_TIMEOUT_SECONDS
+            timeout_default = SEARCH_REQUEST_TIMEOUT_SECONDS
 
         qualities = [
             "disk-480p",
@@ -125,8 +133,10 @@ class Source(AbstractSearchSource):
             max_offset = 2000 if episode_date else 100
             for query in search_strings:
                 for page in range(0, max_offset, 20):
+                    checkpoint()
                     url = f"https://{dd}/index/search/keyword/{query}/qualities/{','.join(qualities)}/from/{page}/search"
 
+                    timeout = clamp_timeout(timeout_default)
                     r = dd_session.get(url, headers=headers, timeout=timeout)
                     r.raise_for_status()
                     releases_on_page = r.json()
@@ -151,7 +161,14 @@ class Source(AbstractSearchSource):
                         debug(
                             f"Release {release.get('release')} marked as fake. Invalidating session..."
                         )
-                        create_and_persist_session(shared_state)
+                        try:
+                            checkpoint()
+                            create_and_persist_session(shared_state)
+                        except SearchBudgetExhausted:
+                            # No time left to log back in - but a response that
+                            # serves fakes is still not an answer, so nothing
+                            # collected from it may be handed back.
+                            pass
                         return []
                     else:
                         title = release.get("release")
@@ -202,6 +219,8 @@ class Source(AbstractSearchSource):
                                 "type": "protected",
                             }
                         )
+                except SearchBudgetExhausted:
+                    raise
                 except Exception as e:
                     warn(f"Error parsing feed: {e}")
                     mark_hostname_issue(
@@ -211,6 +230,8 @@ class Source(AbstractSearchSource):
                     )
                     continue
 
+        except SearchBudgetExhausted:
+            pass
         except Exception as e:
             error(f"Error loading feed: {e}")
             mark_hostname_issue(

@@ -34,6 +34,11 @@ from quasarr.providers.utils import (
     is_valid_release,
     normalize_magazine_title,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -75,7 +80,9 @@ class Source(AbstractSearchSource):
         url = f"{base_url}/{feed_type}"
         headers = {"User-Agent": shared_state.values["user_agent"]}
         try:
-            r = requests.get(url, headers=headers, timeout=FEED_REQUEST_TIMEOUT_SECONDS)
+            checkpoint()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
+            r = requests.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             soup = BeautifulSoup(r.content, "html.parser")
             releases = self._parse_posts(
@@ -85,6 +92,9 @@ class Source(AbstractSearchSource):
                 password,
                 search_category=search_category,
             )
+        except SearchBudgetExhausted:
+            debug("Feed budget spent before the request could start")
+            releases = []
         except Exception as e:
             error(f"Error loading feed: {e}")
             mark_hostname_issue(
@@ -140,10 +150,12 @@ class Source(AbstractSearchSource):
                     if url in visited:
                         continue
                     visited.add(url)
+                    checkpoint()
+                    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                     r = requests.get(
                         url,
                         headers=headers,
-                        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout=timeout,
                     )
                     r.raise_for_status()
                     soup = BeautifulSoup(r.content, "html.parser")
@@ -178,6 +190,8 @@ class Source(AbstractSearchSource):
                             continue
                         if page_url not in visited and page_url not in pending:
                             pending.append(page_url)
+        except SearchBudgetExhausted:
+            debug("Search budget spent; returning partial results")
         except Exception as e:
             error(f"Error loading search: {e}")
             mark_hostname_issue(

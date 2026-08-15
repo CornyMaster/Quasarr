@@ -1,10 +1,13 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import requests
 
-from quasarr.downloads.sources.al import Source
+from quasarr.constants import SEARCH_CAT_MOVIES
+from quasarr.downloads.sources.al import Source as DownloadSource
 from quasarr.providers.sessions import al as al_sessions
+from quasarr.search.sources.al import Source as SearchSource
+from quasarr.search.sources.helpers.budget import use_search_budget
 
 
 class SharedState:
@@ -35,6 +38,14 @@ class Stats:
 
     def increment_failed_decryptions_automatic(self):
         pass
+
+
+class ManualClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 class AlFlareSolverrSessionTests(unittest.TestCase):
@@ -83,6 +94,47 @@ class AlFlareSolverrSessionTests(unittest.TestCase):
             {"X-Requested-With": "XMLHttpRequest"},
             post.call_args.kwargs["json"]["headers"],
         )
+
+    def test_al_search_feed_clamps_the_session_request_to_the_worker_budget(self):
+        shared_state = SharedState()
+        shared_state.values["user_agent"] = "UnitTestAgent/1.0"
+        response = MagicMock(content=b"<html></html>")
+
+        with (
+            patch(
+                "quasarr.search.sources.al.fetch_via_requests_session",
+                return_value=response,
+            ) as fetch,
+            patch("quasarr.search.sources.al.clear_hostname_issue"),
+            patch("quasarr.search.sources.al.mark_hostname_issue"),
+            patch("quasarr.search.sources.al.invalidate_session"),
+            use_search_budget(0.5, clock=ManualClock()),
+        ):
+            SearchSource().feed(shared_state, 0.0, SEARCH_CAT_MOVIES)
+
+        self.assertEqual(0.5, fetch.call_args.kwargs["timeout"])
+
+    def test_al_search_feed_starts_no_session_request_after_exhaustion(self):
+        shared_state = SharedState()
+        shared_state.values["user_agent"] = "UnitTestAgent/1.0"
+        response = MagicMock(content=b"<html></html>")
+
+        with (
+            patch(
+                "quasarr.search.sources.al.fetch_via_requests_session",
+                return_value=response,
+            ) as fetch,
+            patch("quasarr.search.sources.al.clear_hostname_issue"),
+            patch("quasarr.search.sources.al.mark_hostname_issue") as marked,
+            patch("quasarr.search.sources.al.invalidate_session") as invalidated,
+            use_search_budget(1.0, clock=ManualClock(1.0)),
+        ):
+            releases = SearchSource().feed(shared_state, 0.0, SEARCH_CAT_MOVIES)
+
+        self.assertEqual([], releases)
+        fetch.assert_not_called()
+        marked.assert_not_called()
+        invalidated.assert_not_called()
 
     def test_al_download_reuses_flaresolverr_session_and_ajax_headers_for_captcha_flow(
         self,
@@ -164,7 +216,7 @@ class AlFlareSolverrSessionTests(unittest.TestCase):
             ),
             patch("quasarr.downloads.sources.al.StatsHelper", return_value=Stats()),
         ):
-            result = Source().get_download_links(
+            result = DownloadSource().get_download_links(
                 shared_state,
                 "https://www.source.invalid/media/example",
                 [],

@@ -28,6 +28,11 @@ from quasarr.providers.utils import (
     is_imdb_id,
     is_valid_release,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -59,10 +64,12 @@ class Source(AbstractSearchSource):
         }
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
             r = requests.get(
                 rss_url,
                 headers=headers,
-                timeout=FEED_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             r.raise_for_status()
 
@@ -147,6 +154,9 @@ class Source(AbstractSearchSource):
                     debug(f"Error parsing RSS entry: {e}")
                     continue
 
+        except SearchBudgetExhausted:
+            debug("Feed budget spent before the request could start")
+            return releases
         except Exception as e:
             error(f"Error loading feed: {e}")
             mark_hostname_issue(
@@ -227,11 +237,13 @@ class Source(AbstractSearchSource):
         trace(f"Searching: '{search_string}'")
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
             r = requests.get(
                 api_url,
                 headers=headers,
                 params=params,
-                timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             r.raise_for_status()
 
@@ -253,6 +265,7 @@ class Source(AbstractSearchSource):
 
             for item in items:
                 try:
+                    checkpoint()
                     uid = item.get("uid")
                     if not uid:
                         debug("Item has no UID, skipping")
@@ -261,10 +274,12 @@ class Source(AbstractSearchSource):
                     trace(f"Fetching details for UID: {uid}")
 
                     detail_url = f"https://api.{host}/start/d/{uid}"
+                    checkpoint()
+                    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                     detail_r = requests.get(
                         detail_url,
                         headers=headers,
-                        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout=timeout,
                     )
                     detail_r.raise_for_status()
 
@@ -426,6 +441,9 @@ class Source(AbstractSearchSource):
                     else:
                         debug(f"No releases array found for {uid}")
 
+                except SearchBudgetExhausted:
+                    debug("Search budget spent; returning partial results")
+                    break
                 except Exception as e:
                     debug(f"Error processing item: {e}")
                     debug(f"{traceback.format_exc()}")
@@ -433,6 +451,9 @@ class Source(AbstractSearchSource):
 
             trace(f"Returning {len(releases)} total releases (deduplicated)")
 
+        except SearchBudgetExhausted:
+            debug("Search budget spent before the request could start")
+            return releases
         except Exception as e:
             error(f"Error in search: {e}")
             mark_hostname_issue(

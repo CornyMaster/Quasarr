@@ -27,6 +27,11 @@ from quasarr.providers.utils import (
     is_imdb_id,
     is_valid_release,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -62,7 +67,9 @@ class Source(AbstractSearchSource):
         }
 
         try:
-            r = requests.get(url, headers=headers, timeout=FEED_REQUEST_TIMEOUT_SECONDS)
+            checkpoint()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
+            r = requests.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             feed = BeautifulSoup(r.content, "html.parser")
             articles = feed.find_all("h4")
@@ -119,6 +126,8 @@ class Source(AbstractSearchSource):
                     }
                 )
 
+        except SearchBudgetExhausted:
+            debug("Feed budget spent before the request could start")
         except Exception as e:
             warn(f"Error loading feed: {e}")
             mark_hostname_issue(
@@ -161,15 +170,20 @@ class Source(AbstractSearchSource):
         }
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
             r = requests.get(
                 url,
                 headers=headers,
-                timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             r.raise_for_status()
             search = BeautifulSoup(r.content, "html.parser")
             results = search.find_all("h4")
 
+        except SearchBudgetExhausted:
+            debug("Search budget spent before the request could start")
+            return releases
         except Exception as e:
             warn(f"Error loading search feed: {e}")
             mark_hostname_issue(

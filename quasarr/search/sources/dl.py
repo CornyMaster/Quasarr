@@ -42,6 +42,11 @@ from quasarr.providers.utils import (
     is_valid_release,
     replace_umlauts,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -89,6 +94,7 @@ class Source(AbstractSearchSource):
             return releases
 
         try:
+            checkpoint()
             sess = retrieve_and_validate_session(shared_state)
             if not sess:
                 warn(f"Could not retrieve valid session for {host}")
@@ -97,7 +103,9 @@ class Source(AbstractSearchSource):
             forum_url = (
                 f"https://www.{host}/forums/{forum}/?order=post_date&direction=desc"
             )
-            r = sess.get(forum_url, timeout=FEED_REQUEST_TIMEOUT_SECONDS)
+            checkpoint()
+            timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
+            r = sess.get(forum_url, timeout=timeout)
             r.raise_for_status()
 
             soup = BeautifulSoup(r.content, "html.parser")
@@ -170,6 +178,8 @@ class Source(AbstractSearchSource):
                     debug(f"error parsing Forum item: {e}")
                     continue
 
+        except SearchBudgetExhausted:
+            pass
         except Exception as e:
             warn(f"Forum feed error: {e}")
             mark_hostname_issue(
@@ -208,6 +218,8 @@ class Source(AbstractSearchSource):
         query_string = replace_umlauts(query_string)
 
         try:
+            checkpoint()
+            timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
             if page_num == 1:
                 search_params = {"keywords": query_string, "c[title_only]": 1}
                 search_url = f"https://www.{host}/search/search"
@@ -223,7 +235,7 @@ class Source(AbstractSearchSource):
                 method="GET",
                 target_url=search_url,
                 get_params=search_params,
-                timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
 
             if search_response.status_code != 200:
@@ -386,11 +398,15 @@ class Source(AbstractSearchSource):
                         }
                     )
 
+                except SearchBudgetExhausted:
+                    raise
                 except Exception as e:
                     debug(f"[Page {page_num}] error parsing item: {e}")
 
             return page_releases, extracted_search_id, raw_page_signature
 
+        except SearchBudgetExhausted:
+            raise
         except Exception as e:
             warn(f"[Page {page_num}] error: {e}")
             mark_hostname_issue(
@@ -450,6 +466,7 @@ class Source(AbstractSearchSource):
         )
 
         try:
+            checkpoint()
             sess = retrieve_and_validate_session(shared_state)
             if not sess:
                 warn(f"Could not retrieve valid session for {host}")
@@ -459,12 +476,20 @@ class Source(AbstractSearchSource):
             seen_release_titles = set()
 
             for current_search_string in search_strings:
+                try:
+                    checkpoint()
+                except SearchBudgetExhausted:
+                    break
                 search_id = None
                 page_num = 0
                 seen_page_signatures = set()
 
                 # Sequential search through pages until timeout or mode-specific stop
                 while (time.time() - search_start_time) < max_search_duration:
+                    try:
+                        checkpoint()
+                    except SearchBudgetExhausted:
+                        break
                     page_num += 1
 
                     (
@@ -537,6 +562,8 @@ class Source(AbstractSearchSource):
                             "continuing date pagination"
                         )
 
+        except SearchBudgetExhausted:
+            pass
         except Exception as e:
             info(f"search error: {e}")
             mark_hostname_issue(
@@ -707,6 +734,10 @@ def _expand_jahresthema_thread_releases(
             page_responses[1] = first_page
 
         for page_num in range(start_page, last_page + 1):
+            try:
+                checkpoint()
+            except SearchBudgetExhausted:
+                break
             response = page_responses.get(page_num)
             page_url = _thread_page_url(thread_url, page_num)
             if response is None:
@@ -735,6 +766,8 @@ def _expand_jahresthema_thread_releases(
                 seen.add(dedupe_key)
                 releases.append(release)
 
+    except SearchBudgetExhausted:
+        pass
     except Exception as e:
         debug(f"error expanding Jahresthema thread {thread_url}: {e}")
 
@@ -744,11 +777,13 @@ def _expand_jahresthema_thread_releases(
 
 
 def _fetch_thread_page(shared_state, page_url):
+    checkpoint()
+    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
     response = fetch_via_requests_session(
         shared_state,
         method="GET",
         target_url=page_url,
-        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     if response.status_code != 200:
         debug(f"Jahresthema page returned status {response.status_code}: {page_url}")
@@ -775,6 +810,7 @@ def _date_release_from_thread(
     page_numbers = list(dict.fromkeys(page_numbers))
 
     for page_num in page_numbers:
+        checkpoint()
         page_url = (
             thread_url
             if page_num == 1

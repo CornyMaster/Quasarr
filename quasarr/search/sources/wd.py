@@ -37,6 +37,11 @@ from quasarr.providers.utils import (
     is_valid_release,
     normalize_magazine_title,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    checkpoint,
+    clamp_timeout,
+)
 from quasarr.search.sources.helpers.search_release import SearchRelease
 from quasarr.search.sources.helpers.search_source import AbstractSearchSource
 
@@ -81,9 +86,9 @@ class Source(AbstractSearchSource):
         try:
             # Try normal request first
             try:
-                r = requests.get(
-                    url, headers=headers, timeout=FEED_REQUEST_TIMEOUT_SECONDS
-                )
+                checkpoint()
+                timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
+                r = requests.get(url, headers=headers, timeout=timeout)
             except requests.RequestException:
                 r = None
 
@@ -91,10 +96,12 @@ class Source(AbstractSearchSource):
             if r is None or r.status_code == 403 or is_cloudflare_challenge(r.text):
                 if is_flaresolverr_available(shared_state):
                     debug("Encountered Cloudflare on feed. Trying FlareSolverr...")
+                    checkpoint()
+                    timeout = clamp_timeout(FEED_REQUEST_TIMEOUT_SECONDS)
                     r = flaresolverr_get(
                         shared_state,
                         url,
-                        timeout=FEED_REQUEST_TIMEOUT_SECONDS,
+                        timeout=timeout,
                     )
                 elif r is None:
                     raise requests.RequestException(
@@ -114,6 +121,8 @@ class Source(AbstractSearchSource):
             r.raise_for_status()
             soup = BeautifulSoup(r.content, "html.parser")
             releases = self._parse_rows(soup, shared_state, wd, password)
+        except SearchBudgetExhausted:
+            releases = []
         except Exception as e:
             error(f"Error loading feed: {e}")
             mark_hostname_issue(
@@ -166,9 +175,9 @@ class Source(AbstractSearchSource):
         try:
             # Try normal request first
             try:
-                r = requests.get(
-                    url, headers=headers, timeout=SEARCH_REQUEST_TIMEOUT_SECONDS
-                )
+                checkpoint()
+                timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
+                r = requests.get(url, headers=headers, timeout=timeout)
             except requests.RequestException:
                 r = None
 
@@ -176,10 +185,12 @@ class Source(AbstractSearchSource):
             if r is None or r.status_code == 403 or is_cloudflare_challenge(r.text):
                 if is_flaresolverr_available(shared_state):
                     debug("Encountered Cloudflare on search. Trying FlareSolverr...")
+                    checkpoint()
+                    timeout = clamp_timeout(SEARCH_REQUEST_TIMEOUT_SECONDS)
                     r = flaresolverr_get(
                         shared_state,
                         url,
-                        timeout=SEARCH_REQUEST_TIMEOUT_SECONDS,
+                        timeout=timeout,
                     )
                 elif r is None:
                     raise requests.RequestException(
@@ -210,6 +221,8 @@ class Source(AbstractSearchSource):
                 episode_date=episode_date,
                 imdb_id=imdb_id,
             )
+        except SearchBudgetExhausted:
+            releases = []
         except Exception as e:
             error(f"Error loading search: {e}")
             mark_hostname_issue(

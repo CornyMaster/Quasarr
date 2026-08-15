@@ -13,7 +13,18 @@ from quasarr.providers.cloudflare import (
     _clear_cloudflare_gate_cache,
 )
 from quasarr.search.sources.ff import Source as FfSearchSource
+from quasarr.search.sources.helpers.budget import use_search_budget
 from quasarr.search.sources.sf import Source as SfSearchSource
+
+
+class ManualClock:
+    """Wall clock a test moves by hand, so no budget test needs to sleep."""
+
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 class FakeResponse:
@@ -227,6 +238,86 @@ class FfSourceTests(unittest.TestCase):
 
         self.assertEqual([feed_url], requested_urls)
         self.assertEqual([], result)
+
+    def test_feed_keeps_collected_releases_when_the_search_budget_expires(self):
+        # The search budget can expire between a date's checkpoint and the
+        # clamped timeout of its request. Letting SearchBudgetExhausted escape
+        # there throws away every release the earlier dates already collected.
+        host = "host-ff.invalid"
+        feed_url = f"https://{host}/updates/2026-06-24#list"
+        movie_url = f"https://{host}/example-movie"
+        api_url = f"https://{host}/api/v1/token123?filter="
+        requested_urls = []
+        budget_clock = ManualClock()
+        cross_referenced = False
+
+        feed_html = """
+        <div class="sra">
+          <span class="lsf-icon timed">10:15</span>
+          <a href="/example-movie"></a>
+          <h2>Example Movie<i>(2026)</i><span>
+            <a href="/example-movie/Example.Movie.2026.1080p.WEB-GROUP">
+              Example.Movie.2026.1080p.WEB-GROUP
+            </a>
+          </span></h2>
+        </div>
+        """
+        movie_html = """
+        <a href="https://www.imdb.com/title/tt1234567/">IMDB</a>
+        <script>initMovie('token123', '', '', '', '', '');</script>
+        """
+        api_html = """
+        <div class="entry">
+          <span class="morespec">Example.Movie.2026.1080p.WEB-GROUP</span>
+          <span class="audiotag"><small>Größe:</small> 1.5 GB</span>
+        </div>
+        """
+
+        def fake_get(url, headers=None, timeout=None):
+            nonlocal cross_referenced
+            requested_urls.append(url)
+            if url == feed_url:
+                return FakeResponse(url, text=feed_html)
+            if url == movie_url:
+                return FakeResponse(url, text=movie_html)
+            if url == api_url:
+                cross_referenced = True
+                return FakeResponse(url, json_data={"html": api_html})
+            raise AssertionError(f"Unexpected URL requested: {url}")
+
+        def feed_clock():
+            # FF's own feed clock. Reading it is all that happens between the
+            # next date's checkpoint and its clamped timeout, so spending the
+            # budget here lands in exactly that window.
+            if cross_referenced:
+                budget_clock.now = 10.0
+            return 0.0
+
+        with (
+            patch("quasarr.search.sources.ff.requests.get", side_effect=fake_get),
+            patch(
+                "quasarr.search.sources.ff.generate_download_link",
+                side_effect=lambda *args: f"download://{args[1]}",
+            ),
+            patch("quasarr.search.sources.ff.clear_hostname_issue"),
+            patch("quasarr.search.sources.ff.mark_hostname_issue") as marked,
+            patch("quasarr.search.sources.ff.time.time", side_effect=feed_clock),
+            patch("quasarr.search.sources.ff.datetime") as fake_datetime,
+            use_search_budget(10.0, clock=budget_clock),
+        ):
+            fake_datetime.now.return_value = __import__("datetime").datetime(
+                2026, 6, 24, 12, 0, 0
+            )
+            fake_datetime.strptime = __import__("datetime").datetime.strptime
+            result = FfSearchSource().feed(_build_shared_state({"ff": host}), 0.0, 2000)
+
+        self.assertEqual([feed_url, movie_url, api_url], requested_urls)
+        self.assertEqual(1, len(result))
+        self.assertEqual(
+            "Example.Movie.2026.1080p.WEB-GROUP", result[0]["details"]["title"]
+        )
+        # A spent budget is not the host's fault, so it must not be recorded as one.
+        marked.assert_not_called()
 
     def test_download_resolves_external_without_requesting_final_destination(self):
         host = "host-ff.invalid"

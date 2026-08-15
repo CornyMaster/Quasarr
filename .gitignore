@@ -1,6 +1,9 @@
 # Project by https://github.com/rix1337
 
 .claude/
+.superpowers/
+docs/superpowers/
+.worktrees/
 
 # Python
 *.pyc

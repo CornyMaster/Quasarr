@@ -9,6 +9,10 @@ from quasarr.providers.cloudflare import (
     LazyFlareSolverrSession,
     _clear_cloudflare_gate_cache,
 )
+from quasarr.search.sources.helpers.budget import (
+    SearchBudgetExhausted,
+    use_search_budget,
+)
 
 
 class FakeResponse:
@@ -23,6 +27,14 @@ def _build_shared_state():
     shared_state = MagicMock()
     shared_state.values = {"user_agent": "UnitTestAgent/1.0"}
     return shared_state
+
+
+class ManualClock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
 
 
 class CloudflareGateCacheTests(unittest.TestCase):
@@ -226,6 +238,97 @@ class CloudflareGateCacheTests(unittest.TestCase):
                 session.close()
 
         self.assertEqual(30, flaresolverr_get.call_args.kwargs["timeout"])
+
+    def test_solver_timeout_is_clamped_to_the_worker_budget(self):
+        url = "https://worker-budget-source.invalid/page"
+        plain_get = MagicMock(return_value=FakeResponse(url, status_code=403))
+
+        with (
+            patch(
+                "quasarr.providers.cloudflare.is_flaresolverr_available",
+                return_value=True,
+            ),
+            patch(
+                "quasarr.providers.cloudflare.flaresolverr_create_session",
+                return_value="worker-budget-session",
+            ),
+            patch(
+                "quasarr.providers.cloudflare.flaresolverr_get",
+                return_value=FakeResponse(url, text="<html>solved</html>"),
+            ) as flaresolverr_get,
+            patch("quasarr.providers.cloudflare.flaresolverr_destroy_session"),
+            use_search_budget(5.0, clock=ManualClock()),
+        ):
+            session = LazyFlareSolverrSession(_build_shared_state())
+            try:
+                session.get(
+                    url,
+                    {"User-Agent": "UnitTestAgent/1.0"},
+                    10,
+                    plain_get,
+                )
+            finally:
+                session.close()
+
+        self.assertEqual(5.0, flaresolverr_get.call_args.kwargs["timeout"])
+
+    def test_browser_is_not_created_after_plain_request_spends_the_budget(self):
+        url = "https://late-browser-source.invalid/page"
+        clock = ManualClock()
+
+        def spend_budget(_url, headers=None, timeout=None):
+            clock.now = 10.0
+            return FakeResponse(url, status_code=403)
+
+        with (
+            patch(
+                "quasarr.providers.cloudflare.is_flaresolverr_available",
+                return_value=True,
+            ),
+            patch(
+                "quasarr.providers.cloudflare.flaresolverr_create_session",
+                return_value="too-late-session",
+            ) as create_session,
+            patch(
+                "quasarr.providers.cloudflare.flaresolverr_get",
+                return_value=FakeResponse(url, text="<html>solved</html>"),
+            ),
+            patch(
+                "quasarr.providers.cloudflare.flaresolverr_destroy_session"
+            ) as destroy_session,
+            use_search_budget(10.0, clock=clock),
+        ):
+            session = LazyFlareSolverrSession(_build_shared_state())
+            try:
+                with self.assertRaises(SearchBudgetExhausted):
+                    session.get(
+                        url,
+                        {"User-Agent": "UnitTestAgent/1.0"},
+                        10,
+                        spend_budget,
+                    )
+            finally:
+                session.close()
+
+        create_session.assert_not_called()
+        destroy_session.assert_not_called()
+
+    def test_an_existing_browser_is_closed_after_the_budget_is_spent(self):
+        session = LazyFlareSolverrSession(_build_shared_state())
+        session.session_id = "existing-session"
+
+        with (
+            patch(
+                "quasarr.providers.cloudflare.flaresolverr_destroy_session"
+            ) as destroy_session,
+            use_search_budget(1.0, clock=ManualClock(1.0)),
+        ):
+            session.close()
+
+        destroy_session.assert_called_once_with(
+            session.shared_state, "existing-session"
+        )
+        self.assertIsNone(session.session_id)
 
     def test_concurrent_detection_logs_once_and_leaves_host_gated(self):
         url = "https://threaded-source.invalid/page"
