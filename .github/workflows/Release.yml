@@ -26,6 +26,7 @@ env:
 
 jobs:
   version:
+    if: github.repository == 'rix1337/Quasarr'
     name: Get Version
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -48,6 +49,7 @@ jobs:
           echo "🏷️ Version: $VERSION"
 
   build-wheel:
+    if: github.repository == 'rix1337/Quasarr'
     name: Build Wheel
     runs-on: ubuntu-latest
     timeout-minutes: 3
@@ -81,6 +83,7 @@ jobs:
           path: ./dist/*
 
   build-exe:
+    if: github.repository == 'rix1337/Quasarr'
     name: Build Exe (Windows)
     runs-on: windows-latest
     timeout-minutes: 3
@@ -129,6 +132,7 @@ jobs:
           path: ./dist/*.exe
 
   build-docker-amd64:
+    if: github.repository == 'rix1337/Quasarr'
     name: Build Docker (AMD64)
     runs-on: ubuntu-latest
     timeout-minutes: 3
@@ -171,6 +175,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=amd64
 
   build-docker-arm64:
+    if: github.repository == 'rix1337/Quasarr'
     name: Build Docker (ARM64)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 3
@@ -213,6 +218,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=arm64
 
   merge-docker-manifest:
+    if: github.repository == 'rix1337/Quasarr'
     name: Merge Docker Manifests
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -242,6 +248,7 @@ jobs:
           docker buildx imagetools create -t ${{ env.GHCR_ENDPOINT }}:beta --annotation "$ANNOTATION" ${{ env.GHCR_ENDPOINT }}:beta-amd64 ${{ env.GHCR_ENDPOINT }}:beta-arm64
 
   release:
+    if: github.repository == 'rix1337/Quasarr'
     name: Create Release
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -307,7 +314,7 @@ jobs:
   notify:
     name: Notify Discord
     needs: [ version, release, merge-docker-manifest ]
-    if: always() && needs.release.result == 'success'
+    if: github.repository == 'rix1337/Quasarr' && always() && needs.release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:
@@ -337,7 +344,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 1
     needs: [ version, build-wheel, build-exe, build-docker-amd64, build-docker-arm64, release ]
-    if: always()
+    if: github.repository == 'rix1337/Quasarr' && always()
     steps:
       - name: Generate Job Summary
         run: |
