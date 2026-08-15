@@ -2,11 +2,13 @@
 # Quasarr
 # Project by https://github.com/rix1337
 
+import hashlib
 import time
 import traceback
 import xml.sax.saxutils as sax_utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import format_datetime, parsedate_to_datetime
 from urllib.parse import parse_qs, urlparse
 from xml.etree import ElementTree
 
@@ -32,7 +34,14 @@ from quasarr.providers.version import get_version
 from quasarr.search import get_search_results
 from quasarr.search.runtime import search_runtime
 from quasarr.search.sources import get_sources
-from quasarr.storage.categories import get_download_categories, get_search_categories
+from quasarr.storage.categories import (
+    get_download_categories,
+    get_search_categories,
+)
+
+_PUBLICATION_DATES_TABLE = "newznab_publication_dates"
+_PUBLICATION_DATE_BATCH_SIZE = 500
+_SAFE_PUBLICATION_DATE = "Thu, 01 Jan 1970 00:00:00 +0000"
 
 
 def _get_release_dedupe_key(release):
@@ -70,6 +79,86 @@ def _xml_text(value):
 
 def _xml_attr(value):
     return sax_utils.quoteattr(str(value or ""))
+
+
+def _parse_publication_date(value):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        candidate = value.strip()
+        try:
+            parsed = parsedate_to_datetime(candidate)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            try:
+                parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            except (TypeError, ValueError, OverflowError):
+                return None
+    else:
+        return None
+
+    try:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return format_datetime(parsed.astimezone(timezone.utc))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _canonical_publication_date(value, fallback):
+    return (
+        _parse_publication_date(value)
+        or _parse_publication_date(fallback)
+        or _SAFE_PUBLICATION_DATE
+    )
+
+
+def _stable_publication_dates(releases, fallback):
+    proposed = {}
+    link_keys = {}
+    for release in releases:
+        details = release.get("details", {}) if isinstance(release, dict) else {}
+        link = str(details.get("link", "") or "").strip()
+        if not link:
+            continue
+        key = hashlib.sha256(link.encode("utf-8")).hexdigest()
+        link_keys[link] = key
+        proposed.setdefault(
+            key, _canonical_publication_date(details.get("date"), fallback)
+        )
+
+    resolved = {}
+    items = list(proposed.items())
+    try:
+        database = shared_state.get_db(_PUBLICATION_DATES_TABLE)
+    except Exception as error:
+        warn(
+            "Could not persist stable Newznab publication dates "
+            f"({type(error).__name__})"
+        )
+        return {link: proposed[key] for link, key in link_keys.items()}
+
+    for offset in range(0, len(items), _PUBLICATION_DATE_BATCH_SIZE):
+        batch = items[offset : offset + _PUBLICATION_DATE_BATCH_SIZE]
+        keys = tuple(key for key, _value in batch)
+        values = tuple(value for _key, value in batch)
+        targets = tuple((_PUBLICATION_DATES_TABLE, key) for key in keys)
+        try:
+            stored = database.mutate_values(
+                targets,
+                lambda current, values=values: tuple(
+                    _canonical_publication_date(value, proposed)
+                    for value, proposed in zip(current, values, strict=True)
+                ),
+            )
+        except Exception as error:
+            warn(
+                "Could not persist stable Newznab publication dates "
+                f"({type(error).__name__})"
+            )
+            stored = values
+        resolved.update(zip(keys, stored, strict=True))
+
+    return {link: resolved[key] for link, key in link_keys.items()}
 
 
 def setup_arr_routes(app):
@@ -567,8 +656,9 @@ def setup_arr_routes(app):
                         debug(f"Search runtime summary: {runtime_summary}")
 
                     # XML Generation (releases are already sliced)
+                    now_rfc822 = format_datetime(datetime.now(timezone.utc))
+                    publication_dates = _stable_publication_dates(releases, now_rfc822)
                     items = ""
-                    now_rfc822 = datetime.now().strftime("%a, %d %b %Y %H:%M:%S +0000")
 
                     for release in releases:
                         release = release.get("details", {})
@@ -584,9 +674,12 @@ def setup_arr_routes(app):
                             title = f"[{release.get('hostname', '').upper()}] {title}"
 
                         # Get publication date - sources should provide valid dates
-                        pub_date = release.get("date", "").strip()
-                        if not pub_date:
-                            pub_date = now_rfc822
+                        link = str(release.get("link", "") or "").strip()
+                        pub_date = publication_dates.get(
+                            link
+                        ) or _canonical_publication_date(
+                            release.get("date"), now_rfc822
+                        )
 
                         title_xml = _xml_text(title)
                         link_xml = _xml_text(release.get("link", ""))

@@ -212,6 +212,7 @@ class DataBase(object):
 
         def operation():
             try:
+                schema_changed = False
                 if not self._conn.execute(
                     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?;",
                     (table,),
@@ -219,6 +220,17 @@ class DataBase(object):
                     self._conn.execute(
                         f"CREATE TABLE IF NOT EXISTS {table} (key, value)"
                     )
+                    schema_changed = True
+                index = f"{table}_key_idx"
+                if not self._conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?;",
+                    (index,),
+                ).fetchall():
+                    self._conn.execute(
+                        f"CREATE INDEX IF NOT EXISTS {index} ON {table}(key)"
+                    )
+                    schema_changed = True
+                if schema_changed:
                     self._conn.commit()
             except sqlite3.OperationalError:
                 self._rollback()

@@ -42,6 +42,32 @@ class SQLiteDatabaseTests(unittest.TestCase):
         db._conn.close()
         reopened._conn.close()
 
+    def test_existing_tables_gain_a_non_unique_key_index(self):
+        with sqlite3.connect(self.dbfile) as connection:
+            connection.execute("CREATE TABLE example_table (key, value)")
+            connection.executemany(
+                "INSERT INTO example_table VALUES (?, ?)",
+                (("duplicate", "one"), ("duplicate", "two")),
+            )
+
+        database = DataBase("example_table")
+        try:
+            indexes = database._conn.execute(
+                "PRAGMA index_list(example_table)"
+            ).fetchall()
+            key_indexes = [
+                row
+                for row in indexes
+                if database._conn.execute(f"PRAGMA index_info({row[1]})").fetchall()
+                == [(0, 0, "key")]
+            ]
+
+            self.assertEqual(1, len(key_indexes))
+            self.assertEqual(0, key_indexes[0][2])
+            self.assertEqual(["one", "two"], database.retrieve_all("duplicate"))
+        finally:
+            database._conn.close()
+
     def test_mutate_value_preserves_both_concurrent_observations(self):
         first = DataBase("crypter_cooldowns")
         second = DataBase("crypter_cooldowns")
