@@ -2542,44 +2542,46 @@ class LifecycleRouteTests(CohortApiTestCase):
         )
 
     def test_lifecycle_handout_selection_matrix(self):
-        self.store(filecrypt_rows(1))
-        # Also add a non-Filecrypt alternative
-        pkg = package(1)
-        data = json.loads(self.state.databases["protected"].rows[pkg])
-        data["links"].append(["https://tolink.invalid/file/1", "tolink"])
-        self.state.databases["protected"].rows[pkg] = json.dumps(data)
-
-        # With lifecycle offer present: the offered Filecrypt link survives
-        handout = self.lifecycle_to_decrypt()
-        self.assertIn("crypter_offer", handout)
-        self.assertEqual(
-            "filecrypt_link_lifecycle_v1",
-            handout["crypter_offer"]["capability"],
+        from quasarr.providers.crypter_candidates import (
+            enumerate_filecrypt_lifecycle_candidates,
         )
-        urls = handout["url"]
-        fc_urls = [u for u in urls if "filecrypt" in str(u[0]).lower()]
-        self.assertEqual(1, len(fc_urls))
-        # Non-Filecrypt alternative also survives
-        non_fc = [u for u in urls if "tolink" in str(u[0]).lower()]
-        self.assertGreaterEqual(len(non_fc), 1)
-
-        # When lifecycle has no typed offer: only-Filecrypt package is skipped
-        single_fc = filecrypt_rows(1, start=99)
-        self.state.databases["protected"].rows.clear()
-        for k, v in single_fc.items():
-            self.state.databases["protected"].rows[k] = v
-        # Blacklist the fingerprint so lifecycle can't offer it
         from quasarr.providers.filecrypt_lifecycle import (
             FILECRYPT_LINK_STATES_TABLE,
+            FILECRYPT_SWEEP_KEY,
+            FILECRYPT_SWEEP_STATE_TABLE,
             encode_link_state,
+            encode_sweep_header,
         )
 
-        fp99 = fingerprint_of(filecrypt_url(99))
-        self.state.databases.setdefault(
-            FILECRYPT_LINK_STATES_TABLE, AtomicDatabase(tables=self.state.databases)
-        )
-        self.state.databases[FILECRYPT_LINK_STATES_TABLE].rows[fp99] = (
-            encode_link_state(
+        # --- subTest: offered Filecrypt survives, non-Filecrypt alternative kept ---
+        with self.subTest(case="offered_survives"):
+            self.store(filecrypt_rows(1))
+            pkg = package(1)
+            data = json.loads(self.state.databases["protected"].rows[pkg])
+            data["links"].append(["https://tolink.invalid/file/1", "tolink"])
+            self.state.databases["protected"].rows[pkg] = json.dumps(data)
+
+            handout = self.lifecycle_to_decrypt()
+            self.assertIn("crypter_offer", handout)
+            self.assertEqual(
+                "filecrypt_link_lifecycle_v1",
+                handout["crypter_offer"]["capability"],
+            )
+            fc_urls = [u for u in handout["url"] if "filecrypt" in str(u[0]).lower()]
+            self.assertEqual(1, len(fc_urls))
+            non_fc = [u for u in handout["url"] if "tolink" in str(u[0]).lower()]
+            self.assertGreaterEqual(len(non_fc), 1)
+
+        # --- subTest: only-Filecrypt package skipped when blacklisted ---
+        with self.subTest(case="blacklisted_only_filecrypt_skipped"):
+            self.setUp()
+            self.store(filecrypt_rows(1, start=99))
+            fp99 = fingerprint_of(filecrypt_url(99))
+            ls_db = self.state.databases.setdefault(
+                FILECRYPT_LINK_STATES_TABLE,
+                AtomicDatabase(tables=self.state.databases),
+            )
+            ls_db.rows[fp99] = encode_link_state(
                 {
                     "schema_version": 1,
                     "state": "blacklisted",
@@ -2587,10 +2589,82 @@ class LifecycleRouteTests(CohortApiTestCase):
                     "blacklisted_epoch": NOW,
                 }
             )
-        )
-        with self.assertRaises(HTTPError) as raised:
-            self.lifecycle_to_decrypt()
-        self.assertEqual(404, raised.exception.status_code)
+            with self.assertRaises(HTTPError) as raised:
+                self.lifecycle_to_decrypt()
+            self.assertEqual(404, raised.exception.status_code)
+
+        # --- subTest: 101 fingerprints with queued probe under lifecycle cooldown ---
+        with self.subTest(case="probe_beyond_legacy_cap"):
+            self.setUp()
+            self.store(filecrypt_rows(101))
+            # Add a non-Filecrypt alternative to the probe package for handout
+            protected = self.state.databases["protected"].retrieve_all_titles()
+            inventory = enumerate_filecrypt_lifecycle_candidates(protected)
+            self.assertEqual(101, len(inventory.candidates))
+            self.assertFalse(inventory.oversized)
+
+            import time as _time
+
+            real_now = int(_time.time())
+
+            # Seed lifecycle cooldown header + held state for all fingerprints
+            sweep_db = self.state.databases.setdefault(
+                FILECRYPT_SWEEP_STATE_TABLE,
+                AtomicDatabase(tables=self.state.databases),
+            )
+            gen_id = "c" * 32
+            sweep_db.rows[FILECRYPT_SWEEP_KEY] = encode_sweep_header(
+                {
+                    "schema_version": 1,
+                    "state": "cooldown",
+                    "generation_id": gen_id,
+                    "sweep_deadline_epoch": real_now + COOLDOWN_SECONDS,
+                    "retry_after_epoch": real_now + COOLDOWN_SECONDS,
+                }
+            )
+            ls_db = self.state.databases.setdefault(
+                FILECRYPT_LINK_STATES_TABLE,
+                AtomicDatabase(tables=self.state.databases),
+            )
+            probe_fp = inventory.candidates[50].fingerprint
+            for candidate in inventory.candidates:
+                ls_db.rows[candidate.fingerprint] = encode_link_state(
+                    {
+                        "schema_version": 1,
+                        "state": "held",
+                        "first_blocked_epoch": real_now - 100,
+                        "retry_after_epoch": real_now + COOLDOWN_SECONDS,
+                        "lease": None,
+                    }
+                )
+
+            # Queue a probe for the package owning probe_fp
+            probe_pkg = inventory.candidates[50].occurrences[0].package_id
+            pkg_data = json.loads(self.state.databases["protected"].rows[probe_pkg])
+            pkg_data["deferred"] = {
+                "schema_version": 2,
+                "crypter": "filecrypt",
+                "reason_code": "ip_block_suspected",
+                "since_epoch": real_now - 100,
+                "retry_after_epoch": real_now + COOLDOWN_SECONDS,
+                "probe_requested": True,
+                "observation_holds": 1,
+                "sweep_id": gen_id,
+                "link_fingerprints": [probe_fp],
+            }
+            # Add non-Filecrypt alternative so handout has an eligible link
+            pkg_data["links"].append(["https://tolink.invalid/probe", "tolink"])
+            self.state.databases["protected"].rows[probe_pkg] = json.dumps(pkg_data)
+
+            handout = self.lifecycle_to_decrypt()
+            self.assertIn("crypter_offer", handout)
+            self.assertEqual("probe", handout["crypter_offer"]["mode"])
+            self.assertEqual(probe_fp, handout["crypter_offer"]["link_fingerprint"])
+
+            handout = self.lifecycle_to_decrypt()
+            self.assertIn("crypter_offer", handout)
+            self.assertEqual("probe", handout["crypter_offer"]["mode"])
+            self.assertEqual(probe_fp, handout["crypter_offer"]["link_fingerprint"])
 
     def test_lifecycle_report_classification_matrix(self):
         from quasarr.api.sponsors_helper.cohort_protocol import (
@@ -2729,20 +2803,21 @@ class LifecycleRouteTests(CohortApiTestCase):
         self.assertEqual("stale", stale["instruction"])
         self.assertEqual("available", stale["state"])
 
-        # Stale access (fail mode)
+        # Stale access (fail mode) → HTTPResponse 409
         access_payload = self.lifecycle_access_payload(offer, pkg_id, "clear")
         stale_access = self.call(ACCESS_RULE, access_payload)
-        if isinstance(stale_access, HTTPResponse):
-            body = json.loads(stale_access.body)
-            self.assertEqual(409, stale_access.status_code)
-            self.assertEqual("stale", body["instruction"])
+        self.assertIsInstance(stale_access, HTTPResponse)
+        self.assertEqual(409, stale_access.status_code)
+        body = json.loads(stale_access.body)
+        self.assertEqual("stale", body["instruction"])
 
         # Re-enable deferred mode; lifecycle access with stale offer → 409
         self.state.values["crypter_block_mode"] = "defer"
         access_resp = self.call(ACCESS_RULE, access_payload)
-        if isinstance(access_resp, HTTPResponse):
-            body = json.loads(access_resp.body)
-            self.assertEqual(409, access_resp.status_code)
+        self.assertIsInstance(access_resp, HTTPResponse)
+        self.assertEqual(409, access_resp.status_code)
+        body = json.loads(access_resp.body)
+        self.assertEqual("stale", body["instruction"])
 
 
 if __name__ == "__main__":

@@ -1901,7 +1901,7 @@ class LifecycleTerminalBlacklistTests(TerminalConfirmationTestCase):
         }
 
     def test_lifecycle_second_404_terminal_blacklist_workflow(self):
-        """Retest BLOCKED → terminal failure → blacklist acknowledgement."""
+        """Retest BLOCKED → route drives terminal failure → blacklist."""
         from quasarr.providers.crypter_candidates import link_fingerprint
         from quasarr.providers.filecrypt_lifecycle import (
             FILECRYPT_LINK_STATES_TABLE,
@@ -1909,17 +1909,15 @@ class LifecycleTerminalBlacklistTests(TerminalConfirmationTestCase):
         )
         from quasarr.providers.filecrypt_lifecycle_service import (
             OFFER_LEASE_SECONDS,
-            FilecryptLifecycleService,
         )
 
         pkg_id = package()
         fp = link_fingerprint("filecrypt", "https://filecrypt.invalid/container/1")
         sweep_id = "a" * 32
         offer_id = "b" * 32
-        top_id = terminal_operation_id(pkg_id)
         now = int(time.time())
 
-        # Seed held link state with an active retest lease (hold expired)
+        # Seed expired held state with an active retest lease
         self.state.get_db(FILECRYPT_LINK_STATES_TABLE).update_store(
             fp,
             encode_link_state(
@@ -1938,115 +1936,87 @@ class LifecycleTerminalBlacklistTests(TerminalConfirmationTestCase):
             ),
         )
 
-        # Call record_blocked directly (retest path)
-        lifecycle = FilecryptLifecycleService(self.state)
-        report = {
-            "package_id": pkg_id,
-            "crypter": "filecrypt",
-            "reason_code": "ip_block_suspected",
-            "link_fingerprint": fp,
-            "sweep_id": sweep_id,
-            "offer_id": offer_id,
-            "protocol_version": 2,
-            "terminal_operation_id": top_id,
-        }
-        protected_rows = self.state.get_db("protected").retrieve_all_titles()
-        result = lifecycle.record_blocked(report, protected_rows)
+        # Drive the actual route
+        payload = self.lifecycle_blocked(
+            {"link_fingerprint": fp, "sweep_id": sweep_id, "offer_id": offer_id},
+            pkg_id,
+        )
+        response = self.call(DEFER_RULE, payload)
 
-        # Retest BLOCKED → terminal_required
-        self.assertIsNotNone(result)
-        self.assertTrue(result.get("terminal_required"))
-        self.assertEqual(fp, result["fingerprint"])
-        self.assertEqual(pkg_id, result["package_id"])
-
-        # Now confirm the blacklist via the route's terminal workflow
-        blacklist = lifecycle.confirm_blacklist(fp, offer_id, top_id)
-        self.assertIsNotNone(blacklist)
-        self.assertEqual("blacklist", blacklist["instruction"])
-        self.assertEqual("individual", blacklist["state"])
-        self.assertFalse(blacklist["terminal_required"])
-        # No legacy fail() involved
-        self.assertIsNone(self.state.get_db("failed").retrieve(pkg_id))
+        # Route completes terminal blacklist via render_defer_response
+        self.assertIsNotNone(response)
+        self.assertEqual("blacklist", response["instruction"])
+        self.assertEqual("individual", response["state"])
+        self.assertNotIn("terminal_required", response)
+        self.assertIsNone(self.protected_row())
+        self.assertIsNotNone(self.failed_row())
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        # Operation record completed
+        op = self.operation_row()
+        self.assertIsNotNone(op)
+        self.assertEqual("complete", op["state"])
+        self.assertTrue(op["package_removed"])
+        self.assertTrue(op["package_terminal"])
 
     def test_lifecycle_blacklist_lost_response_replays_once(self):
-        """Lost blacklist response replays via receipt without duplicate effects."""
+        """Lost response replay: same route payload returns same blacklist, no dup."""
+        from quasarr.providers.crypter_candidates import link_fingerprint
         from quasarr.providers.filecrypt_lifecycle import (
             FILECRYPT_LINK_STATES_TABLE,
-            FILECRYPT_OFFER_RECEIPTS_TABLE,
             encode_link_state,
-            encode_offer_receipt,
-        )
-        from quasarr.providers.filecrypt_lifecycle_decisions import (
-            build_blacklist_decision,
         )
         from quasarr.providers.filecrypt_lifecycle_service import (
-            FilecryptLifecycleService,
+            OFFER_LEASE_SECONDS,
         )
 
         pkg_id = package()
-        fp = terminal_operation_id(pkg_id)  # just need a 64-hex fingerprint
-        # Use a real fingerprint from the stored links
-        from quasarr.providers.crypter_candidates import link_fingerprint
-
         fp = link_fingerprint("filecrypt", "https://filecrypt.invalid/container/1")
         sweep_id = "a" * 32
         offer_id = "b" * 32
-        top_id = terminal_operation_id(pkg_id)
+        now = int(time.time())
 
-        # Seed the receipt as if blacklist already completed
-        blacklist_resp = build_blacklist_decision(
-            sweep_id=sweep_id, sweep_deadline_epoch=int(time.time()) + 900
-        )
-        receipt = {
-            "schema_version": 1,
-            "generation_id": sweep_id,
-            "fingerprint": fp,
-            "package_id": pkg_id,
-            "mode": "retest",
-            "outcome": "blocked",
-            "response": blacklist_resp,
-            "accepted_epoch": int(time.time()),
-            "expires_epoch": int(time.time()) + 30 * 24 * 3600,
-        }
-        self.state.get_db(FILECRYPT_OFFER_RECEIPTS_TABLE).update_store(
-            offer_id, encode_offer_receipt(receipt)
-        )
-        # Seed link state as blacklisted (post-confirm)
+        # Seed expired held + retest lease (same as terminal workflow)
         self.state.get_db(FILECRYPT_LINK_STATES_TABLE).update_store(
             fp,
             encode_link_state(
                 {
                     "schema_version": 1,
-                    "state": "blacklisted",
-                    "first_blocked_epoch": int(time.time()) - 86400,
-                    "blacklisted_epoch": int(time.time()),
+                    "state": "held",
+                    "first_blocked_epoch": now - 86400,
+                    "retry_after_epoch": now - 1,
+                    "lease": {
+                        "sweep_id": sweep_id,
+                        "offer_id": offer_id,
+                        "package_id": pkg_id,
+                        "offer_expires_epoch": now + OFFER_LEASE_SECONDS,
+                    },
                 }
             ),
         )
 
-        # Call record_blocked which should replay the blacklist receipt
-        lifecycle = FilecryptLifecycleService(self.state)
-        report = {
-            "package_id": pkg_id,
-            "crypter": "filecrypt",
-            "reason_code": "ip_block_suspected",
-            "link_fingerprint": fp,
-            "sweep_id": sweep_id,
-            "offer_id": offer_id,
-            "protocol_version": 2,
-            "terminal_operation_id": top_id,
-        }
-        protected_rows = self.state.get_db("protected").retrieve_all_titles()
-        result = lifecycle.record_blocked(report, protected_rows)
+        payload = self.lifecycle_blocked(
+            {"link_fingerprint": fp, "sweep_id": sweep_id, "offer_id": offer_id},
+            pkg_id,
+        )
 
-        # Receipt replay returns blacklist without terminal_required
-        self.assertIsNotNone(result)
-        self.assertFalse(result.get("terminal_required", True))
-        self.assertEqual("blacklist", result["instruction"])
-        self.assertEqual(fp, result["fingerprint"])
-        self.assertEqual(pkg_id, result["package_id"])
-        # No duplicate effects: failed row untouched, no notification
-        self.assertIsNone(self.state.get_db("failed").retrieve(pkg_id))
+        # First call: terminal blacklist completes
+        first = self.call(DEFER_RULE, payload)
+        self.assertEqual("blacklist", first["instruction"])
+        self.assertIsNone(self.protected_row())
+        failed_after_first = self.failed_row()
+        notif_after_first = list(self.notification_cases())
+        counter_after_first = self.statistic("failed_downloads")
+
+        # Second call: same payload after protected removal → receipt replay
+        second = self.call(DEFER_RULE, payload)
+        self.assertEqual(first["instruction"], second["instruction"])
+        self.assertEqual(first["state"], second["state"])
+        self.assertNotIn("terminal_required", second)
+        # No additional side effects
+        self.assertEqual(failed_after_first, self.failed_row())
+        self.assertEqual(notif_after_first, self.notification_cases())
+        self.assertEqual(counter_after_first, self.statistic("failed_downloads"))
 
 
 if __name__ == "__main__":

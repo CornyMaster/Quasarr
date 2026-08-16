@@ -46,6 +46,7 @@ from quasarr.providers import shared_state
 from quasarr.providers.auth import require_api_key
 from quasarr.providers.crypter_candidates import (
     enumerate_filecrypt_candidates,
+    enumerate_filecrypt_lifecycle_candidates,
     link_fingerprint,
 )
 from quasarr.providers.crypter_cooldowns import (
@@ -1378,7 +1379,7 @@ def setup_sponsors_helper_routes(app):
                 lifecycle_service = FilecryptLifecycleService(shared_state)
                 preferred_fp = None
                 probe_occurrence = filecrypt_probe_occurrence(
-                    filecrypt_inventory(protected), protected
+                    enumerate_filecrypt_lifecycle_candidates(protected), protected
                 )
                 if probe_occurrence is not None:
                     preferred_fp = probe_occurrence.fingerprint

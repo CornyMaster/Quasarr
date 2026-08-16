@@ -2314,6 +2314,7 @@ class PrepareOfferTests(SweepServiceTestCase):
 
         self.assertEqual(
             {
+                "capability": "filecrypt_cohort_sweep_v1",
                 "mode": "sweep",
                 "sweep_id": offer_id(901),
                 "offer_id": offer_id(902),
