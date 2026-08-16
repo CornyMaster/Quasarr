@@ -1499,6 +1499,81 @@ class HelperPackagePredicateTests(unittest.TestCase):
                 self.assertIs(False, helper_package_is_candidate(value))
 
 
+class SweepDeadlineEpochCodecTests(unittest.TestCase):
+    """Discriminating tests for sweep_deadline_epoch codec validation."""
+
+    def test_sweep_deadline_epoch_must_be_positive_in_accepted_offer(self):
+        """sweep_deadline_epoch=0 must be rejected during both encode and decode."""
+        # Valid accepted offer with positive deadline
+        valid_record = cohort_cooldown_record()
+        encoded = encode_decision_record(valid_record)
+        self.assertIsNotNone(decode_decision_record(encoded, now=NOW))
+
+        # Accepted offer with zero deadline must be rejected on encode
+        offers_with_zero_deadline = [
+            {
+                **accepted_offer(index),
+                "sweep_deadline_epoch": 0,
+                "state": "cooldown"
+                if index == MINIMUM_CONCLUSIVE_COHORT_SIZE
+                else "sweeping",
+                "instruction": "cooldown"
+                if index == MINIMUM_CONCLUSIVE_COHORT_SIZE
+                else "hold",
+            }
+            for index in range(1, MINIMUM_CONCLUSIVE_COHORT_SIZE + 1)
+        ]
+        invalid_record = cohort_cooldown_record(
+            accepted_offers=offers_with_zero_deadline
+        )
+        with self.assertRaises(ValueError) as cm:
+            encode_decision_record(invalid_record)
+        self.assertIn("sweep_deadline_epoch", str(cm.exception))
+
+        # Persisted record with zero deadline must be rejected on decode
+        encoded_invalid = json.dumps(
+            {
+                "schema_version": SWEEP_SCHEMA_VERSION,
+                "state": "cooldown",
+                "reason_code": REASON,
+                "sweep_id": SWEEP_ID,
+                "opened_epoch": NOW,
+                "deadline_epoch": NOW + SWEEP_WINDOW_SECONDS,
+                "members": blocked_members(),
+                "cohort_size": MINIMUM_CONCLUSIVE_COHORT_SIZE,
+                "retry_after_epoch": COOLDOWN_RETRY,
+                "live_offer": live_offer(mode="probe"),
+                "accepted_offers": [
+                    {
+                        **accepted_offer(1),
+                        "sweep_deadline_epoch": 0,
+                    }
+                ],
+                "used_offer_ids": used_ids(
+                    (entry["offer_id"] for entry in blocked_members()),
+                    ("b" * 32,),
+                    (OFFER_ID,),
+                ),
+            }
+        )
+        self.assertIsNone(
+            decode_decision_record(encoded_invalid, now=NOW),
+            "Malformed persisted record with sweep_deadline_epoch=0 must return None",
+        )
+
+    def test_sweep_deadline_epoch_accepts_positive_values(self):
+        """sweep_deadline_epoch > 0 must be accepted."""
+        positive_deadlines = [1, NOW, NOW + SWEEP_WINDOW_SECONDS]
+        for deadline in positive_deadlines:
+            with self.subTest(deadline=deadline):
+                record = cohort_cooldown_record()
+                # Update all accepted offers with the test deadline
+                for offer in record["accepted_offers"]:
+                    offer["sweep_deadline_epoch"] = deadline
+                encoded = encode_decision_record(record)
+                self.assertIsNotNone(decode_decision_record(encoded, now=NOW))
+
+
 class ServiceSnapshotTests(unittest.TestCase):
     class FakeDatabase:
         def __init__(self):
