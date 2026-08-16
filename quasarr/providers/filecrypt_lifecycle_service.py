@@ -8,6 +8,7 @@ confirmation, pruning, migration, route wiring, settings persistence, and
 terminal effects are deferred to later tasks.
 """
 
+import json
 import re
 import secrets
 import time
@@ -22,7 +23,10 @@ from quasarr.providers.crypter_cooldowns import (
     CRYPTER_EVENT_KEY,
     CRYPTER_EVENT_TABLE,
     MINIMUM_COOLDOWN_HOURS,
+    PACKAGE_DEFER_KEY,
     _add_pending_crypter_events,
+    decode_package_defer,
+    package_defer_covers_fingerprint,
 )
 from quasarr.providers.crypter_sweeps import OWNERSHIP_OWNED
 from quasarr.providers.filecrypt_lifecycle import (
@@ -201,7 +205,12 @@ class FilecryptLifecycleService:
     # ── offer preparation ──────────────────────────────────────────────────────
 
     def prepare_offer(
-        self, protected_rows, *, excluded_package_ids=(), preferred_fingerprint=None
+        self,
+        protected_rows,
+        *,
+        excluded_package_ids=(),
+        preferred_fingerprint=None,
+        probe_package_id=None,
     ):
         """Build and atomically commit an offer, or None if unavailable."""
         now = int(self._clock())
@@ -283,6 +292,7 @@ class FilecryptLifecycleService:
                 preferred_fingerprint,
                 excluded_package_ids,
                 now,
+                probe_package_id=probe_package_id,
             )
 
         if header_state == "sweeping":
@@ -335,8 +345,14 @@ class FilecryptLifecycleService:
         preferred_fingerprint,
         excluded_package_ids,
         now,
+        *,
+        probe_package_id=None,
     ):
-        """Issue a probe offer under a live cooldown, or None."""
+        """Issue a probe offer under a live cooldown, or None.
+
+        When probe_package_id is supplied, the protected package row is included
+        as an atomic target and its deferred metadata is removed on success.
+        """
         if preferred_fingerprint is None or preferred_fingerprint not in fp_map:
             return None
         ls_raw = link_state_by_fp.get(preferred_fingerprint)
@@ -355,11 +371,24 @@ class FilecryptLifecycleService:
         _fp = preferred_fingerprint
         _occ = occurrence
         _gen_id = header["generation_id"]
+        _pkg_id = probe_package_id
         result = [None]
         ids = self._ids
 
+        # Pre-read the protected package row if we will consume the marker
+        pkg_raw = None
+        if _pkg_id is not None:
+            pkg_raw = self._shared_state.get_db("protected").retrieve(_pkg_id)
+            if pkg_raw is None:
+                return None
+
         def mutator(values):
-            hdr_raw, ls_curr_raw = values
+            if _pkg_id is not None:
+                hdr_raw, ls_curr_raw, pkg_curr_raw = values
+            else:
+                hdr_raw, ls_curr_raw = values
+                pkg_curr_raw = None
+
             hdr = decode_sweep_header(hdr_raw)
             if (
                 hdr is None
@@ -375,9 +404,36 @@ class FilecryptLifecycleService:
                 or _now >= ls_curr.get("retry_after_epoch", 0)
             ):
                 result[0] = None
-                return (hdr_raw, ls_curr_raw)
+                return values
+
+            # Validate and consume the protected package deferred marker
+            new_pkg_raw = pkg_curr_raw
+            if _pkg_id is not None:
+                try:
+                    pkg_data = json.loads(pkg_curr_raw) if pkg_curr_raw else None
+                except (TypeError, ValueError):
+                    pkg_data = None
+                if not isinstance(pkg_data, dict):
+                    result[0] = None
+                    return values
+                try:
+                    deferred = decode_package_defer(pkg_data)
+                except (TypeError, ValueError):
+                    result[0] = None
+                    return values
+                if (
+                    deferred is None
+                    or deferred["crypter"] != FILECRYPT_CRYPTER
+                    or not deferred["probe_requested"]
+                    or not package_defer_covers_fingerprint(deferred, _fp)
+                ):
+                    result[0] = None
+                    return values
+                # Remove only the deferred key; preserve all other package data
+                cleaned = {k: v for k, v in pkg_data.items() if k != PACKAGE_DEFER_KEY}
+                new_pkg_raw = json.dumps(cleaned, separators=(",", ":"))
+
             offer_id = ids()
-            # Reuse existing sweep_id from lease if present, else use cooldown generation
             existing_lease = ls_curr.get("lease") or {}
             sweep_id = existing_lease.get("sweep_id") or _gen_id
             new_ls = dict(ls_curr)
@@ -397,12 +453,17 @@ class FilecryptLifecycleService:
                 "deadline_epoch": _now + OFFER_LEASE_SECONDS,
                 "occurrence": _occ,
             }
-            return (hdr_raw, encode_link_state(new_ls))
+            encoded_ls = encode_link_state(new_ls)
+            if _pkg_id is not None:
+                return (hdr_raw, encoded_ls, new_pkg_raw)
+            return (hdr_raw, encoded_ls)
 
         targets = [
             (FILECRYPT_SWEEP_STATE_TABLE, FILECRYPT_SWEEP_KEY),
             (FILECRYPT_LINK_STATES_TABLE, _fp),
         ]
+        if _pkg_id is not None:
+            targets.append(("protected", _pkg_id))
         self._shared_state.get_db(FILECRYPT_SWEEP_STATE_TABLE).mutate_values(
             targets, mutator
         )

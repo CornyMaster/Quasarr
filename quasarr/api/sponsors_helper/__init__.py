@@ -1395,6 +1395,11 @@ def setup_sponsors_helper_routes(app):
                         excluded_package_ids
                     ),
                     preferred_fingerprint=preferred_fp,
+                    probe_package_id=(
+                        probe_occurrence.package_id
+                        if probe_occurrence is not None
+                        else None
+                    ),
                 )
                 occurrence = offer.get("occurrence") if offer else None
             elif cohort_capable and cooldown_service is not None:

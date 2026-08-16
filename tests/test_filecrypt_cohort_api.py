@@ -2656,15 +2656,82 @@ class LifecycleRouteTests(CohortApiTestCase):
             pkg_data["links"].append(["https://tolink.invalid/probe", "tolink"])
             self.state.databases["protected"].rows[probe_pkg] = json.dumps(pkg_data)
 
+            # First handout: typed probe is issued
             handout = self.lifecycle_to_decrypt()
             self.assertIn("crypter_offer", handout)
             self.assertEqual("probe", handout["crypter_offer"]["mode"])
             self.assertEqual(probe_fp, handout["crypter_offer"]["link_fingerprint"])
 
-            handout = self.lifecycle_to_decrypt()
-            self.assertIn("crypter_offer", handout)
-            self.assertEqual("probe", handout["crypter_offer"]["mode"])
-            self.assertEqual(probe_fp, handout["crypter_offer"]["link_fingerprint"])
+            # Deferred marker must be atomically removed from the package
+            pkg_after = json.loads(self.state.databases["protected"].rows[probe_pkg])
+            self.assertNotIn("deferred", pkg_after)
+            # All other package fields preserved
+            self.assertIn("links", pkg_after)
+
+            # Second identical poll must NOT return a probe from same marker
+            try:
+                handout2 = self.lifecycle_to_decrypt()
+            except HTTPError:
+                handout2 = None
+            if handout2 is not None:
+                # A non-probe lifecycle offer or alternative is acceptable
+                offer2 = handout2.get("crypter_offer")
+                if offer2 is not None:
+                    self.assertNotEqual("probe", offer2.get("mode"))
+
+        # --- subTest: malformed deferred blocks probe (fail-closed) ---
+        with self.subTest(case="malformed_defer_no_probe"):
+            self.setUp()
+            self.store(filecrypt_rows(5))
+            protected = self.state.databases["protected"].retrieve_all_titles()
+            inventory = enumerate_filecrypt_lifecycle_candidates(protected)
+
+            real_now = int(_time.time())
+            sweep_db = self.state.databases.setdefault(
+                FILECRYPT_SWEEP_STATE_TABLE,
+                AtomicDatabase(tables=self.state.databases),
+            )
+            gen_id = "d" * 32
+            sweep_db.rows[FILECRYPT_SWEEP_KEY] = encode_sweep_header(
+                {
+                    "schema_version": 1,
+                    "state": "cooldown",
+                    "generation_id": gen_id,
+                    "sweep_deadline_epoch": real_now + COOLDOWN_SECONDS,
+                    "retry_after_epoch": real_now + COOLDOWN_SECONDS,
+                }
+            )
+            ls_db = self.state.databases.setdefault(
+                FILECRYPT_LINK_STATES_TABLE,
+                AtomicDatabase(tables=self.state.databases),
+            )
+            for candidate in inventory.candidates:
+                ls_db.rows[candidate.fingerprint] = encode_link_state(
+                    {
+                        "schema_version": 1,
+                        "state": "held",
+                        "first_blocked_epoch": real_now - 100,
+                        "retry_after_epoch": real_now + COOLDOWN_SECONDS,
+                        "lease": None,
+                    }
+                )
+
+            # Seed malformed deferred (missing required fields)
+            target_pkg = inventory.candidates[0].occurrences[0].package_id
+            pkg_data = json.loads(self.state.databases["protected"].rows[target_pkg])
+            pkg_data["deferred"] = {"crypter": "filecrypt", "broken": True}
+            pkg_data["links"].append(["https://tolink.invalid/x", "tolink"])
+            self.state.databases["protected"].rows[target_pkg] = json.dumps(pkg_data)
+
+            # Malformed defer cannot produce a probe occurrence
+            try:
+                handout = self.lifecycle_to_decrypt()
+            except HTTPError:
+                handout = None
+            if handout is not None:
+                offer = handout.get("crypter_offer")
+                if offer is not None:
+                    self.assertNotEqual("probe", offer.get("mode"))
 
     def test_lifecycle_report_classification_matrix(self):
         from quasarr.api.sponsors_helper.cohort_protocol import (
