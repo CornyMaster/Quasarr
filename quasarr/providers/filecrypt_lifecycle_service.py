@@ -1879,7 +1879,11 @@ class FilecryptLifecycleService:
         _expired_by_key = {key: raw for key, raw in expired}
         _now = now
 
+        # Overwritten on each invocation; last write wins (never accumulates).
+        deletion_flags: list[tuple[bool, ...]] = [()]
+
         def _pruning_mutator(values):
+            flags: list[bool] = []
             result = []
             for i, current_raw in enumerate(values):
                 key = targets[i][1]
@@ -1888,16 +1892,12 @@ class FilecryptLifecycleService:
                     record = decode_offer_receipt(current_raw)
                     if record is not None and record["expires_epoch"] <= _now:
                         result.append(None)
+                        flags.append(True)
                         continue
                 result.append(current_raw)
+                flags.append(False)
+            deletion_flags[0] = tuple(flags)
             return tuple(result)
 
-        committed_values = receipts_db.mutate_values(targets, _pruning_mutator)
-        # Count deletions by comparing committed values to the enumerated originals.
-        # Only count when the original receipt is deleted (None in committed_values).
-        deleted_count = sum(
-            1
-            for i, committed_raw in enumerate(committed_values)
-            if committed_raw is None and _expired_by_key[targets[i][1]] is not None
-        )
-        return deleted_count
+        receipts_db.mutate_values(targets, _pruning_mutator)
+        return sum(deletion_flags[0])

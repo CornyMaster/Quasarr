@@ -437,6 +437,37 @@ class PruningTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIsNone(db.retrieve(oid), "receipt must be deleted")
 
+    def test_concurrent_deletion_counts_only_local_prune(self):
+        """Concurrent external deletion of A must not inflate the returned count.
+
+        Two expired receipts A and B are enumerated.  Before the pruning
+        callback reads current values, a concurrent actor deletes A entirely.
+        The callback sees current_raw=None for A (mismatch against enumerated),
+        so it preserves None without marking it as locally deleted.  Only B is
+        deleted by this call.  Returned count must be 1, not 2.
+        """
+        oid_a = _receipt_id(1)
+        oid_b = _receipt_id(2)
+        raw_a = _make_raw_receipt(
+            oid_a, _receipt_fp(1), _receipt_pkg(1), expires_epoch=NOW - 1
+        )
+        raw_b = _make_raw_receipt(
+            oid_b, _receipt_fp(2), _receipt_pkg(2), expires_epoch=NOW - 1
+        )
+        db = self.receipts_db()
+        db.store(oid_a, raw_a)
+        db.store(oid_b, raw_b)
+
+        # Concurrent actor deletes A before the callback reads current values.
+        db.before_mutation = lambda: db.rows.pop(oid_a, None)
+
+        result = self.service().prune_receipts()
+
+        # Only B was deleted by this call; A was already gone externally.
+        self.assertEqual(result, 1)
+        self.assertIsNone(db.retrieve(oid_a), "A absent (deleted externally)")
+        self.assertIsNone(db.retrieve(oid_b), "B absent (pruned locally)")
+
 
 # ── hardening tests: fake store ───────────────────────────────────────────────
 
