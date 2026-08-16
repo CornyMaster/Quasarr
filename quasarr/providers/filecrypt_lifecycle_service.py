@@ -12,6 +12,7 @@ import re
 import secrets
 import time
 
+from quasarr.providers import log
 from quasarr.providers.crypter_candidates import (
     FilecryptCandidate,
     classify_package_ownership,
@@ -60,6 +61,7 @@ FILECRYPT_LINK_LIFECYCLE_CAPABILITY = "filecrypt_link_lifecycle_v1"
 FILECRYPT_CRYPTER = "filecrypt"
 DEFAULT_SWEEP_WINDOW_MINUTES = 15
 OFFER_LEASE_SECONDS = 120
+RECEIPT_ADVISORY_THRESHOLD = 4096
 
 _SCHEMA_VERSION = 1
 _WINDOW_MIN = 1
@@ -1840,3 +1842,57 @@ class FilecryptLifecycleService:
             targets, mutator
         )
         return result[0]
+
+    # ── receipt pruning (Task 3C) ─────────────────────────────────────────────
+
+    def prune_receipts(self) -> int:
+        """Prune expired offer receipts.  Returns the number of rows deleted."""
+        receipts_db = self._shared_state.get_db(FILECRYPT_OFFER_RECEIPTS_TABLE)
+        all_rows = receipts_db.retrieve_all_titles() or []
+
+        now = int(self._clock())
+
+        expired = []
+        malformed_count = 0
+        for key, raw in all_rows:
+            record = decode_offer_receipt(raw)
+            if record is None:
+                malformed_count += 1
+                continue
+            if record["expires_epoch"] <= now:
+                expired.append((key, raw))
+
+        total = len(all_rows)
+        if total >= RECEIPT_ADVISORY_THRESHOLD:
+            log.warn(
+                f"filecrypt receipt table has {total} rows "
+                f"({len(expired)} expired, {malformed_count} malformed)"
+            )
+        if malformed_count > 0:
+            log.warn(f"filecrypt receipt table has {malformed_count} malformed rows")
+
+        if not expired:
+            return 0
+
+        expired.sort(key=lambda x: x[0])
+        targets = [(FILECRYPT_OFFER_RECEIPTS_TABLE, key) for key, _ in expired]
+        _expired_by_key = {key: raw for key, raw in expired}
+        _now = now
+        deleted = [0]
+
+        def _pruning_mutator(values):
+            result = []
+            for i, current_raw in enumerate(values):
+                key = targets[i][1]
+                enumerated_raw = _expired_by_key[key]
+                if current_raw is not None and current_raw == enumerated_raw:
+                    record = decode_offer_receipt(current_raw)
+                    if record is not None and record["expires_epoch"] <= _now:
+                        deleted[0] += 1
+                        result.append(None)
+                        continue
+                result.append(current_raw)
+            return tuple(result)
+
+        receipts_db.mutate_values(targets, _pruning_mutator)
+        return deleted[0]
