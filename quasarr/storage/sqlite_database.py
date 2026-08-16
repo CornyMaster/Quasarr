@@ -364,10 +364,12 @@ class DataBase(object):
 
     def _resolve_targets(self, targets, method):
         resolved = []
+        seen = set()
         for table, key in targets:
             target = (self._validate_table_name(table), key)
-            if target in resolved:
+            if target in seen:
                 raise ValueError(f"{method} targets must be unique")
+            seen.add(target)
             resolved.append(target)
         if not resolved:
             raise ValueError(f"{method} needs at least one target")
@@ -386,7 +388,7 @@ class DataBase(object):
             raise TypeError("mutator must be callable")
         resolved = self._resolve_targets(targets, "mutate_values")
 
-        for table, _key in resolved:
+        for table in dict.fromkeys(table for table, _key in resolved):
             self._ensure_table(table)
 
         try:

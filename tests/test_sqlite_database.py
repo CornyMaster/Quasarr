@@ -349,6 +349,22 @@ class SQLiteDatabaseTests(unittest.TestCase):
         finally:
             db._conn.close()
 
+    def test_mutate_values_ensures_each_unique_table_once(self):
+        database = DataBase("members")
+        targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
+        with patch.object(database, "_ensure_table", wraps=database._ensure_table) as ensure:
+            database.mutate_values(targets, lambda values: ["pending"] * len(values))
+        self.assertEqual([unittest.mock.call("members")], ensure.call_args_list)
+        database._conn.close()
+
+    def test_resolve_targets_rejects_a_duplicate_among_5000_keys(self):
+        database = DataBase("members")
+        targets = [("members", str(index)) for index in range(5000)]
+        targets.append(("members", "4999"))
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            database.retrieve_values(targets)
+        database._conn.close()
+
     def test_delete_exact_removes_only_one_matching_row_and_commits(self):
         writer = DataBase("failed")
         reader = DataBase("failed")
