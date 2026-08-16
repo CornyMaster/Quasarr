@@ -138,7 +138,8 @@ class FilecryptLifecycleService:
             record = decode_link_state(raw)
             if record is not None and record.get("state") == "blacklisted":
                 result.append(fp)
-        return tuple(result)  # retrieve_all_titles is sorted by key
+        result.sort()
+        return tuple(result)
 
     # ── offer preparation ──────────────────────────────────────────────────────
 
@@ -428,10 +429,24 @@ class FilecryptLifecycleService:
         ids = self._ids
 
         def mutator(values):
-            (ls_raw,) = values
+            hdr_raw, ls_raw = values
+            # Abort if a concurrent live valid or malformed header is present
+            if hdr_raw is not None:
+                hdr = decode_sweep_header(hdr_raw)
+                if hdr is None:
+                    result[0] = None
+                    return values
+                s = hdr.get("state")
+                if (
+                    (s == "sweeping" and _now < hdr.get("deadline_epoch", 0))
+                    or (s == "healthy" and _now < hdr.get("until_epoch", 0))
+                    or (s == "cooldown" and _now < hdr.get("retry_after_epoch", 0))
+                ):
+                    result[0] = None
+                    return values
             if ls_raw is not None:
                 result[0] = None
-                return (ls_raw,)
+                return values
             generation_id = ids()
             offer_id = ids()
             ts = _now
@@ -458,10 +473,13 @@ class FilecryptLifecycleService:
                 "deadline_epoch": retry_after,
                 "occurrence": _occ,
             }
-            return (encode_link_state(new_ls),)
+            return (hdr_raw, encode_link_state(new_ls))
 
-        targets = [(FILECRYPT_LINK_STATES_TABLE, fp)]
-        self._shared_state.get_db(FILECRYPT_LINK_STATES_TABLE).mutate_values(
+        targets = [
+            (FILECRYPT_SWEEP_STATE_TABLE, FILECRYPT_SWEEP_KEY),
+            (FILECRYPT_LINK_STATES_TABLE, fp),
+        ]
+        self._shared_state.get_db(FILECRYPT_SWEEP_STATE_TABLE).mutate_values(
             targets, mutator
         )
         return result[0]
@@ -489,16 +507,23 @@ class FilecryptLifecycleService:
                 leased_occ = occ
                 break
 
+        # Fix 4: no handable occurrence → do not open or commit a sweep
+        if leased_fp is None:
+            return None
+
         first_time_set = set(first_time_fps)
         all_member_fps = sorted(existing_member_fps | first_time_set)
         n_members = len(all_member_fps)
+        # Index of each first-time fp in the link-state target block
+        first_time_fps_order = first_time_fps  # preserves iteration order
+        first_time_fp_idx = {fp: i for i, fp in enumerate(first_time_fps_order)}
 
-        # Build targets: header + all members + link state for leased fp (if any)
+        # Build targets: header + all members + link-state for EVERY first-time fp
         targets = [(FILECRYPT_SWEEP_STATE_TABLE, FILECRYPT_SWEEP_KEY)]
         for fp in all_member_fps:
             targets.append((FILECRYPT_SWEEP_MEMBERS_TABLE, fp))
-        if leased_fp is not None:
-            targets.append((FILECRYPT_LINK_STATES_TABLE, leased_fp))
+        for fp in first_time_fps_order:
+            targets.append((FILECRYPT_LINK_STATES_TABLE, fp))
 
         result = [None]
         ids = self._ids
@@ -507,6 +532,8 @@ class FilecryptLifecycleService:
         _leased_occ = leased_occ
         _all_member_fps = all_member_fps
         _first_time_set = first_time_set
+        _first_time_fp_idx = first_time_fp_idx
+        _n_members = n_members
 
         def mutator(values):
             ts = _now
@@ -527,10 +554,10 @@ class FilecryptLifecycleService:
                     result[0] = None
                     return values
 
-            # Abort if leased fp's link state was concurrently written
-            if _leased_fp is not None:
-                ls_raw = values[1 + n_members]
-                if ls_raw is not None:
+            # Abort if ANY first-time link-state was concurrently written
+            ls_base = 1 + _n_members
+            for i in range(len(_first_time_fps)):
+                if values[ls_base + i] is not None:
                     result[0] = None
                     return values
 
@@ -581,33 +608,31 @@ class FilecryptLifecycleService:
                 else:
                     new_values[midx] = None  # remove stale member
 
-            # Link state for leased member
-            if _leased_fp is not None and _leased_occ is not None:
-                new_ls = {
-                    "schema_version": _SCHEMA_VERSION,
-                    "state": "held",
-                    "first_blocked_epoch": ts,
-                    "retry_after_epoch": deadline_epoch,
-                    "lease": {
-                        "sweep_id": generation_id,
-                        "offer_id": offer_id,
-                        "package_id": _leased_occ.package_id,
-                        "offer_expires_epoch": ts + OFFER_LEASE_SECONDS,
-                    },
-                }
-                new_values[1 + n_members] = encode_link_state(new_ls)
-                result[0] = {
-                    "capability": FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
-                    "mode": "sweep",
-                    "crypter": FILECRYPT_CRYPTER,
+            # Link state for leased member only; all others stay absent
+            leased_ls_idx = ls_base + _first_time_fp_idx[_leased_fp]
+            new_ls = {
+                "schema_version": _SCHEMA_VERSION,
+                "state": "held",
+                "first_blocked_epoch": ts,
+                "retry_after_epoch": deadline_epoch,
+                "lease": {
                     "sweep_id": generation_id,
                     "offer_id": offer_id,
-                    "link_fingerprint": _leased_fp,
-                    "deadline_epoch": deadline_epoch,
-                    "occurrence": _leased_occ,
-                }
-            else:
-                result[0] = None  # sweep opened but no handable member
+                    "package_id": _leased_occ.package_id,
+                    "offer_expires_epoch": ts + OFFER_LEASE_SECONDS,
+                },
+            }
+            new_values[leased_ls_idx] = encode_link_state(new_ls)
+            result[0] = {
+                "capability": FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
+                "mode": "sweep",
+                "crypter": FILECRYPT_CRYPTER,
+                "sweep_id": generation_id,
+                "offer_id": offer_id,
+                "link_fingerprint": _leased_fp,
+                "deadline_epoch": deadline_epoch,
+                "occurrence": _leased_occ,
+            }
 
             return tuple(new_values)
 

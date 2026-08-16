@@ -359,6 +359,17 @@ class TestExclusion(LifecycleServiceTestCase):
         offer = svc.prepare_offer(rows_for([1, 2]), excluded_package_ids=[pkg(1)])
         self.assertEqual(fp(2), offer["link_fingerprint"])
 
+    def test_all_occurrences_excluded_returns_none_no_sweep(self):
+        """When every first-time fingerprint has only excluded owners, return None and write nothing."""
+        svc = self.service()
+        offer = svc.prepare_offer(
+            rows_for([1, 2, 3]),
+            excluded_package_ids=[pkg(1), pkg(2), pkg(3)],
+        )
+        self.assertIsNone(offer)
+        self.assertIsNone(self.header())
+        self.assertIsNone(self.members_db().retrieve_all_titles())
+
 
 class TestAtomicity(LifecycleServiceTestCase):
     def test_open_and_first_lease_atomic_one_mutation(self):
@@ -867,6 +878,29 @@ class TestActiveBlacklistedFingerprints(LifecycleServiceTestCase):
         self.assertEqual(tuple(sorted(result)), result)
         self.assertEqual(3, len(result))
 
+    def test_sorted_independent_of_db_enumeration_order(self):
+        """Result must be sorted even if the DB returns rows in reverse/unsorted order."""
+        fp_vals = sorted([fp(1), fp(3), fp(5)])
+        blacklisted_row = encode_link_state(
+            {
+                "schema_version": 1,
+                "state": "blacklisted",
+                "first_blocked_epoch": NOW - 100,
+                "blacklisted_epoch": NOW - 50,
+            }
+        )
+        for f in fp_vals:
+            self.ls_db().update_store(f, blacklisted_row)
+        # Override enumeration to return rows in reverse (unsorted) order
+        db = self.ls_db()
+        original_enum = db.retrieve_all_titles
+        db.retrieve_all_titles = lambda: list(reversed(original_enum()))
+        try:
+            result = self.service().active_blacklisted_fingerprints()
+        finally:
+            db.retrieve_all_titles = original_enum
+        self.assertEqual(tuple(fp_vals), result)
+
 
 class TestConcurrencyAndRollback(LifecycleServiceTestCase):
     def test_concurrent_opener_hook_writes_no_orphan_members(self):
@@ -905,6 +939,59 @@ class TestConcurrencyAndRollback(LifecycleServiceTestCase):
             self.assertNotEqual(fp(1), offer["link_fingerprint"])
         # Malformed row preserved
         self.assertEqual("corrupted_json{{", self.ls_db().retrieve(fp(1)))
+
+    def test_race_non_leased_candidate_link_state_aborts_sweep(self):
+        """Sweep open aborts if a non-leased first-time fingerprint's link state is written during the callback."""
+        all_fps = sorted([fp(1), fp(2), fp(3)])
+        # The leased candidate is the first-ordered first-time fp; pick the second as the race target
+        non_leased_fp = all_fps[1]
+        held_ls = encode_link_state(
+            {
+                "schema_version": 1,
+                "state": "held",
+                "first_blocked_epoch": NOW,
+                "retry_after_epoch": NOW + WINDOW,
+                "lease": {
+                    "sweep_id": "a" * 32,
+                    "offer_id": "b" * 32,
+                    "package_id": pkg(99),
+                    "offer_expires_epoch": NOW + OFFER_LEASE_SECONDS,
+                },
+            }
+        )
+
+        def install_race():
+            self.ls_db().update_store(non_leased_fp, held_ls)
+
+        self.sweep_db().before_mutation = install_race
+
+        svc = self.service()
+        offer = svc.prepare_offer(rows_for([1, 2, 3]))
+
+        self.assertIsNone(offer)
+        self.assertIsNone(self.header())
+        self.assertIsNone(self.members_db().retrieve_all_titles())
+        # Race-installed link state is preserved, not overwritten
+        self.assertEqual(held_ls, self.ls_db().retrieve(non_leased_fp))
+
+    def test_race_live_sweep_header_aborts_individual(self):
+        """Individual open aborts if a live sweep header is installed during the mutation callback."""
+
+        def install_race():
+            self.install_header(self.make_sweeping_header("c" * 32))
+
+        self.sweep_db().before_mutation = install_race
+
+        svc = self.service()
+        offer = svc.prepare_offer(rows_for([1]))
+
+        self.assertIsNone(offer)
+        # No link-state written for the individual candidate
+        self.assertIsNone(self.link_state(fp(1)))
+        # The concurrently-installed sweep header is preserved
+        hdr = self.header()
+        self.assertIsNotNone(hdr)
+        self.assertEqual("sweeping", hdr["state"])
 
 
 class TestScale(LifecycleServiceTestCase):
