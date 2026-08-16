@@ -85,6 +85,28 @@ class AtomicDatabase:
     def update_store(self, key, value):
         return self.store(key, value)
 
+    def mutate_value(self, key, mutator):
+        with self.lock:
+            self.mutation_count += 1
+            current = self.rows.get(key)
+            new_value = mutator(current)
+            if new_value is None:
+                self.rows.pop(key, None)
+            else:
+                self.rows[key] = new_value
+            return new_value
+
+    def delete(self, key):
+        with self.lock:
+            self.rows.pop(key, None)
+
+    def delete_exact(self, key, value):
+        with self.lock:
+            if self.rows.get(key) != value:
+                return False
+            self.rows.pop(key, None)
+            return True
+
     def mutate_values(self, targets, mutator):
         with self.lock:
             self.mutation_count += 1

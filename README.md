@@ -193,7 +193,19 @@ docker run -d \
 | `USER` / `PASS`    | Optional, but recommended! Username / Password to protect the web UI.                                      |
 | `AUTH`             | Authentication mode. Supported values: `form` or `basic`.                                                  |
 | `TZ`               | Optional. Timezone. Incorrect values may cause HTTPS/SSL issues.                                           |
-| `FILECRYPT_SWEEP_WINDOW_MINUTES` | Optional. Filecrypt sweep window in minutes (1–1440, default 15). A WebGUI override under **Link Protection** takes precedence over this value. |
+| `FILECRYPT_SWEEP_WINDOW_MINUTES` | Optional. Filecrypt sweep window in minutes (1–1440, default 15). A WebGUI override under **Link Protection** takes precedence over this value; clearing the WebGUI override reverts to this ENV or the default. |
+
+## Filecrypt Link Lifecycle
+
+When SponsorsHelper (v1 protocol) reports a Filecrypt link unavailable (IP block), Quasarr applies a **per-link 24-hour hold** rather than immediately failing the release. A full sweep of at least five links that are all blocked closes with a **global cooldown**; a single reachable link (CLEAR) prevents the global cooldown. Key operator behaviors:
+
+- **Per-link 24 h hold**: each blocked link is held individually. No release fails during its first blocked result.
+- **Global cooldown minimum**: requires at least 5 members all blocked. Fewer members get individual holds without a global cooldown.
+- **Unlimited denominator**: sweeps are not capped at 100 links. Quasarr handles any number of Filecrypt packages without truncation.
+- **CLEAR prevents global cooldown**: one accessible link in a sweep marks the whole linkcrypter as healthy.
+- **Second-blocked terminal blacklist**: after a 24 h hold the link is rechecked; a second blocked result permanently blacklists the URL. The release fails exactly once; other releases sharing the URL have their link scrubbed (with alternatives) or fail exactly once (sole link).
+- **Arr blocklist matching**: Quasarr publishes stable Newznab publication dates so Radarr/Sonarr/Lidarr can match failed releases in their blocklist. Do not modify the publication date of a failed release manually.
+- **Sweep window**: configurable via `FILECRYPT_SWEEP_WINDOW_MINUTES` (ENV) or **Link Protection → Sweep window override** in the WebGUI. Stored WebGUI value takes precedence over ENV; clearing the WebGUI override reverts to ENV or the 15-minute default.
 
 # Manual setup
 

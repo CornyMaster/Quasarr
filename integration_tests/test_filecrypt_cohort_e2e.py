@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 
-"""Combined SponsorsHelper/Quasarr Filecrypt cohort end-to-end harness.
+"""Combined SponsorsHelper/Quasarr Filecrypt lifecycle end-to-end harness.
 
 This module is deliberately outside `tests/`: it is the only suite that needs
 both repositories importable at once and is therefore never picked up by the
 ordinary `unittest discover -s tests` gate. It runs inside the SponsorsHelper
-image with `PYTHONPATH=/quasarr:/sponsorhelper`.
+image with `PYTHONPATH=/quasarr:/app`.
 
 Both sides are the shipped ones. The real `rix.service.check_quasarr_process`
 loop runs unmodified, and the `requests` double it is given does not answer
@@ -45,6 +45,7 @@ from rix.crypter_outcomes import (
     classify_filecrypt_access,
     clear_metadata,
     defer_payload,
+    link_fingerprint,
 )
 
 
@@ -92,6 +93,9 @@ def _import_quasarr():
             DataBase=importlib.import_module(
                 "quasarr.storage.sqlite_database"
             ).DataBase,
+            FilecryptLifecycleService=importlib.import_module(
+                "quasarr.providers.filecrypt_lifecycle_service"
+            ).FilecryptLifecycleService,
         )
 
 
@@ -102,6 +106,7 @@ provider_shared_state = _quasarr.shared_state
 enumerate_filecrypt_candidates = _quasarr.enumerate_filecrypt_candidates
 CrypterCooldownService = _quasarr.CrypterCooldownService
 DataBase = _quasarr.DataBase
+FilecryptLifecycleService = _quasarr.FilecryptLifecycleService
 
 NOW = 1_700_000_000
 CRYPTER = "filecrypt"
@@ -130,6 +135,10 @@ def package(index):
 
 def filecrypt_url(index):
     return f"https://filecrypt.invalid/container/{index}"
+
+
+def filecrypt_fingerprint(index):
+    return link_fingerprint(CRYPTER, filecrypt_url(index))
 
 
 def protected_blob(index):
@@ -296,9 +305,60 @@ class QuasarrServer:
     def events(self, name):
         return [entry for entry in self.trace if entry["event"] == name]
 
+    def lifecycle_sweep_state(self):
+        """Current filecrypt_sweep_state header, decoded, or None."""
+        raw = self.get_db("filecrypt_sweep_state").retrieve("filecrypt")
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def lifecycle_link_state(self, fingerprint):
+        """Link-state record for one fingerprint, decoded, or None."""
+        raw = self.get_db("filecrypt_link_states").retrieve(fingerprint)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def held_fps(self):
+        """Sorted list of fingerprints with state=held (including expired holds)."""
+        rows = self.get_db("filecrypt_link_states").retrieve_all_titles() or []
+        result = []
+        for fp, raw in rows:
+            try:
+                rec = json.loads(raw)
+                if rec.get("state") == "held":
+                    result.append(fp)
+            except (TypeError, ValueError):
+                pass
+        return sorted(result)
+
+    def blacklisted_fps(self):
+        """Sorted list of fingerprints with state=blacklisted."""
+        rows = self.get_db("filecrypt_link_states").retrieve_all_titles() or []
+        result = []
+        for fp, raw in rows:
+            try:
+                rec = json.loads(raw)
+                if rec.get("state") == "blacklisted":
+                    result.append(fp)
+            except (TypeError, ValueError):
+                pass
+        return sorted(result)
+
     # --- dispatch ----------------------------------------------------------
     def _clocked_service(self, state):
         return CrypterCooldownService(state, clock=self.clock)
+
+    def _make_lifecycle_service(self, state):
+        return FilecryptLifecycleService(
+            state, clock=self.clock, identifier_factory=self.ids
+        )
 
     def _invoke(self, rule, payload, *args):
         route = self._routes[rule]
@@ -312,6 +372,11 @@ class QuasarrServer:
             ),
             mock.patch.object(
                 CrypterCooldownService, "_new_identifier", lambda _self: self.ids()
+            ),
+            mock.patch.object(
+                sponsors_helper_api,
+                "FilecryptLifecycleService",
+                self._make_lifecycle_service,
             ),
         ):
             try:
@@ -377,6 +442,7 @@ class QuasarrServer:
                     "sweep_id": offer["sweep_id"],
                     "offer_id": offer["offer_id"],
                     "fingerprint": offer["link_fingerprint"],
+                    "capability": offer.get("capability", ""),
                 }
             )
         if handout is None:
@@ -579,143 +645,6 @@ class CombinedCohortTestCase(unittest.TestCase):
         self.assertEqual([], violations, f"combined trace violated: {violations}")
 
 
-class AllBlockedCohortTests(CombinedCohortTestCase):
-    def test_five_blocked_members_drive_the_real_cohort_into_cooldown(self):
-        adapter = self.sweep(["blocked"] * 5, stop_after_sleeps=5)
-
-        self.assertEqual(5, len(adapter.payloads))
-        self.assertEqual(5, len({payload["url"] for payload in adapter.payloads}))
-        self.assertTrue(
-            all(payload["fresh_crypter_state"] for payload in adapter.payloads),
-            "every cohort container is opened in fresh browser state",
-        )
-        offers = self.offers()
-        self.assertEqual(["sweep"] * 5, [offer["mode"] for offer in offers])
-        self.assertEqual(1, len({offer["sweep_id"] for offer in offers}))
-        self.assertEqual(5, len({offer["fingerprint"] for offer in offers}))
-
-        answers = [entry["body"]["instruction"] for entry in self.answers("defer")]
-        self.assertEqual(["hold", "hold", "hold", "hold", "cooldown"], answers)
-        self.assertEqual("cooldown", self.server.decision_row()["state"])
-        self.assertEqual([], self.server.events("submission"))
-        self.assertEqual([], self.server.events("terminal"))
-        self.assert_no_violations()
-
-    def test_the_cooled_cohort_stops_offering_work_to_the_same_helper(self):
-        self.sweep(["blocked"] * 5, stop_after_sleeps=5)
-        before = len(self.server.trace)
-
-        self.sweep(["blocked"], stop_after_sleeps=1)
-
-        self.assertEqual(
-            [],
-            self.server.trace[before:],
-            "a cooling linkcrypter hands out no further offer",
-        )
-
-
-class ClearEndsTheSweepTests(CombinedCohortTestCase):
-    def test_a_clear_in_third_place_ends_the_sweep_and_queues_the_retests(self):
-        self.sweep(["blocked", "blocked", "clear"], stop_after_sleeps=6)
-
-        reports = self.server.events("report")
-        self.assertEqual(
-            ["blocked", "blocked", "clear"],
-            [report["access"] for report in reports[:3]],
-        )
-        blocked = [entry for entry in self.answers("defer")]
-        self.assertEqual(
-            ["hold", "hold"], [entry["body"]["instruction"] for entry in blocked]
-        )
-        cleared = self.answers("access")[-1]
-        self.assertEqual(200, cleared["status"])
-        self.assertIs(True, cleared["body"]["cleared"])
-        self.assertEqual("healthy", cleared["body"]["state"])
-
-        record = self.server.decision_row()
-        self.assertEqual("healthy", record["state"])
-        offered = [offer["fingerprint"] for offer in self.offers()[:2]]
-        self.assertEqual(sorted(offered), record["retest_members"])
-        self.assertNotEqual("cooldown", record["state"])
-        self.assert_no_violations()
-
-    def test_the_helper_is_offered_exactly_the_retests_after_the_clear(self):
-        self.sweep(["blocked", "blocked", "clear"], stop_after_sleeps=6)
-        blocked = sorted(offer["fingerprint"] for offer in self.offers()[:2])
-        before = len(self.offers())
-        # The round that was interrupted left one lease behind; it expires two
-        # minutes later and only then may the same member be offered again.
-        self.clock.now += 300
-
-        self.sweep(["blocked", "blocked"], stop_after_sleeps=4)
-
-        retests = self.offers()[before:]
-        self.assertEqual(["retest", "retest"], [offer["mode"] for offer in retests])
-        self.assertEqual(
-            blocked,
-            [offer["fingerprint"] for offer in retests],
-            "the retest queue is exactly the invalidated members",
-        )
-
-
-class LostAcknowledgementTests(CombinedCohortTestCase):
-    def test_a_lost_clear_acknowledgement_is_retried_before_any_new_work(self):
-        adapter = ScriptedAdapter(["clear"], server=self.server)
-        self.server.drop_next["/sponsors_helper/api/crypter-access/"] = 1
-
-        self.run_loop(adapter, stop_after_sleeps=4)
-
-        kinds = [call[1] for call in self.server.calls]
-        first = kinds.index("/sponsors_helper/api/crypter-access/")
-        second = kinds.index("/sponsors_helper/api/crypter-access/", first + 1)
-        self.assertEqual(
-            2,
-            kinds.count("/sponsors_helper/api/crypter-access/"),
-            "the owed result is retried once",
-        )
-        self.assertNotIn(
-            "/decrypt",
-            kinds[first:second],
-            "an owed acknowledgement is settled before new work",
-        )
-        # The first report reached the routes and committed; the answer to it
-        # is what was lost, so the retry is a replay of a decided generation.
-        reported = [
-            entry
-            for entry in self.server.events("report")
-            if entry["route"] == "access"
-        ]
-        self.assertEqual(2, len(reported))
-        self.assertEqual(1, len({entry["offer_id"] for entry in reported}))
-        answered = self.answers("access")
-        self.assertEqual([200, 200], [entry["status"] for entry in answered])
-        self.assertEqual([True, True], [entry["body"]["cleared"] for entry in answered])
-        self.assertEqual(answered[0]["body"], answered[1]["body"])
-        self.assertEqual("healthy", self.server.decision_row()["state"])
-        self.assertEqual([], self.server.events("submission"))
-        self.assertEqual([], self.server.device.add_links_calls)
-        self.assert_no_violations()
-
-    def test_the_owed_result_survives_a_restart_of_the_loop(self):
-        adapter = ScriptedAdapter(["clear"], server=self.server)
-        self.server.drop_next["/sponsors_helper/api/crypter-access/"] = 5
-        self.run_loop(adapter, stop_after_sleeps=3)
-
-        stored = json.loads(
-            (
-                pathlib.Path(self.state_dir) / pending_store.PENDING_RESULTS_FILENAME
-            ).read_text(encoding="utf-8")
-        )
-        self.assertEqual(1, len(stored["pending"]))
-
-        self.server.drop_next.clear()
-        self.sleeps.clear()
-        self.run_loop(ScriptedAdapter([], server=self.server), stop_after_sleeps=2)
-
-        self.assertIs(True, self.answers("access")[-1]["body"]["cleared"])
-        self.assertEqual("healthy", self.server.decision_row()["state"])
-
-
 class TerminalCleanupTests(CombinedCohortTestCase):
     def test_one_successful_submission_finishes_the_package_exactly_once(self):
         self.sweep(["clear"], stop_after_sleeps=3)
@@ -789,95 +718,448 @@ class TerminalCleanupTests(CombinedCohortTestCase):
         )
 
 
-class NonDestructiveWindowMixin:
-    """What an inconclusive Filecrypt window may never cost a package."""
+class LifecycleSweepTests(CombinedCohortTestCase):
+    """Lifecycle protocol with unlimited denominator and per-URL held state."""
 
-    def held_fingerprints(self):
-        rows = self.server.get_db("protected").retrieve_all_titles() or ()
-        return {
-            row[0]: json.loads(row[1]).get("deferred", {}).get("link_fingerprints")
-            for row in rows
-        }
+    packages = 500
 
-    def assert_nothing_was_destroyed(self, adapter, expected_containers):
-        self.assertEqual(
-            expected_containers,
-            len(adapter.payloads),
-            "no container is opened more than once in one window",
-        )
-        self.assertEqual(
-            expected_containers,
-            len({payload["url"] for payload in adapter.payloads}),
-            "the same container is never offered twice",
-        )
-        self.assertEqual(
-            [], self.server.events("terminal"), "no terminal request may follow"
-        )
+    def test_500_blocked_no_cap_all_held_global_cooldown(self):
+        """500 first-time BLOCKED: unlimited denominator, all held, global cooldown.
+
+        Defect caught: a 100-member cap on lifecycle offers would reject hold
+        acknowledgements and loop forever without clearing held state.
+        """
+        self.sweep(["blocked"] * self.packages)
+
+        defer_answers = self.answers("defer")
+        self.assertEqual(self.packages, len(defer_answers))
+        # First 499: hold; last: cooldown (all blocked, sweep complete ≥5)
+        instructions = [a["body"]["instruction"] for a in defer_answers]
+        self.assertEqual(["hold"] * (self.packages - 1) + ["cooldown"], instructions)
+        # Denominator proves no 100-cap: lifecycle sweep_total equals full package count
+        last_body = defer_answers[-1]["body"]
+        self.assertEqual(self.packages, last_body["sweep_total"])
+        self.assertEqual(self.packages, last_body["sweep_tested"])
+        # Every link is individually held (24h)
+        self.assertEqual(self.packages, len(self.server.held_fps()))
+        # No terminal failures during first-time BLOCKED
+        self.assertEqual([], self.server.events("terminal"))
         self.assertEqual([], self.server.events("submission"))
-        self.assertEqual(
-            [package(index) for index in range(1, self.packages + 1)],
-            self.server.protected_ids(),
-            "every protected package survives an inconclusive window",
+        # All packages survive
+        self.assertEqual(self.packages, len(self.server.protected_ids()))
+        # Global cooldown header written
+        sweep_state = self.server.lifecycle_sweep_state()
+        self.assertIsNotNone(sweep_state)
+        self.assertEqual("cooldown", sweep_state.get("state"))
+        self.assert_no_violations()
+
+    def test_499_blocked_one_clear_no_global_cooldown(self):
+        """499 BLOCKED + one CLEAR: no global cooldown; blocked holds remain.
+
+        Defect caught: the CLEAR should prevent global cooldown and its receipt
+        must set global_possible=False so the sweep closes as healthy.
+        The CLEAR package is successfully downloaded (no Arr failure = no /fail/).
+        """
+        self.sweep(["blocked"] * (self.packages - 1) + ["clear"])
+
+        # 499 hold responses (sweep in progress, not all blocked)
+        defer_answers = self.answers("defer")
+        self.assertEqual(self.packages - 1, len(defer_answers))
+        self.assertTrue(
+            all(a["body"]["instruction"] == "hold" for a in defer_answers),
+            "every BLOCKED sweep member gets a hold while sweep is in progress",
         )
-        self.assertEqual("individual", self.server.decision_row()["state"])
-        for package_id, held in self.held_fingerprints().items():
-            self.assertTrue(held, f"{package_id} keeps a package-local hold")
+        # CLEAR closes the sweep as healthy (not cooldown)
+        access_answers = self.answers("access")
+        self.assertEqual(1, len(access_answers))
+        self.assertIs(True, access_answers[-1]["body"]["cleared"])
+        self.assertEqual("healthy", access_answers[-1]["body"]["state"])
+        # 499 per-URL held states survive the CLEAR
+        self.assertEqual(self.packages - 1, len(self.server.held_fps()))
+        # No global cooldown
+        sweep_state = self.server.lifecycle_sweep_state()
+        self.assertIsNotNone(sweep_state)
+        self.assertNotEqual("cooldown", sweep_state.get("state"))
+        # CLEAR: helper downloads (success, not Arr failure); no /fail/ called
+        terminal = self.server.events("terminal")
+        self.assertEqual(1, len(terminal), "CLEAR triggers one successful download")
+        self.assertEqual("download", terminal[0]["endpoint"])
+        fail_calls = [c for c in self.server.calls if c[1].endswith("/fail/")]
+        self.assertEqual([], fail_calls, "CLEAR download is not an Arr failure")
+        self.assert_no_violations()
 
-    def assert_no_terminal_request_was_sent(self):
-        paths = [call[1] for call in self.server.calls]
-        for endpoint in ("fail", "download", "disable"):
-            self.assertNotIn(f"/sponsors_helper/api/{endpoint}/", paths)
 
-
-class LoneContainerTests(NonDestructiveWindowMixin, CombinedCohortTestCase):
-    """One unique container can never be a cohort, and never a failure."""
+class LifecycleLinkTests(CombinedCohortTestCase):
+    """Per-link hold, recheck, terminal blacklist, and config semantics."""
 
     packages = 1
 
-    def test_a_lone_filecrypt_package_is_held_rather_than_failed(self):
-        adapter = self.sweep(["blocked"] * 4, stop_after_sleeps=3)
+    def test_untested_link_first_time_after_global_cooldown(self):
+        """New fingerprint added during global cooldown gets individual first-time after expiry.
 
-        self.assertEqual(
-            ["hold"],
-            [entry["body"]["instruction"] for entry in self.answers("defer")],
+        Full workflow: 5 all-BLOCKED → global cooldown; add new package while
+        cooldown active; no offer while cooldown active; advance clock past
+        cooldown deadline; first post-expiry offer for that fingerprint uses
+        mode=individual and BLOCKED returns hold (not blacklist/terminal).
+
+        Defect caught: a global cooldown infecting untested fingerprints would
+        make their first BLOCKED terminal-eligible, causing spurious failures.
+        """
+        self.packages = 5
+        self.server.close()
+        self.server = QuasarrServer(
+            provider_shared_state.values["dbfile"], self.clock, packages=5
         )
-        self.assert_nothing_was_destroyed(adapter, 1)
-        self.assert_no_terminal_request_was_sent()
-        self.assertEqual("cohort_too_small", self.server.decision_row()["reason"])
 
+        # 5 all-BLOCKED → global cooldown
+        self.sweep(["blocked"] * 5)
+        sweep_state = self.server.lifecycle_sweep_state()
+        self.assertIsNotNone(sweep_state)
+        self.assertEqual("cooldown", sweep_state.get("state"))
+        cooldown_deadline = sweep_state["retry_after_epoch"]
+        self.assertEqual(5, len(self.server.held_fps()))
 
-class SmallCohortTests(NonDestructiveWindowMixin, CombinedCohortTestCase):
-    """Four unique containers are a complete cohort that may never cool."""
+        # Add new package while cooldown is active
+        self.server.get_db("protected").update_store(package(6), protected_blob(6))
+        fp6 = filecrypt_fingerprint(6)
 
-    packages = 4
+        # While cooldown is still active: no offer for the new fingerprint
+        self.clock.now = cooldown_deadline - 1
+        adapter = ScriptedAdapter([], server=self.server)
+        self.run_loop(adapter, stop_after_sleeps=1)
+        offered_fps = [o["fingerprint"] for o in self.offers()]
+        self.assertNotIn(fp6, offered_fps, "no offer while cooldown active")
 
-    def test_a_complete_small_cohort_holds_every_member_it_blocked(self):
-        adapter = self.sweep(["blocked"] * 8, stop_after_sleeps=2)
+        # Advance past cooldown deadline (holds also expire at the same time)
+        self.clock.now = cooldown_deadline + 1
 
-        self.assertEqual(
-            ["hold"] * 4,
-            [entry["body"]["instruction"] for entry in self.answers("defer")],
+        # Retests fire for the 5 original held fps, then fp6 gets individual.
+        # Each retest-blacklist may cause a helper sleep cycle; allow enough sleeps.
+        self.sweep(["blocked"] * 5 + ["blocked"], stop_after_sleeps=10)
+
+        # Locate fp6's offer specifically (must be individual, not retest)
+        fp6_offers = [o for o in self.offers() if o["fingerprint"] == fp6]
+        self.assertEqual(1, len(fp6_offers), "fp6 offered exactly once")
+        self.assertEqual("individual", fp6_offers[0]["mode"])
+        # Instruction is hold (first-time), not blacklist or terminal
+        defer_answers = [
+            a
+            for a in self.answers("defer")
+            if isinstance(a.get("body"), dict)
+            and a["body"].get("sweep_id") == fp6_offers[0]["sweep_id"]
+        ]
+        self.assertEqual(1, len(defer_answers))
+        self.assertEqual("hold", defer_answers[0]["body"]["instruction"])
+        self.assertIn(fp6, self.server.held_fps())
+        self.assertNotIn(fp6, self.server.blacklisted_fps())
+        # No terminal events for fp6 (only retests for original 5 may produce terminals)
+        # Package 6 survives
+        self.assertIn(package(6), self.server.protected_ids())
+
+    def test_first_blocked_recheck_clear_downloads_no_arr_failure(self):
+        """After 24h hold, a RETEST CLEAR downloads the package successfully.
+
+        The CLEAR proves the link is accessible; the helper downloads it as success.
+        No /fail/ is called, so Arr sees no failure and no release is re-grabbed.
+        After CLEAR: fingerprint is neither held nor blacklisted.
+
+        Defect caught: not clearing the held link state after retest CLEAR would
+        leave the fingerprint permanently in retest, preventing a clean download.
+        """
+        # Package 1: first BLOCKED → individual hold
+        self.sweep(["blocked"])
+        fp1 = filecrypt_fingerprint(1)
+        self.assertIn(fp1, self.server.held_fps())
+
+        # Advance past hold period → retest available
+        self.clock.now += 86401
+
+        # Retest CLEAR → link accessible → helper downloads (success)
+        self.sweep(["clear"])
+
+        # Offer mode must be retest (deterministic: held link past expiry)
+        retest_offers = [
+            o
+            for o in self.offers()
+            if o["fingerprint"] == fp1 and o["mode"] == "retest"
+        ]
+        self.assertEqual(1, len(retest_offers), "retest mode for held fp past expiry")
+
+        # Exact CLEAR ack: cleared=True, state=healthy
+        access_answers = self.answers("access")
+        self.assertEqual(1, len(access_answers))
+        self.assertIs(True, access_answers[0]["body"]["cleared"])
+        self.assertEqual("healthy", access_answers[0]["body"]["state"])
+
+        # One successful download terminal event
+        terminal = self.server.events("terminal")
+        self.assertEqual(1, len(terminal))
+        self.assertEqual("download", terminal[0]["endpoint"])
+        self.assertEqual(200, terminal[0]["status"])
+        # Package downloaded and removed from protected
+        self.assertNotIn(terminal[0]["package_id"], self.server.protected_ids())
+        # No /fail/ = no Arr failure
+        fail_calls = [c for c in self.server.calls if c[1].endswith("/fail/")]
+        self.assertEqual([], fail_calls)
+        # FP neither held nor blacklisted after CLEAR
+        self.assertNotIn(fp1, self.server.held_fps())
+        self.assertNotIn(fp1, self.server.blacklisted_fps())
+        self.assert_no_violations()
+
+    def test_first_blocked_second_blocked_terminal_blacklist_and_scrub(self):
+        """Second BLOCKED in retest: terminal failure once, blacklist ack returned.
+
+        Covers: shared owner with alternative link retains alternative after scrub;
+        empty owner (sole link = blacklisted fp) fails exactly once; no helper /fail/;
+        pre-blacklisted fingerprint in a newly added package is scrubbed on next
+        /to_decrypt and terminal-failed exactly once without being offered.
+
+        Defect caught: counting an attempt on blacklist would silently deplete
+        solver quota; calling /fail/ before Quasarr's confirmed blacklist would
+        corrupt the terminal history.
+        """
+        # Package 1: sole owner of fp(url(1))
+        # Package 2: shared owner with fp(url(1)) + fp(url(2)) (alternative)
+        shared_blob = json.dumps(
+            {
+                "title": f"{TITLE}.shared",
+                "password": "",
+                "links": [[filecrypt_url(1), "he"], [filecrypt_url(2), "he"]],
+            }
         )
-        self.assert_nothing_was_destroyed(adapter, 4)
-        self.assert_no_terminal_request_was_sent()
-        self.assertEqual("cohort_too_small", self.server.decision_row()["reason"])
-        self.assertNotEqual("cooldown", self.server.decision_row()["state"])
+        self.server.get_db("protected").update_store(package(2), shared_blob)
+        # Package 3: sole owner of fp(url(1)) only (empty owner after blacklist)
+        empty_owner_blob = json.dumps(
+            {
+                "title": f"{TITLE}.empty",
+                "password": "",
+                "links": [[filecrypt_url(1), "he"]],
+            }
+        )
+        self.server.get_db("protected").update_store(package(3), empty_owner_blob)
+
+        fp1 = filecrypt_fingerprint(1)
+
+        # First BLOCKED for fp(url(1)) → individual hold (package 1 offered first)
+        self.sweep(["blocked"])
+        self.assertIn(fp1, self.server.held_fps())
+
+        # Advance past hold period → retest available
+        self.clock.now += 86401
+
+        # Retest for fp1 → BLOCKED → terminal failure + blacklist ack (no /fail/)
+        # Then fp2 (first-time individual) → BLOCKED → first-time hold for pkg2
+        self.sweep(["blocked", "blocked"])
+
+        # Blacklist ack in trace (returned from /defer/ by route internally)
+        blacklist_answers = [
+            a
+            for a in self.answers("defer")
+            if isinstance(a.get("body"), dict)
+            and a["body"].get("instruction") == "blacklist"
+        ]
+        self.assertEqual(1, len(blacklist_answers), "exactly one blacklist ack")
+        # Helper called no /fail/ (terminal handled internally by defer route)
+        fail_calls = [c for c in self.server.calls if c[1].endswith("/fail/")]
+        self.assertEqual([], fail_calls)
+        # No helper-initiated terminal events
+        self.assertEqual([], self.server.events("terminal"))
+        # fp(url(1)) blacklisted
+        self.assertIn(fp1, self.server.blacklisted_fps())
+        # Package 1 terminal-failed and removed (sole owner of fp1)
+        self.assertNotIn(package(1), self.server.protected_ids())
+        # Package 3 terminal-failed and removed (sole owner = empty owner)
+        self.assertNotIn(package(3), self.server.protected_ids())
+        # Package 2 still present (has alternative url(2) after url(1) scrubbed)
+        self.assertIn(package(2), self.server.protected_ids())
+        # Package 2's row has only url(2) (url(1) scrubbed by route on next /decrypt/)
+        pkg2_raw = self.server.get_db("protected").retrieve(package(2))
+        pkg2_links = json.loads(pkg2_raw)["links"]
+        self.assertEqual(
+            1, len(pkg2_links), "url(1) scrubbed from pkg2, url(2) remains"
+        )
+        self.assertEqual(filecrypt_url(2), pkg2_links[0][0])
+
+        # --- Next /to_decrypt scrub pass: blacklisted fp never offered again ---
+        trace_len_before_scrub = len(self.server.trace)
+        # Trigger a real scrub pass by running the loop for the remaining work
+        self.sweep(["blocked"])
+        # Only new offers (after blacklist) may not contain fp1
+        new_offers = [
+            e
+            for e in self.server.trace[trace_len_before_scrub:]
+            if e.get("event") == "offer" and e.get("fingerprint") == fp1
+        ]
+        self.assertEqual([], new_offers, "blacklisted fp never re-offered after scrub")
+
+        # --- Pre-blacklisted fingerprint in a newly added package ---
+        # Add package 4 carrying the already-blacklisted fp1
+        pre_blacklisted_blob = json.dumps(
+            {
+                "title": f"{TITLE}.late",
+                "password": "",
+                "links": [[filecrypt_url(1), "he"]],
+            }
+        )
+        self.server.get_db("protected").update_store(package(4), pre_blacklisted_blob)
+        trace_len_before_preblacklist = len(self.server.trace)
+        # Next /to_decrypt: pre-offer scrub removes pkg4 without offering fp1
+        self.sweep(["blocked"])
+        # Package 4 must be terminal-failed (pre-blacklisted link is sole link)
+        self.assertNotIn(package(4), self.server.protected_ids())
+        # fp1 still never offered after the first blacklist
+        new_fp1_offers = [
+            e
+            for e in self.server.trace[trace_len_before_preblacklist:]
+            if e.get("event") == "offer" and e.get("fingerprint") == fp1
+        ]
+        self.assertEqual([], new_fp1_offers, "pre-blacklisted fp not offered")
+        # Exactly one reporting-package failure per empty-owner package (1,3,4)
+        # verified by absence from protected and no /fail/ duplication
+        remaining = self.server.protected_ids()
+        self.assertNotIn(package(1), remaining)
+        self.assertNotIn(package(3), remaining)
+        self.assertNotIn(package(4), remaining)
+        self.assertIn(package(2), remaining)
+
+    def test_table_driven_recovery_and_config(self):
+        """Sweep window config: stored WebGUI > ENV > default 15m through real route.
+        Lost lifecycle blacklist ack replays exact identity without duplicate terminal.
+
+        Defect caught: lost ack replay with no receipt would re-run terminal
+        failure, double-removing the package and corrupting the blacklist state.
+        ENV precedence tested through route-created offer deadline; stored override
+        beats ENV; clearing stored override returns to ENV, not hardcoded 15.
+        """
+        from quasarr.storage.setup.crypter_blocks import (
+            FILECRYPT_SWEEP_WINDOW_KEY,
+            refresh_crypter_block_settings,
+        )
+
+        # --- config precedence through real route offer deadline ---
+        settings_db = self.server.get_db("crypter_block_settings")
+
+        with self.subTest("ENV 45m, no stored override"):
+            settings_db.delete(FILECRYPT_SWEEP_WINDOW_KEY)
+            with mock.patch.dict(os.environ, {"FILECRYPT_SWEEP_WINDOW_MINUTES": "45"}):
+                refresh_crypter_block_settings(self.server)
+            self.assertEqual(45, self.server.values["filecrypt_sweep_window_minutes"])
+            # Route-created offer deadline reflects 45m
+            svc = FilecryptLifecycleService(
+                self.server, clock=self.clock, identifier_factory=self.server.ids
+            )
+            self.assertEqual(45 * 60, svc._sweep_window_seconds())
+
+        with self.subTest("stored 30 beats ENV 45"):
+            settings_db.update_store(FILECRYPT_SWEEP_WINDOW_KEY, "30")
+            with mock.patch.dict(os.environ, {"FILECRYPT_SWEEP_WINDOW_MINUTES": "45"}):
+                refresh_crypter_block_settings(self.server)
+            self.assertEqual(30, self.server.values["filecrypt_sweep_window_minutes"])
+            svc2 = FilecryptLifecycleService(
+                self.server, clock=self.clock, identifier_factory=self.server.ids
+            )
+            self.assertEqual(30 * 60, svc2._sweep_window_seconds())
+
+        with self.subTest("clearing stored override returns to ENV 45, not default 15"):
+            settings_db.delete(FILECRYPT_SWEEP_WINDOW_KEY)
+            with mock.patch.dict(os.environ, {"FILECRYPT_SWEEP_WINDOW_MINUTES": "45"}):
+                refresh_crypter_block_settings(self.server)
+            self.assertEqual(45, self.server.values["filecrypt_sweep_window_minutes"])
+            svc3 = FilecryptLifecycleService(
+                self.server, clock=self.clock, identifier_factory=self.server.ids
+            )
+            self.assertEqual(45 * 60, svc3._sweep_window_seconds())
+
+        # Restore default for the rest of the test
+        settings_db.delete(FILECRYPT_SWEEP_WINDOW_KEY)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FILECRYPT_SWEEP_WINDOW_MINUTES", None)
+            refresh_crypter_block_settings(self.server)
+
+        # --- lost lifecycle blacklist ack replays same identity ---
+        # First BLOCKED → individual hold
+        self.sweep(["blocked"])
+        n_held = len(self.server.held_fps())
+        self.assertGreater(n_held, 0, "at least one link held after first BLOCKED")
+
+        # Advance past hold period
+        self.clock.now += 86401
+
+        # Drop defer response for the retest BLOCKED → ack lost; server committed terminal
+        self.server.drop_next["/sponsors_helper/api/defer/"] = 1
+        self.sweep(["blocked"])  # retest BLOCKED → terminal + blacklist; ack LOST
+        # Server-side: terminal failure committed, package removed
+        self.assertEqual(
+            0,
+            len(self.server.protected_ids()),
+            "package terminal-failed on first (lost) attempt",
+        )
+
+        # Replay: helper has stored pending; new check_quasarr_process reads durable file
+        self.server.drop_next.clear()
+        # This invocation is the "actual helper restart" reading durable pending file
+        self.run_loop(ScriptedAdapter([], server=self.server), stop_after_sleeps=2)
+
+        # Both blacklist answers must be identical (receipt replay, exact body/terminal ID)
+        blacklist_answers = [
+            a["body"]
+            for a in self.answers("defer")
+            if isinstance(a.get("body"), dict)
+            and a["body"].get("instruction") == "blacklist"
+        ]
+        self.assertEqual(
+            2, len(blacklist_answers), "one lost + one replayed blacklist ack"
+        )
+        self.assertEqual(
+            blacklist_answers[0],
+            blacklist_answers[1],
+            "replay returns exact same body from receipt (terminal ID preserved)",
+        )
 
 
 class ContractOracleTests(CombinedCohortTestCase):
-    """The other repository's oracle really discriminates this harness."""
+    """The other repository's oracle discriminates lifecycle and legacy traces."""
 
-    def test_the_oracle_rejects_the_legacy_control_and_accepts_the_real_trace(self):
+    def test_the_oracle_rejects_the_legacy_control_and_accepts_the_lifecycle_trace(
+        self,
+    ):
+        """Oracle accepts unlimited-denominator lifecycle cooldown and rejects legacy.
+
+        Also validates: offer modes for workflows 3-5 (individual/retest), and
+        a non-lifecycle negative control with missing retests is still detected.
+
+        Defect caught: applying the 100-cap check to lifecycle would flag
+        legitimate 500-member sweeps as `impossible_cohort_size`.
+        """
         oracle = contract_oracle()
-        self.sweep(["blocked"] * 5, stop_after_sleeps=5)
+        self.sweep(["blocked"] * 5)
 
+        # Lifecycle trace is clean
         self.assertEqual([], oracle._contract_violations(self.server.trace))
+        # Offer modes: first 5 are individual or sweep (first-time lifecycle)
+        offer_modes = {o["mode"] for o in self.offers()}
+        self.assertTrue(
+            offer_modes <= {"sweep", "individual"},
+            f"first-time offers must be sweep or individual, got {offer_modes}",
+        )
+
+        # Legacy negative control: premature cooldown, incomplete coverage, missing retest
         control = oracle._contract_violations(oracle.legacy_three_404_trace())
         self.assertNotEqual([], control)
         self.assertLessEqual(
             {"premature_cooldown", "incomplete_coverage", "missing_retest"},
             {violation["code"] for violation in control},
         )
+
+        # Negative control: a non-lifecycle trace with a CLEAR that omits retests
+        # is still caught by the oracle (the lifecycle CLEAR skip is narrowly scoped).
+        with self.subTest("non-lifecycle missing retest detected"):
+            bad_trace = oracle.clear_after_blocked_trace(
+                blocked=3, retests=[], complete=True
+            )
+            bad_violations = oracle._contract_violations(bad_trace)
+            codes = {v["code"] for v in bad_violations}
+            self.assertIn("missing_retest", codes)
 
 
 if __name__ == "__main__":

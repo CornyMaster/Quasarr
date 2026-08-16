@@ -16,6 +16,7 @@ import time
 from quasarr.providers import log
 from quasarr.providers.crypter_candidates import (
     FilecryptCandidate,
+    _link_carries_fingerprint,
     classify_package_ownership,
     enumerate_filecrypt_lifecycle_candidates,
 )
@@ -1835,6 +1836,71 @@ class FilecryptLifecycleService:
             "package_id": _pkg_id,
             "terminal_operation_id": _top_id,
         }
+
+    # ── owner scrub (Task 6B) ─────────────────────────────────────────────────
+
+    def blacklisted_owners(self, protected_rows, fingerprint):
+        """Sorted tuple of package_ids in protected_rows that own the fingerprint."""
+        inventory = enumerate_filecrypt_lifecycle_candidates(protected_rows)
+        owners = set()
+        for candidate in inventory.candidates:
+            if candidate.fingerprint == fingerprint:
+                for occ in candidate.occurrences:
+                    owners.add(occ.package_id)
+        return tuple(sorted(owners))
+
+    def remove_blacklisted_link(self, package_id, fingerprint):
+        """Compare-and-mutate removal of a blacklisted fingerprint from a package.
+
+        Removes the matching links and returns
+        ``{"link_removed": bool, "usable_links_remaining": int, "package_absent": bool}``.
+
+        If removal would leave the package with zero usable links the row is
+        NOT modified (link_removed=False, usable_links_remaining=0) so the
+        caller may open a terminal operation before removing the whole row.
+        """
+        result = [
+            {
+                "link_removed": False,
+                "usable_links_remaining": 0,
+                "package_absent": False,
+            }
+        ]
+
+        def _mutator(raw):
+            if raw is None:
+                result[0]["package_absent"] = True
+                return None
+            try:
+                data = json.loads(raw)
+            except (TypeError, ValueError, RecursionError):
+                return raw
+            if not isinstance(data, dict):
+                return raw
+            links = data.get("links")
+            if not isinstance(links, list):
+                return raw
+            kept = [
+                link
+                for link in links
+                if not _link_carries_fingerprint(link, FILECRYPT_CRYPTER, fingerprint)
+            ]
+            if len(kept) == len(links):
+                result[0]["usable_links_remaining"] = len(links)
+                return raw
+            if not kept:
+                # Would empty the package: leave unchanged so the caller may
+                # open a terminal operation before the whole row is removed.
+                result[0]["usable_links_remaining"] = 0
+                return raw
+            new_data = dict(data)
+            new_data["links"] = kept
+            result[0]["link_removed"] = True
+            result[0]["usable_links_remaining"] = len(kept)
+            return json.dumps(new_data, separators=(",", ":"), sort_keys=True)
+
+        self._shared_state.get_db("protected").mutate_value(package_id, _mutator)
+        return result[0]
 
     # ── blacklist confirmation (Task 3B2B) ────────────────────────────────────
 

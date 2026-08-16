@@ -7,7 +7,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from functools import wraps
 
-from bottle import HTTPResponse, abort, request
+from bottle import HTTPError, HTTPResponse, abort, request
 
 from quasarr.api.sponsors_helper.cohort_protocol import (
     COHORT_CRYPTER,
@@ -544,6 +544,68 @@ def setup_sponsors_helper_routes(app):
         """
         warn(f"{event} failed ({type(error).__name__})")
         return abort(500, "Internal server error")
+
+    def scrub_blacklisted_owners(lifecycle_service, protected_rows):
+        """Scrub blacklisted Filecrypt fingerprints from all owning packages.
+
+        Packages with alternative links have the blacklisted link removed.
+        Packages that would be left with no usable links are terminally failed
+        through the existing terminal-operation service.  CAPACITY, UNREADABLE,
+        and CONFLICT outcomes leave the last link intact for the next scrub pass.
+        The reporting package's absence is idempotent.
+        """
+        terminal_service = TerminalOperationService(shared_state)
+        for fp_val in lifecycle_service.active_blacklisted_fingerprints():
+            for pkg_id in lifecycle_service.blacklisted_owners(protected_rows, fp_val):
+                try:
+                    removal = lifecycle_service.remove_blacklisted_link(pkg_id, fp_val)
+                    if removal["package_absent"]:
+                        continue
+                    if removal["link_removed"]:
+                        # Alternatives remain; the package row is already updated.
+                        continue
+                    if removal["usable_links_remaining"] > 0:
+                        # Fingerprint not found in this package (already scrubbed).
+                        continue
+                    # Package has no usable links after scrub: run terminal failure.
+                    op_id = terminal_operation_id(pkg_id)
+                    with terminal_service.exclusive(op_id, pkg_id, "failed") as result:
+                        outcome = result["outcome"]
+                        if outcome in (CAPACITY, UNREADABLE, CONFLICT):
+                            # Preserve the link/package for the next scrub pass.
+                            continue
+                        context = {
+                            "service": terminal_service,
+                            "operation_id": op_id,
+                            "record": result["record"],
+                        }
+                        _present, package_data = read_protected_package(pkg_id)
+                        title = (
+                            package_data.get("title", "Unknown")
+                            if isinstance(package_data, dict)
+                            else "Unknown"
+                        )
+                        reason = (
+                            "Filecrypt URL permanently blacklisted; "
+                            "no remaining links available."
+                        )
+                        confirm_terminal_failure(context, pkg_id, title, reason)
+                except HTTPError as _http_err:
+                    if _http_err.status_code == 409:
+                        # Downstream identity conflict: preserve link, retry next pass.
+                        pass
+                    else:
+                        warn(
+                            f"Error scrubbing blacklisted Filecrypt owner "
+                            f"{_log_safe_package_id(pkg_id)}: "
+                            f"{type(_http_err).__name__}"
+                        )
+                except Exception as error:
+                    warn(
+                        f"Error scrubbing blacklisted Filecrypt owner "
+                        f"{_log_safe_package_id(pkg_id)}: "
+                        f"{type(error).__name__}"
+                    )
 
     def filecrypt_probe_occurrence(inventory, protected_rows):
         """The exact occurrence one queued `Check now` authorizes, or None.
@@ -1383,6 +1445,8 @@ def setup_sponsors_helper_routes(app):
                         status=503,
                         body="Filecrypt lifecycle migration unavailable",
                     )
+                scrub_blacklisted_owners(lifecycle_service, protected)
+                protected = shared_state.get_db("protected").retrieve_all_titles()
                 preferred_fp = None
                 probe_occurrence = filecrypt_probe_occurrence(
                     enumerate_filecrypt_lifecycle_candidates(protected), protected
