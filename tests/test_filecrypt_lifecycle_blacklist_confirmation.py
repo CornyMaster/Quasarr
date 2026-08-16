@@ -2,6 +2,7 @@
 """Tests for FilecryptLifecycleService.confirm_blacklist (Task 3B2B)."""
 
 import json
+import threading
 import unittest
 
 from quasarr.providers.filecrypt_lifecycle import (
@@ -279,6 +280,25 @@ class TestWrongIdentity(BlacklistConfirmationTestCase):
         raw_before = self.ls_db().retrieve(FP0)
         self.service().confirm_blacklist(FP0, OFFER_ID, other_top)
         self.assertEqual(raw_before, self.ls_db().retrieve(FP0))
+
+    def test_wrong_top_on_receipt_replay_returns_none(self):
+        # Link-state is blacklisted → only the receipt path can authorize;
+        # wrong TOP must be rejected by the receipt-path TOP check.
+        self.install_blacklisting()
+        self.confirm()  # fresh path: transitions to blacklisted, writes receipt
+        other_top = terminal_operation_id(pkg(1))
+        result = self.service().confirm_blacklist(FP0, OFFER_ID, other_top)
+        self.assertIsNone(result)
+
+    def test_wrong_top_on_receipt_replay_values_unchanged(self):
+        self.install_blacklisting()
+        self.confirm()
+        raw_ls_before = self.ls_db().retrieve(FP0)
+        raw_receipt_before = self.receipts_db().retrieve(OFFER_ID)
+        other_top = terminal_operation_id(pkg(1))
+        self.service().confirm_blacklist(FP0, OFFER_ID, other_top)
+        self.assertEqual(raw_ls_before, self.ls_db().retrieve(FP0))
+        self.assertEqual(raw_receipt_before, self.receipts_db().retrieve(OFFER_ID))
 
 
 # ── invalid argument syntax ───────────────────────────────────────────────────
@@ -594,13 +614,13 @@ class TestRollback(BlacklistConfirmationTestCase):
         self.assertIsNone(self.receipts_db().retrieve(OFFER_ID))
 
 
-# ── concurrency ───────────────────────────────────────────────────────────────
+# ── reentrant receipt replay (same-thread) ───────────────────────────────────
 
 
-class TestConcurrency(BlacklistConfirmationTestCase):
-    """Concurrent exact calls: one commits, the other replays identically."""
+class TestReentrantReceipt(BlacklistConfirmationTestCase):
+    """Reentrant same-thread replay via before_mutation hook: one commit, one replay."""
 
-    def test_concurrent_calls_produce_one_receipt_and_identical_results(self):
+    def test_reentrant_receipt_replay_produces_identical_result(self):
         self.install_blacklisting()
         svc = self.service()
         results = []
@@ -609,7 +629,8 @@ class TestConcurrency(BlacklistConfirmationTestCase):
             r = svc.confirm_blacklist(FP0, OFFER_ID, TOP0)
             results.append(r)
 
-        # Fire first_confirm inside the lock via the before_mutation hook
+        # Fire first_confirm inside the lock via the before_mutation hook;
+        # RLock is reentrant for the same thread so no deadlock.
         self.ls_db().before_mutation = first_confirm
 
         second_result = svc.confirm_blacklist(FP0, OFFER_ID, TOP0)
@@ -619,7 +640,7 @@ class TestConcurrency(BlacklistConfirmationTestCase):
         self.assertIsNotNone(second_result)
         self.assertEqual(results[0], second_result)
 
-    def test_concurrent_calls_write_exactly_one_receipt(self):
+    def test_reentrant_receipt_replay_writes_exactly_one_receipt(self):
         self.install_blacklisting()
         svc = self.service()
 
@@ -634,6 +655,163 @@ class TestConcurrency(BlacklistConfirmationTestCase):
         self.assertIsNotNone(raw)
         rcpt = decode_offer_receipt(raw)
         self.assertEqual(rcpt["outcome"], "blocked")
+
+
+# ── two-thread concurrency ────────────────────────────────────────────────────
+
+
+class TestTwoThreadConcurrent(BlacklistConfirmationTestCase):
+    """Two real threads on separate service instances sharing the same state.
+
+    The AtomicDatabase RLock serializes all mutate_values calls from different
+    threads.  The before_mutation hook (fired inside the lock) waits for
+    thread-2's ready event, which thread-2 sets BEFORE acquiring the lock.
+    This guarantees thread-2 is committed to calling confirm_blacklist when
+    thread-1 releases the lock — proving both paths ran without sleeps and
+    without deadlocking.
+
+    mutation_count == 2 after both threads join is a secondary proof that two
+    separate storage transactions executed (one fresh, one replay).
+    """
+
+    def test_two_threads_both_finish_no_errors(self):
+        self.install_blacklisting()
+        svc1 = self.service()
+        svc2 = self.service()
+
+        barrier = threading.Barrier(2)
+        # Thread-2 sets this BEFORE calling confirm_blacklist so thread-1's
+        # hook (inside the lock) can wait for it without deadlocking.
+        thread2_ready = threading.Event()
+        errors = [None, None]
+
+        def hook_inside_lock():
+            thread2_ready.wait(timeout=5)
+
+        self.ls_db().before_mutation = hook_inside_lock
+
+        def run1():
+            barrier.wait()
+            try:
+                svc1.confirm_blacklist(FP0, OFFER_ID, TOP0)
+            except Exception as exc:  # noqa: BLE001
+                errors[0] = exc
+
+        def run2():
+            barrier.wait()
+            thread2_ready.set()  # must be before the lock acquisition
+            try:
+                svc2.confirm_blacklist(FP0, OFFER_ID, TOP0)
+            except Exception as exc:  # noqa: BLE001
+                errors[1] = exc
+
+        t1 = threading.Thread(target=run1)
+        t2 = threading.Thread(target=run2)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        self.assertFalse(t1.is_alive(), "thread 1 timed out")
+        self.assertFalse(t2.is_alive(), "thread 2 timed out")
+        self.assertIsNone(errors[0], str(errors[0]))
+        self.assertIsNone(errors[1], str(errors[1]))
+
+    def test_two_threads_results_identical(self):
+        self.install_blacklisting()
+        svc1 = self.service()
+        svc2 = self.service()
+
+        barrier = threading.Barrier(2)
+        thread2_ready = threading.Event()
+        results = [None, None]
+        errors = [None, None]
+
+        def hook_inside_lock():
+            thread2_ready.wait(timeout=5)
+
+        self.ls_db().before_mutation = hook_inside_lock
+
+        def run1():
+            barrier.wait()
+            try:
+                results[0] = svc1.confirm_blacklist(FP0, OFFER_ID, TOP0)
+            except Exception as exc:  # noqa: BLE001
+                errors[0] = exc
+
+        def run2():
+            barrier.wait()
+            thread2_ready.set()
+            try:
+                results[1] = svc2.confirm_blacklist(FP0, OFFER_ID, TOP0)
+            except Exception as exc:  # noqa: BLE001
+                errors[1] = exc
+
+        t1 = threading.Thread(target=run1)
+        t2 = threading.Thread(target=run2)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        self.assertIsNone(errors[0], str(errors[0]))
+        self.assertIsNone(errors[1], str(errors[1]))
+        self.assertIsNotNone(results[0])
+        self.assertIsNotNone(results[1])
+        self.assertEqual(results[0], results[1])
+
+    def test_two_threads_exactly_one_receipt_and_blacklisted_row(self):
+        self.install_blacklisting()
+        svc1 = self.service()
+        svc2 = self.service()
+
+        barrier = threading.Barrier(2)
+        thread2_ready = threading.Event()
+        errors = [None, None]
+        # Track how many mutate_values calls complete to prove both ran.
+        mutations_before = self.ls_db().mutation_count
+
+        def hook_inside_lock():
+            thread2_ready.wait(timeout=5)
+
+        self.ls_db().before_mutation = hook_inside_lock
+
+        def run1():
+            barrier.wait()
+            try:
+                svc1.confirm_blacklist(FP0, OFFER_ID, TOP0)
+            except Exception as exc:  # noqa: BLE001
+                errors[0] = exc
+
+        def run2():
+            barrier.wait()
+            thread2_ready.set()
+            try:
+                svc2.confirm_blacklist(FP0, OFFER_ID, TOP0)
+            except Exception as exc:  # noqa: BLE001
+                errors[1] = exc
+
+        t1 = threading.Thread(target=run1)
+        t2 = threading.Thread(target=run2)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        self.assertIsNone(errors[0], str(errors[0]))
+        self.assertIsNone(errors[1], str(errors[1]))
+
+        # Two mutate_values calls prove one fresh + one replay branch.
+        self.assertEqual(self.ls_db().mutation_count, mutations_before + 2)
+
+        # Exactly one receipt
+        raw = self.receipts_db().retrieve(OFFER_ID)
+        self.assertIsNotNone(raw)
+
+        # Final link state is blacklisted
+        ls = self.link_state()
+        self.assertIsNotNone(ls)
+        self.assertEqual(ls["state"], "blacklisted")
 
 
 # ── privacy ───────────────────────────────────────────────────────────────────

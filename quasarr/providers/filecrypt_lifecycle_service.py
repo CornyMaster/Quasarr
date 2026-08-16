@@ -52,6 +52,9 @@ from quasarr.providers.filecrypt_lifecycle_decisions import (
     validate_blacklist_response,
     validate_defer_response,
 )
+from quasarr.providers.terminal_operations import (
+    terminal_operation_id as _canonical_top_id,
+)
 
 FILECRYPT_LINK_LIFECYCLE_CAPABILITY = "filecrypt_link_lifecycle_v1"
 FILECRYPT_CRYPTER = "filecrypt"
@@ -1767,11 +1770,15 @@ class FilecryptLifecycleService:
                     except (ValueError, TypeError):
                         result[0] = None
                         return values
+                    pkg_id = rcpt.get("package_id")
+                    if _canonical_top_id(pkg_id) != _top_id:
+                        result[0] = None
+                        return values
                     result[0] = {
                         **resp,
                         "terminal_required": False,
                         "fingerprint": _fp,
-                        "package_id": rcpt.get("package_id"),
+                        "package_id": pkg_id,
                         "terminal_operation_id": _top_id,
                     }
                     return values

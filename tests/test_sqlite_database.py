@@ -352,9 +352,15 @@ class SQLiteDatabaseTests(unittest.TestCase):
     def test_mutate_values_ensures_each_unique_table_once(self):
         database = DataBase("members")
         try:
-            targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
-            with patch.object(database, "_ensure_table", wraps=database._ensure_table) as ensure:
-                database.mutate_values(targets, lambda values: ["pending"] * len(values))
+            targets = tuple(
+                ("members", f"fingerprint-{index}") for index in range(5000)
+            )
+            with patch.object(
+                database, "_ensure_table", wraps=database._ensure_table
+            ) as ensure:
+                database.mutate_values(
+                    targets, lambda values: ["pending"] * len(values)
+                )
             self.assertEqual([unittest.mock.call("members")], ensure.call_args_list)
         finally:
             database._conn.close()
@@ -373,15 +379,24 @@ class SQLiteDatabaseTests(unittest.TestCase):
         writer = DataBase("members")
         reader = DataBase("members")
         try:
-            targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
+            targets = tuple(
+                ("members", f"fingerprint-{index}") for index in range(5000)
+            )
 
             # Mutate 5,000 None values to specific values and commit
-            writer.mutate_values(targets, lambda current_values: tuple(f"value-{i}" for i in range(len(current_values))))
+            writer.mutate_values(
+                targets,
+                lambda current_values: tuple(
+                    f"value-{i}" for i in range(len(current_values))
+                ),
+            )
 
             # Verify all 5,000 key/value pairs are visible through a second connection
             # by comparing the exact full dictionary, not just COUNT plus samples
             expected = {f"fingerprint-{i}": f"value-{i}" for i in range(5000)}
-            actual = dict(reader._conn.execute("SELECT key, value FROM members").fetchall())
+            actual = dict(
+                reader._conn.execute("SELECT key, value FROM members").fetchall()
+            )
             self.assertEqual(expected, actual)
         finally:
             writer._conn.close()
@@ -395,12 +410,13 @@ class SQLiteDatabaseTests(unittest.TestCase):
             writer._ensure_table()
             sentinel_data = [(f"fingerprint-{i}", f"sentinel-{i}") for i in range(5000)]
             writer._conn.executemany(
-                "INSERT INTO members (key, value) VALUES (?, ?)",
-                sentinel_data
+                "INSERT INTO members (key, value) VALUES (?, ?)", sentinel_data
             )
             writer._conn.commit()
 
-            targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
+            targets = tuple(
+                ("members", f"fingerprint-{index}") for index in range(5000)
+            )
 
             # Patch _upsert_value to fail after 2,500 writes, proving BEGIN IMMEDIATE rollback
             # restores every partially changed row.
@@ -415,12 +431,18 @@ class SQLiteDatabaseTests(unittest.TestCase):
                     writes_completed_at_failure[0] = upsert_counter[0]
                     raise RuntimeError("simulated failure after 2500 writes")
 
-            with patch.object(writer, "_upsert_value", side_effect=failing_upsert_wrapper):
-                with self.assertRaisesRegex(RuntimeError, "simulated failure after 2500 writes"):
+            with patch.object(
+                writer, "_upsert_value", side_effect=failing_upsert_wrapper
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "simulated failure after 2500 writes"
+                ):
                     # Call mutate_values with 5,000 NEW values so all writes start fresh
                     writer.mutate_values(
                         targets,
-                        lambda current_values: tuple(f"mutated-{i}" for i in range(len(current_values)))
+                        lambda current_values: tuple(
+                            f"mutated-{i}" for i in range(len(current_values))
+                        ),
                     )
 
             # Assert the failure occurred at exactly 2,500 upserts
@@ -428,8 +450,12 @@ class SQLiteDatabaseTests(unittest.TestCase):
 
             # Verify rollback: compare the FULL 5,000-row dict exactly against all original sentinel mappings
             # from SECOND connection, proving BEGIN IMMEDIATE rollback restores every partially changed row
-            expected_sentinels = {f"fingerprint-{i}": f"sentinel-{i}" for i in range(5000)}
-            actual_after_rollback = dict(reader._conn.execute("SELECT key, value FROM members").fetchall())
+            expected_sentinels = {
+                f"fingerprint-{i}": f"sentinel-{i}" for i in range(5000)
+            }
+            actual_after_rollback = dict(
+                reader._conn.execute("SELECT key, value FROM members").fetchall()
+            )
             self.assertEqual(expected_sentinels, actual_after_rollback)
         finally:
             writer._conn.close()
