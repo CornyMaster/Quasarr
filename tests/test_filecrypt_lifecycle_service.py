@@ -265,12 +265,22 @@ class TestPrepareOfferBasic(LifecycleServiceTestCase):
         # No sweep header
         self.assertIsNone(self.header())
 
-        # Link state is held
-        ls = self.link_state(fp(1))
-        self.assertIsNotNone(ls)
-        self.assertEqual("held", ls["state"])
-        self.assertIsNotNone(ls["lease"])
-        self.assertEqual(offer["offer_id"], ls["lease"]["offer_id"])
+        # No link-state at offer time; only Task 3B BLOCKED creates held state
+        self.assertIsNone(self.link_state(fp(1)))
+        self.assertEqual(
+            {"state": "available", "retry_after_epoch": 0},
+            svc.project_link(fp(1)),
+        )
+
+        # Offered member row written
+        m = self.member(fp(1))
+        self.assertIsNotNone(m)
+        self.assertEqual("offered", m["state"])
+        self.assertEqual(offer["sweep_id"], m["generation_id"])
+        self.assertEqual(offer["offer_id"], m["lease"]["offer_id"])
+
+        # Offer deadline is lease-duration, not window-duration
+        self.assertEqual(NOW + OFFER_LEASE_SECONDS, offer["deadline_epoch"])
 
     def test_two_open_sweep_exact_total(self):
         svc = self.service()
@@ -387,9 +397,8 @@ class TestAtomicity(LifecycleServiceTestCase):
         self.assertIsNotNone(member)
         self.assertEqual("offered", member["state"])
 
-        ls = self.link_state(leased_fp)
-        self.assertIsNotNone(ls)
-        self.assertEqual("held", ls["state"])
+        # No link-state at offer time; only Task 3B BLOCKED creates held state
+        self.assertIsNone(self.link_state(leased_fp))
 
         # One mutation call for opening + leasing
         self.assertEqual(1, self.sweep_db().mutation_count)
@@ -415,6 +424,75 @@ class TestAtomicity(LifecycleServiceTestCase):
         # Nothing committed
         self.assertIsNone(self.header())
         self.assertIsNone(self.members_db().retrieve_all_titles())
+
+
+class TestIndividualLifecycle(LifecycleServiceTestCase):
+    """Discriminating tests: individual offer writes member row only, no link-state."""
+
+    def test_singleton_unanswered_live_lease_not_duplicated(self):
+        """Second prepare_offer call while individual lease is live returns None."""
+        svc = self.service()
+        offer1 = svc.prepare_offer(rows_for([1]))
+        self.assertIsNotNone(offer1)
+        self.assertEqual("individual", offer1["mode"])
+
+        # Advance 1 second; lease still live
+        self.clock.now = NOW + 1
+        offer2 = svc.prepare_offer(rows_for([1]))
+        self.assertIsNone(offer2)
+
+        # Original member row unchanged, still no link-state
+        m = self.member(fp(1))
+        self.assertEqual(offer1["offer_id"], m["lease"]["offer_id"])
+        self.assertIsNone(self.link_state(fp(1)))
+
+    def test_singleton_expired_lease_reoffered_individual_no_link_state(self):
+        """After individual lease expiry, re-offer individual with new offer ID; still no link-state."""
+        svc = self.service()
+        offer1 = svc.prepare_offer(rows_for([1]))
+        self.assertIsNotNone(offer1)
+
+        # Advance past offer expiry
+        self.clock.now = NOW + OFFER_LEASE_SECONDS + 1
+        offer2 = svc.prepare_offer(rows_for([1]))
+
+        self.assertIsNotNone(offer2)
+        self.assertEqual("individual", offer2["mode"])
+        self.assertNotEqual(offer1["offer_id"], offer2["offer_id"])
+        self.assertIsNone(self.link_state(fp(1)))
+        self.assertEqual(
+            {"state": "available", "retry_after_epoch": 0},
+            svc.project_link(fp(1)),
+        )
+        # Updated member row
+        m = self.member(fp(1))
+        self.assertEqual(offer2["offer_id"], m["lease"]["offer_id"])
+
+    def test_first_time_offer_never_produces_retest_without_held_row(self):
+        """After individual offer+expiry, re-offer is individual (not retest); retest needs Task 3B held."""
+        svc = self.service()
+        offer1 = svc.prepare_offer(rows_for([1]))
+        self.assertEqual("individual", offer1["mode"])
+        self.assertIsNone(self.link_state(fp(1)))  # no held row
+
+        # Expire and re-offer: still no held row → still individual, not retest
+        self.clock.now = NOW + OFFER_LEASE_SECONDS + 1
+        offer2 = svc.prepare_offer(rows_for([1]))
+        self.assertIsNotNone(offer2)
+        self.assertEqual("individual", offer2["mode"])  # NOT retest
+        self.assertIsNone(self.link_state(fp(1)))
+
+        # Now simulate Task 3B installing a held row
+        self.install_link_state(
+            fp(1),
+            self.make_held_ls(
+                "c" * 32, offer2["offer_id"], pkg(1), retry_after=NOW - 2
+            ),
+        )
+        self.clock.now = NOW + OFFER_LEASE_SECONDS + 2
+        offer3 = svc.prepare_offer(rows_for([1]))
+        self.assertIsNotNone(offer3)
+        self.assertEqual("retest", offer3["mode"])  # NOW retest because held row exists
 
 
 class TestActiveSweepLeasing(LifecycleServiceTestCase):
@@ -444,6 +522,32 @@ class TestActiveSweepLeasing(LifecycleServiceTestCase):
         self.assertIsNotNone(offer2)
         self.assertEqual("sweep", offer2["mode"])
         self.assertEqual(gen_id, offer2["sweep_id"])
+
+    def test_sweep_opening_all_first_time_link_states_none(self):
+        """Opening a sweep writes no link-state for any first-time fingerprint."""
+        svc = self.service()
+        offer = svc.prepare_offer(rows_for([1, 2, 3]))
+        self.assertIsNotNone(offer)
+        self.assertEqual("sweep", offer["mode"])
+        for i in [1, 2, 3]:
+            self.assertIsNone(
+                self.link_state(fp(i)),
+                f"fp({i}) link-state must be None after sweep open",
+            )
+
+    def test_sweep_expired_offered_member_reoffered_sweep_no_link_state(self):
+        """Expired sweep offer re-leased as sweep; no link-state created."""
+        svc = self.service()
+        svc.prepare_offer(rows_for([1, 2]))
+
+        # Advance past offer expiry
+        self.clock.now = NOW + OFFER_LEASE_SECONDS + 1
+        offer2 = svc.prepare_offer(rows_for([1, 2]))
+
+        self.assertIsNotNone(offer2)
+        self.assertEqual("sweep", offer2["mode"])
+        self.assertIsNone(self.link_state(fp(1)))
+        self.assertIsNone(self.link_state(fp(2)))
 
     def test_active_sweep_never_admits_new_fingerprint(self):
         svc = self.service()
@@ -535,6 +639,25 @@ class TestRetestAndHeld(LifecycleServiceTestCase):
 
         self.assertEqual("retest", offer["mode"])
         self.assertEqual(fp(1), offer["link_fingerprint"])
+
+    def test_preexisting_held_row_produces_retest_unchanged(self):
+        """A held row installed by Task 3B (accepted BLOCKED) alone triggers retest."""
+        gen_id = "a" * 32
+        retry = NOW - 1  # expired hold
+        self.install_link_state(
+            fp(1),
+            self.make_held_ls(gen_id, "b" * 32, pkg(1), retry_after=retry),
+        )
+        svc = self.service()
+        offer = svc.prepare_offer(rows_for([1]))
+
+        self.assertIsNotNone(offer)
+        self.assertEqual("retest", offer["mode"])
+        self.assertEqual(fp(1), offer["link_fingerprint"])
+        # Link-state updated with new lease (existing held row modified)
+        ls = self.link_state(fp(1))
+        self.assertEqual("held", ls["state"])
+        self.assertNotEqual("b" * 32, ls["lease"]["offer_id"])
 
 
 class TestHeaderSuppression(LifecycleServiceTestCase):

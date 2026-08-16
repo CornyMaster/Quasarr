@@ -416,7 +416,11 @@ class FilecryptLifecycleService:
         excluded_package_ids,
         now,
     ):
-        """Open an individual generation for one first-time fingerprint."""
+        """Open an individual generation for one first-time fingerprint.
+
+        Writes an offered member row only.  No link-state row is created;
+        only Task 3B's accepted BLOCKED creates held state.
+        """
         occurrence = _first_handable_occurrence(fp_map[fp], excluded_package_ids)
         if occurrence is None:
             return None
@@ -424,12 +428,26 @@ class FilecryptLifecycleService:
         _now = now
         _fp = fp
         _occ = occurrence
-        _window = self._sweep_window_seconds()
         result = [None]
         ids = self._ids
 
+        # Targets: header (live-header check) + all member rows (cleanup + current) + link-state (revalidate None)
+        all_member_fps = sorted(existing_member_fps | {fp})
+        _fp_member_idx = 1 + all_member_fps.index(fp)
+        _ls_idx = 1 + len(all_member_fps)
+        _all_member_fps = all_member_fps
+
+        targets = [(FILECRYPT_SWEEP_STATE_TABLE, FILECRYPT_SWEEP_KEY)]
+        for m_fp in all_member_fps:
+            targets.append((FILECRYPT_SWEEP_MEMBERS_TABLE, m_fp))
+        targets.append((FILECRYPT_LINK_STATES_TABLE, fp))
+
         def mutator(values):
-            hdr_raw, ls_raw = values
+            ts = _now
+            hdr_raw = values[0]
+            member_raw = values[_fp_member_idx]
+            ls_raw = values[_ls_idx]
+
             # Abort if a concurrent live valid or malformed header is present
             if hdr_raw is not None:
                 hdr = decode_sweep_header(hdr_raw)
@@ -438,31 +456,54 @@ class FilecryptLifecycleService:
                     return values
                 s = hdr.get("state")
                 if (
-                    (s == "sweeping" and _now < hdr.get("deadline_epoch", 0))
-                    or (s == "healthy" and _now < hdr.get("until_epoch", 0))
-                    or (s == "cooldown" and _now < hdr.get("retry_after_epoch", 0))
+                    (s == "sweeping" and ts < hdr.get("deadline_epoch", 0))
+                    or (s == "healthy" and ts < hdr.get("until_epoch", 0))
+                    or (s == "cooldown" and ts < hdr.get("retry_after_epoch", 0))
                 ):
                     result[0] = None
                     return values
+
+            # Abort if link-state is not None (fp is not first-time)
             if ls_raw is not None:
                 result[0] = None
                 return values
+
+            # Abort if a live offered member already exists (no duplicate lease)
+            if member_raw is not None:
+                m = decode_sweep_member(member_raw)
+                if m is None:
+                    result[0] = None
+                    return values
+                if m.get("state") == "offered":
+                    lease = m.get("lease") or {}
+                    if ts < lease.get("offer_expires_epoch", 0):
+                        result[0] = None
+                        return values
+
             generation_id = ids()
             offer_id = ids()
-            ts = _now
-            retry_after = ts + _window
-            new_ls = {
+            new_member = {
                 "schema_version": _SCHEMA_VERSION,
-                "state": "held",
-                "first_blocked_epoch": ts,
-                "retry_after_epoch": retry_after,
+                "generation_id": generation_id,
+                "fingerprint": _fp,
+                "state": "offered",
                 "lease": {
-                    "sweep_id": generation_id,
                     "offer_id": offer_id,
                     "package_id": _occ.package_id,
                     "offer_expires_epoch": ts + OFFER_LEASE_SECONDS,
                 },
+                "outcome": None,
             }
+
+            new_values = list(values)
+            new_values[0] = hdr_raw  # header unchanged
+            for i, m_fp in enumerate(_all_member_fps):
+                midx = 1 + i
+                new_values[midx] = (
+                    encode_sweep_member(new_member) if m_fp == _fp else None
+                )
+            new_values[_ls_idx] = ls_raw  # link-state unchanged (None)
+
             result[0] = {
                 "capability": FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
                 "mode": "individual",
@@ -470,15 +511,11 @@ class FilecryptLifecycleService:
                 "sweep_id": generation_id,
                 "offer_id": offer_id,
                 "link_fingerprint": _fp,
-                "deadline_epoch": retry_after,
+                "deadline_epoch": ts + OFFER_LEASE_SECONDS,
                 "occurrence": _occ,
             }
-            return (hdr_raw, encode_link_state(new_ls))
+            return tuple(new_values)
 
-        targets = [
-            (FILECRYPT_SWEEP_STATE_TABLE, FILECRYPT_SWEEP_KEY),
-            (FILECRYPT_LINK_STATES_TABLE, fp),
-        ]
         self._shared_state.get_db(FILECRYPT_SWEEP_STATE_TABLE).mutate_values(
             targets, mutator
         )
@@ -608,21 +645,7 @@ class FilecryptLifecycleService:
                 else:
                     new_values[midx] = None  # remove stale member
 
-            # Link state for leased member only; all others stay absent
-            leased_ls_idx = ls_base + _first_time_fp_idx[_leased_fp]
-            new_ls = {
-                "schema_version": _SCHEMA_VERSION,
-                "state": "held",
-                "first_blocked_epoch": ts,
-                "retry_after_epoch": deadline_epoch,
-                "lease": {
-                    "sweep_id": generation_id,
-                    "offer_id": offer_id,
-                    "package_id": _leased_occ.package_id,
-                    "offer_expires_epoch": ts + OFFER_LEASE_SECONDS,
-                },
-            }
-            new_values[leased_ls_idx] = encode_link_state(new_ls)
+            # Link-state targets are present only for atomic revalidation; all stay None
             result[0] = {
                 "capability": FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
                 "mode": "sweep",
@@ -721,18 +744,12 @@ class FilecryptLifecycleService:
                     _result[0] = None
                     return values
 
-                # Verify link state is compatible (None or held)
+                # Require link-state exactly None for first-time sweep members
                 if ls_raw is not None:
-                    ls_check = decode_link_state(ls_raw)
-                    if ls_check is None or ls_check.get("state") != "held":
-                        _result[0] = None
-                        return values
+                    _result[0] = None
+                    return values
 
                 offer_id = _ids()
-                existing_ls = decode_link_state(ls_raw) if ls_raw is not None else None
-                first_blocked = (
-                    existing_ls["first_blocked_epoch"] if existing_ls else __now
-                )
 
                 new_member = {
                     "schema_version": _SCHEMA_VERSION,
@@ -745,18 +762,6 @@ class FilecryptLifecycleService:
                         "offer_expires_epoch": __now + OFFER_LEASE_SECONDS,
                     },
                     "outcome": None,
-                }
-                new_ls = {
-                    "schema_version": _SCHEMA_VERSION,
-                    "state": "held",
-                    "first_blocked_epoch": first_blocked,
-                    "retry_after_epoch": __ddl,
-                    "lease": {
-                        "sweep_id": __gen_id,
-                        "offer_id": offer_id,
-                        "package_id": __occ.package_id,
-                        "offer_expires_epoch": __now + OFFER_LEASE_SECONDS,
-                    },
                 }
                 _result[0] = {
                     "capability": FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
@@ -771,7 +776,7 @@ class FilecryptLifecycleService:
                 return (
                     hdr_raw,
                     encode_sweep_member(new_member),
-                    encode_link_state(new_ls),
+                    ls_raw,  # link-state unchanged (None)
                 )
 
             targets = [
