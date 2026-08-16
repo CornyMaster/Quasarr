@@ -12,6 +12,10 @@ ValueError for invalid caller records.
 
 The per-row byte bound (_MAX_LIFECYCLE_RECORD_BYTES) is a safety limit on individual
 stored values; it never restricts the number of rows, members, candidates, or owners.
+
+The ``response`` field in offer receipts is caller-owned and treated as an opaque dict
+by this codec.  It MUST contain only the normalized identifier/count/state decision
+contract; never URLs, titles, raw exception text, or secrets.
 """
 
 import json
@@ -44,7 +48,7 @@ _MAX_LIFECYCLE_RECORD_BYTES = 16 * 1024
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 # Mirrors quasarr.constants.PACKAGE_ID_PATTERN without importing it.
-_PACKAGE_ID_RE = re.compile(r"^Quasarr_[a-z]+_[a-f0-9]{32}$")
+_PACKAGE_ID_RE = re.compile(r"^Quasarr_[a-z0-9]+_[a-f0-9]{32}$")
 
 _LINK_STATES = frozenset({"held", "blacklisting", "blacklisted"})
 _SWEEP_STATES = frozenset({"sweeping", "healthy", "cooldown"})
@@ -315,7 +319,8 @@ def encode_link_state(record):
     """
     if not isinstance(record, dict):
         raise TypeError("record must be a dict")
-    if record.get("schema_version") != _SCHEMA_VERSION:
+    sv = record.get("schema_version")
+    if not (type(sv) is int and sv == _SCHEMA_VERSION):
         raise ValueError("schema_version must be 1")
     state = record.get("state")
     if state not in _LINK_STATES:
@@ -410,7 +415,8 @@ def encode_sweep_header(record):
     """Encode a sweep-header record to canonical sorted JSON."""
     if not isinstance(record, dict):
         raise TypeError("record must be a dict")
-    if record.get("schema_version") != _SCHEMA_VERSION:
+    sv = record.get("schema_version")
+    if not (type(sv) is int and sv == _SCHEMA_VERSION):
         raise ValueError("schema_version must be 1")
     state = record.get("state")
     if state not in _SWEEP_STATES:
@@ -490,7 +496,8 @@ def encode_sweep_member(record):
     """Encode a sweep-member record to canonical sorted JSON."""
     if not isinstance(record, dict):
         raise TypeError("record must be a dict")
-    if record.get("schema_version") != _SCHEMA_VERSION:
+    sv = record.get("schema_version")
+    if not (type(sv) is int and sv == _SCHEMA_VERSION):
         raise ValueError("schema_version must be 1")
     if set(record.keys()) != _MEMBER_KEYS:
         raise ValueError("sweep member key set mismatch")
@@ -546,7 +553,8 @@ def encode_offer_receipt(record):
     """Encode an offer-receipt record to canonical sorted JSON."""
     if not isinstance(record, dict):
         raise TypeError("record must be a dict")
-    if record.get("schema_version") != _SCHEMA_VERSION:
+    sv = record.get("schema_version")
+    if not (type(sv) is int and sv == _SCHEMA_VERSION):
         raise ValueError("schema_version must be 1")
     if set(record.keys()) != _RECEIPT_KEYS:
         raise ValueError("receipt key set mismatch")
@@ -590,7 +598,8 @@ def encode_migration_marker(record):
     """Encode a migration-marker record to canonical sorted JSON."""
     if not isinstance(record, dict):
         raise TypeError("record must be a dict")
-    if record.get("schema_version") != _SCHEMA_VERSION:
+    sv = record.get("schema_version")
+    if not (type(sv) is int and sv == _SCHEMA_VERSION):
         raise ValueError("schema_version must be 1")
     if set(record.keys()) != _MIGRATION_KEYS:
         raise ValueError("migration marker key set mismatch")

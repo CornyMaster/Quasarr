@@ -34,6 +34,7 @@ _ID2 = "b" * 32
 _ID3 = "c" * 32
 _FP = "d" * 64
 _PKG = "Quasarr_movies_" + "e" * 32
+_PKG_NUMERIC = "Quasarr_movies4k_" + "a" * 32
 _TOP_ID = "f" * 64  # terminal operation ID (64-hex)
 
 _HELD = {
@@ -724,6 +725,90 @@ class LinkStatePredicateTests(unittest.TestCase):
 
         sig = inspect.signature(decode_link_state)
         self.assertNotIn("now", sig.parameters)
+
+
+# ── numeric-category package-id tests ─────────────────────────────────────────
+
+
+class PackageIdNumericCategoryTests(unittest.TestCase):
+    """Every record family containing a package_id must accept an alphanumeric
+    category segment such as 'movies4k'."""
+
+    def _cases(self):
+        return [
+            (
+                "held_lease",
+                encode_link_state,
+                decode_link_state,
+                dict(
+                    _HELD_WITH_LEASE,
+                    lease=dict(_HELD_WITH_LEASE["lease"], package_id=_PKG_NUMERIC),
+                ),
+            ),
+            (
+                "blacklisting_recheck_pkg",
+                encode_link_state,
+                decode_link_state,
+                dict(_BLACKLISTING, recheck_package_id=_PKG_NUMERIC),
+            ),
+            (
+                "member_offered_lease",
+                encode_sweep_member,
+                decode_sweep_member,
+                dict(
+                    _MEMBER_OFFERED,
+                    lease=dict(_MEMBER_OFFERED["lease"], package_id=_PKG_NUMERIC),
+                ),
+            ),
+            (
+                "member_outcome",
+                encode_sweep_member,
+                decode_sweep_member,
+                dict(
+                    _MEMBER_BLOCKED,
+                    outcome=dict(_MEMBER_BLOCKED["outcome"], package_id=_PKG_NUMERIC),
+                ),
+            ),
+            (
+                "offer_receipt",
+                encode_offer_receipt,
+                decode_offer_receipt,
+                dict(_RECEIPT, package_id=_PKG_NUMERIC),
+            ),
+        ]
+
+    def test_encode_accepts_numeric_category(self):
+        for name, encoder, _decoder, record in self._cases():
+            with self.subTest(family=name):
+                encoded = encoder(record)
+                self.assertIsNotNone(encoded)
+
+    def test_decode_accepts_numeric_category(self):
+        for name, encoder, decoder, record in self._cases():
+            with self.subTest(family=name):
+                decoded = decoder(encoder(record))
+                self.assertEqual(record, decoded)
+
+
+# ── bool schema_version encoder rejection ─────────────────────────────────────
+
+
+class BoolSchemaVersionEncoderTests(unittest.TestCase):
+    """All five encoders must reject schema_version=True (bool is not int)."""
+
+    _CASES = [
+        ("encode_link_state", encode_link_state, _HELD),
+        ("encode_sweep_header", encode_sweep_header, _SWEEPING),
+        ("encode_sweep_member", encode_sweep_member, _MEMBER_PENDING),
+        ("encode_offer_receipt", encode_offer_receipt, _RECEIPT),
+        ("encode_migration_marker", encode_migration_marker, _MIGRATION),
+    ]
+
+    def test_bool_schema_version_raises_value_error(self):
+        for name, encoder, base in self._CASES:
+            with self.subTest(encoder=name):
+                with self.assertRaises(ValueError):
+                    encoder(dict(base, schema_version=True))
 
 
 if __name__ == "__main__":
