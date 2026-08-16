@@ -396,6 +396,47 @@ class PruningTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(call_count[0], 1)
 
+    def test_double_mutator_invocation_counts_correctly(self):
+        """Mutator double invocation before commit does not double-count deletions.
+
+        Requirement: if prune_receipts' callback is hypothetically called twice
+        before mutate_values commits, the returned deletion count must reflect
+        only what was actually deleted (not accumulated double counts).
+
+        Test: Store one expired receipt. Mock mutate_values to invoke the
+        callback twice, then return committed_values with the receipt as None
+        only on the second call. Assert prune_receipts returns count=1, not 2.
+        """
+        oid = _receipt_id(1)
+        raw = _make_raw_receipt(oid, _receipt_fp(1), _receipt_pkg(1), NOW - 1)
+        db = self.receipts_db()
+        db.store(oid, raw)
+
+        # Capture the callback to invoke it twice
+        captured_callback = [None]
+        original_mutate = db.mutate_values
+
+        def double_invoke_mutate(targets, mutator):
+            captured_callback[0] = mutator
+            # Invoke the callback twice before the real mutate_values
+            current_values = tuple(db.retrieve(key) for _table, key in targets)
+            first_result = mutator(current_values)
+            second_result = mutator(current_values)
+            # The second invocation should return the same (deletion marked as None)
+            self.assertEqual(
+                first_result, second_result, "callback must be deterministic"
+            )
+            # Now call the real mutate_values
+            return original_mutate(targets, mutator)
+
+        db.mutate_values = double_invoke_mutate
+
+        result = self.service().prune_receipts()
+
+        # Must return 1, not 2 (no double-counting)
+        self.assertEqual(result, 1)
+        self.assertIsNone(db.retrieve(oid), "receipt must be deleted")
+
 
 # ── hardening tests: fake store ───────────────────────────────────────────────
 
@@ -574,7 +615,14 @@ class RealSQLiteHardeningTests(unittest.TestCase):
             pdb.update_store(pkg_id, blob)
 
     def test_real_sqlite_duplicate_blocked_serialization(self):
-        """Two threads submit the same BLOCKED offer; both finish, one commits."""
+        """Two threads share service state/connection serialization on same offer.
+
+        Both threads submit the same BLOCKED offer concurrently.  They share a
+        single SQLite database file (not independent connections per thread).
+        SQLite serializes via IMMEDIATE transaction locks. Both threads finish,
+        but only one's write commits; the other sees the committed receipt and
+        returns None (conflict detected).
+        """
         n = 5
         rows = rows_for(range(1, n + 1))
         self._store_packages(rows)
@@ -600,7 +648,11 @@ class RealSQLiteHardeningTests(unittest.TestCase):
                     clock=FakeClock(NOW),
                     identifier_factory=SequentialIds(),
                 )
-                barrier.wait()
+                try:
+                    barrier.wait(timeout=5)
+                except threading.BrokenBarrierError as e:
+                    errors[idx] = e
+                    return
                 results[idx] = svc_t.record_blocked(report, rows)
             except Exception as exc:  # noqa: BLE001
                 errors[idx] = exc
