@@ -351,19 +351,96 @@ class SQLiteDatabaseTests(unittest.TestCase):
 
     def test_mutate_values_ensures_each_unique_table_once(self):
         database = DataBase("members")
-        targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
-        with patch.object(database, "_ensure_table", wraps=database._ensure_table) as ensure:
-            database.mutate_values(targets, lambda values: ["pending"] * len(values))
-        self.assertEqual([unittest.mock.call("members")], ensure.call_args_list)
-        database._conn.close()
+        try:
+            targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
+            with patch.object(database, "_ensure_table", wraps=database._ensure_table) as ensure:
+                database.mutate_values(targets, lambda values: ["pending"] * len(values))
+            self.assertEqual([unittest.mock.call("members")], ensure.call_args_list)
+        finally:
+            database._conn.close()
 
     def test_resolve_targets_rejects_a_duplicate_among_5000_keys(self):
         database = DataBase("members")
-        targets = [("members", str(index)) for index in range(5000)]
-        targets.append(("members", "4999"))
-        with self.assertRaisesRegex(ValueError, "must be unique"):
-            database.retrieve_values(targets)
-        database._conn.close()
+        try:
+            targets = [("members", str(index)) for index in range(5000)]
+            targets.append(("members", "4999"))
+            with self.assertRaisesRegex(ValueError, "must be unique"):
+                database.retrieve_values(targets)
+        finally:
+            database._conn.close()
+
+    def test_mutate_values_commits_5000_keys_visible_from_second_connection(self):
+        writer = DataBase("members")
+        reader = DataBase("members")
+        try:
+            targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
+
+            # Mutate 5,000 None values to specific values and commit
+            writer.mutate_values(targets, lambda current_values: tuple(f"value-{i}" for i in range(len(current_values))))
+
+            # Verify all 5,000 keys are visible through a second connection
+            row_count = reader._conn.execute(
+                "SELECT COUNT(*) FROM members"
+            ).fetchone()[0]
+            self.assertEqual(5000, row_count)
+
+            # Verify a sample of values exist with correct values via SQL
+            for sample_key in [0, 100, 500, 2500, 4999]:
+                result = reader._conn.execute(
+                    "SELECT value FROM members WHERE key = ?",
+                    (f"fingerprint-{sample_key}",)
+                ).fetchone()
+                self.assertIsNotNone(result)
+                self.assertEqual(f"value-{sample_key}", result[0])
+        finally:
+            writer._conn.close()
+            reader._conn.close()
+
+    def test_mutate_values_rolls_back_5000_keys_on_exception(self):
+        writer = DataBase("members")
+        reader = DataBase("members")
+        try:
+            # Seed 5,000 sentinel values via SQL (before transaction)
+            writer._ensure_table()
+            sentinel_data = [(f"fingerprint-{i}", f"sentinel-{i}") for i in range(5000)]
+            writer._conn.executemany(
+                "INSERT INTO members (key, value) VALUES (?, ?)",
+                sentinel_data
+            )
+            writer._conn.commit()
+
+            # Verify initial state
+            initial_count = writer._conn.execute(
+                "SELECT COUNT(*) FROM members"
+            ).fetchone()[0]
+            self.assertEqual(5000, initial_count)
+
+            targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
+
+            # Try to mutate all 5,000 keys but exception occurs mid-transaction
+            def exploding_mutator(_current_values):
+                raise RuntimeError("atomic rollback test")
+
+            with self.assertRaisesRegex(RuntimeError, "atomic rollback test"):
+                writer.mutate_values(targets, exploding_mutator)
+
+            # Verify rollback: row count unchanged
+            final_count = reader._conn.execute(
+                "SELECT COUNT(*) FROM members"
+            ).fetchone()[0]
+            self.assertEqual(5000, final_count)
+
+            # Verify rollback: sampled sentinel values unchanged
+            for sample_key in [0, 100, 500, 2500, 4999]:
+                result = reader._conn.execute(
+                    "SELECT value FROM members WHERE key = ?",
+                    (f"fingerprint-{sample_key}",)
+                ).fetchone()
+                self.assertIsNotNone(result)
+                self.assertEqual(f"sentinel-{sample_key}", result[0])
+        finally:
+            writer._conn.close()
+            reader._conn.close()
 
     def test_delete_exact_removes_only_one_matching_row_and_commits(self):
         writer = DataBase("failed")
