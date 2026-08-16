@@ -54,7 +54,7 @@ _LINK_STATES = frozenset({"held", "blacklisting", "blacklisted"})
 _SWEEP_STATES = frozenset({"sweeping", "healthy", "cooldown"})
 _MEMBER_STATES = frozenset({"pending", "offered", "blocked", "clear", "unknown"})
 _MEMBER_TERMINAL_STATES = frozenset({"blocked", "clear", "unknown"})
-_OFFER_MODES = frozenset({"sweep", "individual", "retest"})
+_OFFER_MODES = frozenset({"sweep", "individual", "retest", "probe"})
 _OUTCOME_VALUES = frozenset({"blocked", "clear", "unknown"})
 
 # Exact key sets per record shape

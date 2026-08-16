@@ -564,7 +564,7 @@ class OfferReceiptCodecTests(unittest.TestCase):
         self.assertEqual(_RECEIPT, decoded)
 
     def test_round_trip_all_modes(self):
-        for mode in ("sweep", "individual", "retest"):
+        for mode in ("sweep", "individual", "retest", "probe"):
             with self.subTest(mode=mode):
                 record = dict(_RECEIPT, mode=mode)
                 self.assertEqual(
@@ -575,6 +575,22 @@ class OfferReceiptCodecTests(unittest.TestCase):
         for outcome in ("blocked", "clear", "unknown"):
             with self.subTest(outcome=outcome):
                 record = dict(_RECEIPT, outcome=outcome)
+                self.assertEqual(
+                    record, decode_offer_receipt(encode_offer_receipt(record))
+                )
+
+    def test_probe_mode_round_trip(self):
+        """Verify probe mode encodes and decodes correctly."""
+        record = dict(_RECEIPT, mode="probe")
+        encoded = encode_offer_receipt(record)
+        decoded = decode_offer_receipt(encoded)
+        self.assertEqual(record, decoded)
+
+    def test_probe_mode_with_all_outcomes(self):
+        """Verify probe mode works with all outcome values."""
+        for outcome in ("blocked", "clear", "unknown"):
+            with self.subTest(outcome=outcome):
+                record = dict(_RECEIPT, mode="probe", outcome=outcome)
                 self.assertEqual(
                     record, decode_offer_receipt(encode_offer_receipt(record))
                 )
@@ -590,7 +606,7 @@ class OfferReceiptCodecTests(unittest.TestCase):
         self.assertIsNone(decode_offer_receipt(json.dumps(bad)))
 
     def test_decode_rejects_invalid_mode(self):
-        bad = dict(_RECEIPT, mode="probe")
+        bad = dict(_RECEIPT, mode="invalid")
         self.assertIsNone(decode_offer_receipt(json.dumps(bad)))
 
     def test_decode_rejects_invalid_outcome(self):
@@ -608,7 +624,7 @@ class OfferReceiptCodecTests(unittest.TestCase):
                 self.assertIsNone(decode_offer_receipt(json.dumps(bad)))
 
     def test_encode_raises_for_invalid_mode(self):
-        bad = dict(_RECEIPT, mode="probe")
+        bad = dict(_RECEIPT, mode="invalid")
         with self.assertRaises(ValueError):
             encode_offer_receipt(bad)
 
