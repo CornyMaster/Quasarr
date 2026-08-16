@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 # Quasarr
-"""Filecrypt link-lifecycle service: opening, leasing, and read projections.
+"""Filecrypt link-lifecycle service: opening, leasing, projections, and outcomes.
 
-Implements only the opening/leasing/projection slice (Task 3A).  Receipt
-processing, report outcomes, outbox, migration, route wiring, settings
-persistence, and terminal effects are deferred to later tasks.
+Implements opening/leasing/projection (Task 3A) and first-time outcome
+recording (Task 3B1).  Retest/probe outcomes, blacklist confirmation,
+pruning, migration, route wiring, settings persistence, and terminal effects
+are deferred to later tasks.
 """
 
 import secrets
@@ -12,20 +13,41 @@ import time
 
 from quasarr.providers.crypter_candidates import (
     FilecryptCandidate,
+    classify_package_ownership,
     enumerate_filecrypt_lifecycle_candidates,
 )
+from quasarr.providers.crypter_cooldowns import (
+    CRYPTER_EVENT_KEY,
+    CRYPTER_EVENT_TABLE,
+    MINIMUM_COOLDOWN_HOURS,
+    _add_pending_crypter_events,
+)
+from quasarr.providers.crypter_sweeps import OWNERSHIP_OWNED
 from quasarr.providers.filecrypt_lifecycle import (
     FILECRYPT_LINK_STATES_TABLE,
+    FILECRYPT_OFFER_RECEIPTS_TABLE,
     FILECRYPT_SWEEP_KEY,
     FILECRYPT_SWEEP_MEMBERS_TABLE,
     FILECRYPT_SWEEP_STATE_TABLE,
+    MINIMUM_GLOBAL_COOLDOWN_SIZE,
     MINIMUM_SWEEP_SIZE,
     decode_link_state,
+    decode_offer_receipt,
     decode_sweep_header,
     decode_sweep_member,
     encode_link_state,
+    encode_offer_receipt,
     encode_sweep_header,
     encode_sweep_member,
+)
+from quasarr.providers.filecrypt_lifecycle_decisions import (
+    RECEIPT_RETENTION_SECONDS,
+    build_lifecycle_access_decision,
+    build_lifecycle_defer_decision,
+    normalize_lifecycle_access_report,
+    normalize_lifecycle_blocked_report,
+    validate_access_response,
+    validate_defer_response,
 )
 
 FILECRYPT_LINK_LIFECYCLE_CAPABILITY = "filecrypt_link_lifecycle_v1"
@@ -791,3 +813,558 @@ class FilecryptLifecycleService:
                 return result[0]
 
         return None
+
+    # ── outcome recording (Task 3B1) ──────────────────────────────────────────
+
+    def _cooldown_seconds(self):
+        configured = self._shared_state.values.get(
+            "crypter_cooldown_hours", MINIMUM_COOLDOWN_HOURS
+        )
+        try:
+            hours = int(configured)
+        except (TypeError, ValueError):
+            hours = MINIMUM_COOLDOWN_HOURS
+        return max(MINIMUM_COOLDOWN_HOURS, hours) * 3600
+
+    def record_blocked(self, report, protected_rows):
+        """Accept a first-time BLOCKED report, or return None if stale."""
+        try:
+            report = normalize_lifecycle_blocked_report(report)
+        except ValueError:
+            return None
+
+        fingerprint = report["link_fingerprint"]
+        package_id = report["package_id"]
+        offer_id = report["offer_id"]
+        sweep_id = report["sweep_id"]
+
+        # Resolve ownership from supplied rows
+        raw_package = None
+        for row in protected_rows or ():
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                if row[0] == package_id:
+                    raw_package = row[1]
+                    break
+
+        now = int(self._clock())
+        cooldown_secs = self._cooldown_seconds()
+        window_secs = self._sweep_window_seconds()
+
+        _now = now
+        _fp = fingerprint
+        _pkg_id = package_id
+        _offer_id = offer_id
+        _sweep_id = sweep_id
+        _raw_package = raw_package
+        _cooldown = cooldown_secs
+        _window = window_secs
+        result = [None]
+
+        targets = [
+            (FILECRYPT_SWEEP_STATE_TABLE, FILECRYPT_SWEEP_KEY),
+            (FILECRYPT_SWEEP_MEMBERS_TABLE, _fp),
+            (FILECRYPT_LINK_STATES_TABLE, _fp),
+            (FILECRYPT_OFFER_RECEIPTS_TABLE, _offer_id),
+            ("protected", _pkg_id),
+            (CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY),
+        ]
+
+        def mutator(values):
+            hdr_raw, member_raw, ls_raw, receipt_raw, prot_raw, events_raw = values
+
+            # 1. Check receipt first (replay)
+            if receipt_raw is not None:
+                rcpt = decode_offer_receipt(receipt_raw)
+                if rcpt is None:
+                    result[0] = None
+                    return values
+                if (
+                    rcpt.get("fingerprint") == _fp
+                    and rcpt.get("package_id") == _pkg_id
+                    and rcpt.get("outcome") == "blocked"
+                ):
+                    resp = rcpt.get("response")
+                    try:
+                        validate_defer_response(resp)
+                    except (ValueError, TypeError):
+                        result[0] = None
+                        return values
+                    result[0] = resp
+                    return values
+                # Conflicting receipt
+                result[0] = None
+                return values
+
+            # 2. Validate protected row ownership
+            if prot_raw is None:
+                result[0] = None
+                return values
+            ownership = classify_package_ownership(prot_raw, "filecrypt", _fp)
+            if ownership != OWNERSHIP_OWNED:
+                result[0] = None
+                return values
+
+            # 3. Validate member: matching offered, correct generation/offer/fp
+            m = decode_sweep_member(member_raw)
+            if m is None:
+                result[0] = None
+                return values
+            if m.get("state") != "offered":
+                result[0] = None
+                return values
+            lease = m.get("lease")
+            if not isinstance(lease, dict):
+                result[0] = None
+                return values
+            if lease.get("offer_id") != _offer_id:
+                result[0] = None
+                return values
+            if lease.get("package_id") != _pkg_id:
+                result[0] = None
+                return values
+            if _now >= lease.get("offer_expires_epoch", 0):
+                result[0] = None
+                return values
+            gen_id = m.get("generation_id")
+
+            # 4. Validate link state is exactly None (first-time)
+            if ls_raw is not None:
+                result[0] = None
+                return values
+
+            # 5. Derive mode from header
+            hdr = decode_sweep_header(hdr_raw) if hdr_raw is not None else None
+            is_sweep = False
+            if hdr is not None:
+                if hdr.get("state") == "sweeping" and _now < hdr.get(
+                    "deadline_epoch", 0
+                ):
+                    if hdr.get("generation_id") == gen_id:
+                        is_sweep = True
+                    else:
+                        result[0] = None
+                        return values
+                elif hdr_raw is not None and hdr is None:
+                    # Malformed header → fail-closed
+                    result[0] = None
+                    return values
+
+            mode = "sweep" if is_sweep else "individual"
+
+            # ── state transitions ──
+            # Member → blocked
+            new_member = {
+                "schema_version": _SCHEMA_VERSION,
+                "generation_id": gen_id,
+                "fingerprint": _fp,
+                "state": "blocked",
+                "lease": None,
+                "outcome": {
+                    "offer_id": _offer_id,
+                    "package_id": _pkg_id,
+                    "accepted_epoch": _now,
+                },
+            }
+
+            # Link state → held
+            new_ls = {
+                "schema_version": _SCHEMA_VERSION,
+                "state": "held",
+                "first_blocked_epoch": _now,
+                "retry_after_epoch": _now + _cooldown,
+                "lease": None,
+            }
+
+            # Header transitions for sweep mode
+            new_hdr_raw = hdr_raw
+            sweep_tested = 0
+            sweep_total = 0
+            sweep_deadline_epoch = 0
+            sweep_blocked = 0
+            is_complete = False
+            is_global_cooldown = False
+
+            if is_sweep:
+                tested = hdr["tested"] + 1
+                blocked = hdr["blocked"] + 1
+                gp = hdr["global_possible"]
+                total = hdr["total"]
+                sweep_tested = tested
+                sweep_total = total
+                sweep_deadline_epoch = hdr["deadline_epoch"]
+                sweep_blocked = blocked
+
+                new_hdr = dict(hdr)
+                new_hdr["tested"] = tested
+                new_hdr["blocked"] = blocked
+                new_hdr_raw = encode_sweep_header(new_hdr)
+
+                is_complete = tested >= total
+                is_global_cooldown = (
+                    is_complete
+                    and gp
+                    and blocked == total
+                    and total >= MINIMUM_GLOBAL_COOLDOWN_SIZE
+                    and _now < hdr["deadline_epoch"]
+                )
+
+                if is_global_cooldown:
+                    cooldown_hdr = {
+                        "schema_version": _SCHEMA_VERSION,
+                        "state": "cooldown",
+                        "generation_id": gen_id,
+                        "sweep_deadline_epoch": hdr["deadline_epoch"],
+                        "retry_after_epoch": _now + _cooldown,
+                    }
+                    new_hdr_raw = encode_sweep_header(cooldown_hdr)
+                    new_ls["retry_after_epoch"] = _now + _cooldown
+                elif is_complete and not is_global_cooldown:
+                    # Complete but not global → healthy
+                    healthy_hdr = {
+                        "schema_version": _SCHEMA_VERSION,
+                        "state": "healthy",
+                        "generation_id": gen_id,
+                        "until_epoch": _now + _window,
+                    }
+                    new_hdr_raw = encode_sweep_header(healthy_hdr)
+
+            # Build response
+            if is_global_cooldown:
+                response = build_lifecycle_defer_decision(
+                    instruction="cooldown",
+                    state="cooldown",
+                    hold_type="crypter_cooldown",
+                    evidence_count=sweep_blocked,
+                    retry_after_epoch=_now + _cooldown,
+                    sweep_id=_sweep_id,
+                    sweep_tested=sweep_tested,
+                    sweep_total=sweep_total,
+                    sweep_deadline_epoch=sweep_deadline_epoch,
+                )
+            elif is_sweep and not is_complete:
+                response = build_lifecycle_defer_decision(
+                    instruction="hold",
+                    state="sweeping",
+                    hold_type="provisional",
+                    evidence_count=sweep_blocked,
+                    retry_after_epoch=_now + _cooldown,
+                    sweep_id=_sweep_id,
+                    sweep_tested=sweep_tested,
+                    sweep_total=sweep_total,
+                    sweep_deadline_epoch=sweep_deadline_epoch,
+                )
+            elif is_sweep and is_complete and not is_global_cooldown:
+                # Completed non-global BLOCKED
+                response = build_lifecycle_defer_decision(
+                    instruction="hold",
+                    state="individual",
+                    hold_type="provisional",
+                    evidence_count=0,
+                    retry_after_epoch=_now + _cooldown,
+                    sweep_id=_sweep_id,
+                    sweep_tested=sweep_tested,
+                    sweep_total=sweep_total,
+                    sweep_deadline_epoch=sweep_deadline_epoch,
+                )
+            else:
+                # Individual BLOCKED
+                response = build_lifecycle_defer_decision(
+                    instruction="hold",
+                    state="individual",
+                    hold_type="provisional",
+                    evidence_count=0,
+                    retry_after_epoch=_now + _cooldown,
+                    sweep_id=_sweep_id,
+                    sweep_tested=0,
+                    sweep_total=0,
+                    sweep_deadline_epoch=_now + _cooldown,
+                )
+
+            # Receipt
+            new_receipt = encode_offer_receipt(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "generation_id": gen_id,
+                    "fingerprint": _fp,
+                    "package_id": _pkg_id,
+                    "mode": mode,
+                    "outcome": "blocked",
+                    "response": response,
+                    "accepted_epoch": _now,
+                    "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                }
+            )
+
+            # Outbox
+            events_delta = {"observations": 1}
+            if is_global_cooldown:
+                events_delta["cooldowns"] = 1
+            new_events = _add_pending_crypter_events(events_raw, **events_delta)
+
+            result[0] = response
+            return (
+                new_hdr_raw,
+                encode_sweep_member(new_member),
+                encode_link_state(new_ls),
+                new_receipt,
+                prot_raw,  # protected unchanged
+                new_events,
+            )
+
+        self._shared_state.get_db(FILECRYPT_SWEEP_STATE_TABLE).mutate_values(
+            targets, mutator
+        )
+        if result[0] is None:
+            return None
+        return result[0]
+
+    def record_access(self, report, protected_rows):
+        """Accept a first-time CLEAR or UNKNOWN report, or return None if stale."""
+        try:
+            report = normalize_lifecycle_access_report(report)
+        except ValueError:
+            return None
+
+        fingerprint = report["link_fingerprint"]
+        package_id = report["package_id"]
+        offer_id = report["offer_id"]
+        sweep_id = report["sweep_id"]
+        access = report["access"]
+
+        raw_package = None
+        for row in protected_rows or ():
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                if row[0] == package_id:
+                    raw_package = row[1]
+                    break
+
+        now = int(self._clock())
+        window_secs = self._sweep_window_seconds()
+
+        _now = now
+        _fp = fingerprint
+        _pkg_id = package_id
+        _offer_id = offer_id
+        _sweep_id = sweep_id
+        _access = access
+        _raw_package = raw_package
+        _window = window_secs
+        result = [None]
+
+        targets = [
+            (FILECRYPT_SWEEP_STATE_TABLE, FILECRYPT_SWEEP_KEY),
+            (FILECRYPT_SWEEP_MEMBERS_TABLE, _fp),
+            (FILECRYPT_LINK_STATES_TABLE, _fp),
+            (FILECRYPT_OFFER_RECEIPTS_TABLE, _offer_id),
+            ("protected", _pkg_id),
+            (CRYPTER_EVENT_TABLE, CRYPTER_EVENT_KEY),
+        ]
+
+        def mutator(values):
+            hdr_raw, member_raw, ls_raw, receipt_raw, prot_raw, events_raw = values
+
+            # 1. Check receipt first (replay)
+            if receipt_raw is not None:
+                rcpt = decode_offer_receipt(receipt_raw)
+                if rcpt is None:
+                    result[0] = None
+                    return values
+                if (
+                    rcpt.get("fingerprint") == _fp
+                    and rcpt.get("package_id") == _pkg_id
+                    and rcpt.get("outcome") == _access
+                ):
+                    resp = rcpt.get("response")
+                    try:
+                        validate_access_response(resp)
+                    except (ValueError, TypeError):
+                        result[0] = None
+                        return values
+                    result[0] = resp
+                    return values
+                # Conflicting receipt
+                result[0] = None
+                return values
+
+            # 2. Validate protected row ownership
+            if prot_raw is None:
+                result[0] = None
+                return values
+            ownership = classify_package_ownership(prot_raw, "filecrypt", _fp)
+            if ownership != OWNERSHIP_OWNED:
+                result[0] = None
+                return values
+
+            # 3. Validate member
+            m = decode_sweep_member(member_raw)
+            if m is None:
+                result[0] = None
+                return values
+            if m.get("state") != "offered":
+                result[0] = None
+                return values
+            lease = m.get("lease")
+            if not isinstance(lease, dict):
+                result[0] = None
+                return values
+            if lease.get("offer_id") != _offer_id:
+                result[0] = None
+                return values
+            if lease.get("package_id") != _pkg_id:
+                result[0] = None
+                return values
+            if _now >= lease.get("offer_expires_epoch", 0):
+                result[0] = None
+                return values
+            gen_id = m.get("generation_id")
+
+            # 4. Link state must be None
+            if ls_raw is not None:
+                result[0] = None
+                return values
+
+            # 5. Derive mode from header
+            hdr = decode_sweep_header(hdr_raw) if hdr_raw is not None else None
+            is_sweep = False
+            if hdr is not None:
+                if hdr.get("state") == "sweeping" and _now < hdr.get(
+                    "deadline_epoch", 0
+                ):
+                    if hdr.get("generation_id") == gen_id:
+                        is_sweep = True
+                    else:
+                        result[0] = None
+                        return values
+                elif hdr_raw is not None and hdr is None:
+                    result[0] = None
+                    return values
+
+            mode = "sweep" if is_sweep else "individual"
+
+            # ── state transitions ──
+            terminal_state = "clear" if _access == "clear" else "unknown"
+            new_member = {
+                "schema_version": _SCHEMA_VERSION,
+                "generation_id": gen_id,
+                "fingerprint": _fp,
+                "state": terminal_state,
+                "lease": None,
+                "outcome": {
+                    "offer_id": _offer_id,
+                    "package_id": _pkg_id,
+                    "accepted_epoch": _now,
+                },
+            }
+
+            # No link-state row for CLEAR/UNKNOWN
+            new_ls_raw = None
+
+            # Header: make global_possible=False for sweep; individual writes healthy
+            new_hdr_raw = hdr_raw
+            sweep_tested = 0
+            sweep_total = 0
+            sweep_deadline_epoch = 0
+
+            if is_sweep:
+                tested = hdr["tested"] + 1
+                total = hdr["total"]
+                sweep_tested = tested
+                sweep_total = total
+                sweep_deadline_epoch = hdr["deadline_epoch"]
+
+                new_hdr = dict(hdr)
+                new_hdr["tested"] = tested
+                new_hdr["global_possible"] = False
+                new_hdr_raw = encode_sweep_header(new_hdr)
+
+                is_complete = tested >= total
+                if is_complete:
+                    healthy_hdr = {
+                        "schema_version": _SCHEMA_VERSION,
+                        "state": "healthy",
+                        "generation_id": gen_id,
+                        "until_epoch": _now + _window,
+                    }
+                    new_hdr_raw = encode_sweep_header(healthy_hdr)
+            else:
+                # Individual CLEAR/UNKNOWN: write healthy header
+                healthy_hdr = {
+                    "schema_version": _SCHEMA_VERSION,
+                    "state": "healthy",
+                    "generation_id": gen_id,
+                    "until_epoch": _now + _window,
+                }
+                new_hdr_raw = encode_sweep_header(healthy_hdr)
+                sweep_deadline_epoch = _now + _window
+
+            # Build response
+            if _access == "clear":
+                response = build_lifecycle_access_decision(
+                    state="healthy",
+                    cleared=True,
+                    accepted="",
+                    sweep_id=_sweep_id,
+                    sweep_tested=sweep_tested if is_sweep else 0,
+                    sweep_total=sweep_total if is_sweep else 0,
+                    sweep_deadline_epoch=sweep_deadline_epoch,
+                )
+            else:
+                # UNKNOWN
+                if is_sweep:
+                    is_complete = sweep_tested >= sweep_total
+                    if not is_complete:
+                        resp_state = "sweeping"
+                    else:
+                        resp_state = "healthy"
+                    response = build_lifecycle_access_decision(
+                        state=resp_state,
+                        cleared=False,
+                        accepted="unknown",
+                        sweep_id=_sweep_id,
+                        sweep_tested=sweep_tested,
+                        sweep_total=sweep_total,
+                        sweep_deadline_epoch=sweep_deadline_epoch,
+                    )
+                else:
+                    response = build_lifecycle_access_decision(
+                        state="individual",
+                        cleared=False,
+                        accepted="unknown",
+                        sweep_id=_sweep_id,
+                        sweep_tested=0,
+                        sweep_total=0,
+                        sweep_deadline_epoch=sweep_deadline_epoch,
+                    )
+
+            # Receipt
+            new_receipt = encode_offer_receipt(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "generation_id": gen_id,
+                    "fingerprint": _fp,
+                    "package_id": _pkg_id,
+                    "mode": mode,
+                    "outcome": _access,
+                    "response": response,
+                    "accepted_epoch": _now,
+                    "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                }
+            )
+
+            # No outbox delta for CLEAR/UNKNOWN
+            result[0] = response
+            return (
+                new_hdr_raw,
+                encode_sweep_member(new_member),
+                new_ls_raw,  # None: no link state
+                new_receipt,
+                prot_raw,  # protected unchanged
+                events_raw,  # outbox unchanged
+            )
+
+        self._shared_state.get_db(FILECRYPT_SWEEP_STATE_TABLE).mutate_values(
+            targets, mutator
+        )
+        if result[0] is None:
+            return None
+        return result[0]
