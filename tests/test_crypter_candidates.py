@@ -407,5 +407,69 @@ class PackageOwnershipClassificationTests(unittest.TestCase):
         self.assertEqual(OWNERSHIP_NOT_OWNED, self.classify(raw_package))
 
 
+class FilecryptLifecycleInventoryTests(unittest.TestCase):
+    """enumerate_filecrypt_lifecycle_candidates never truncates and never returns oversized."""
+
+    @classmethod
+    def setUpClass(cls):
+        from quasarr.providers.crypter_candidates import (  # noqa: PLC0415
+            enumerate_filecrypt_lifecycle_candidates,
+        )
+
+        cls._enumerate = staticmethod(enumerate_filecrypt_lifecycle_candidates)
+
+    def _links(self, count, offset=0):
+        return [
+            [f"https://filecrypt.invalid/Container/{offset + i:08d}", "filecrypt"]
+            for i in range(count)
+        ]
+
+    def test_never_oversized_at_101_unique_fingerprints(self):
+        rows = [protected_row(package_id(1), self._links(101))]
+        inventory = self._enumerate(rows)
+        self.assertFalse(inventory.oversized)
+        self.assertEqual(101, len(inventory.candidates))
+
+    def test_handles_1000_unique_fingerprints(self):
+        rows = [protected_row(package_id(2), self._links(1000))]
+        inventory = self._enumerate(rows)
+        self.assertFalse(inventory.oversized)
+        self.assertEqual(1000, len(inventory.candidates))
+
+    def test_handles_5000_unique_fingerprints(self):
+        # Split across two packages to also test multi-package enumeration
+        rows = [
+            protected_row(package_id(3), self._links(2500, offset=0)),
+            protected_row(package_id(4), self._links(2500, offset=2500)),
+        ]
+        inventory = self._enumerate(rows)
+        self.assertFalse(inventory.oversized)
+        self.assertEqual(5000, len(inventory.candidates))
+
+    def test_deduplicates_fingerprint_appearing_in_two_packages(self):
+        shared_url = "https://filecrypt.invalid/Container/Shared"
+        unique_a = "https://filecrypt.invalid/Container/UniqueA"
+        unique_b = "https://filecrypt.invalid/Container/UniqueB"
+        rows = [
+            protected_row(
+                package_id(5), [[shared_url, "filecrypt"], [unique_a, "filecrypt"]]
+            ),
+            protected_row(
+                package_id(6), [[shared_url, "filecrypt"], [unique_b, "filecrypt"]]
+            ),
+        ]
+        inventory = self._enumerate(rows)
+        self.assertFalse(inventory.oversized)
+        self.assertEqual(3, len(inventory.candidates))
+        shared_fp = link_fingerprint("filecrypt", shared_url)
+        shared = next(c for c in inventory.candidates if c.fingerprint == shared_fp)
+        self.assertEqual(2, len(shared.occurrences))
+
+    def test_returns_empty_inventory_for_no_rows(self):
+        inventory = self._enumerate([])
+        self.assertFalse(inventory.oversized)
+        self.assertEqual(0, len(inventory.candidates))
+
+
 if __name__ == "__main__":
     unittest.main()

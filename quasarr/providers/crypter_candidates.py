@@ -162,3 +162,49 @@ def enumerate_filecrypt_candidates(protected_rows) -> FilecryptInventory:
         ),
         oversized=False,
     )
+
+
+def enumerate_filecrypt_lifecycle_candidates(protected_rows) -> FilecryptInventory:
+    """Build the unbounded unique Filecrypt inventory for lifecycle processing.
+
+    Unlike enumerate_filecrypt_candidates, this never truncates and always returns
+    oversized=False.  It accepts arbitrarily many fingerprints and occurrences;
+    the lifecycle path imposes no capacity bounds.
+    """
+    occurrences_by_fingerprint: dict = {}
+
+    for package_id, raw_package in _canonical_rows(protected_rows):
+        try:
+            package = json.loads(raw_package)
+        except (TypeError, ValueError, RecursionError):
+            continue
+        if not helper_package_is_candidate(package):
+            continue
+
+        for link_index, link in enumerate(package["links"]):
+            if resolve_protected_crypter_key(link) != _FILECRYPT_CRYPTER:
+                continue
+            fingerprint = link_fingerprint(_FILECRYPT_CRYPTER, link[0])
+            occurrences = occurrences_by_fingerprint.get(fingerprint)
+            if occurrences is None:
+                occurrences = []
+                occurrences_by_fingerprint[fingerprint] = occurrences
+            occurrences.append(
+                FilecryptOccurrence(
+                    package_id=package_id,
+                    link_index=link_index,
+                    link=link,
+                    fingerprint=fingerprint,
+                )
+            )
+
+    return FilecryptInventory(
+        candidates=tuple(
+            FilecryptCandidate(
+                fingerprint=fingerprint,
+                occurrences=tuple(occurrences),
+            )
+            for fingerprint, occurrences in occurrences_by_fingerprint.items()
+        ),
+        oversized=False,
+    )
