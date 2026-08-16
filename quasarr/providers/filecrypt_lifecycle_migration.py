@@ -222,6 +222,10 @@ def _represented_fingerprints(protected_rows, observations, now):
         if deferred.get("crypter") != _FILECRYPT_CRYPTER:
             continue
 
+        # probe_requested defers stay for the queue to work
+        if deferred.get("probe_requested"):
+            continue
+
         fps = set()
         if "link_fingerprints" in deferred:
             fps.update(deferred["link_fingerprints"])
@@ -265,6 +269,10 @@ def prepare_migration(shared_state, now, generation_id, protected_rows):
     # Read old decision
     old_raw = shared_state.get_db("crypter_cooldowns").retrieve(_FILECRYPT_CRYPTER)
 
+    # Malformed non-None old decision halts migration
+    if old_raw is not None and not _old_row_is_valid(old_raw):
+        return None, _RESULT_UNAVAILABLE
+
     # Read lifecycle header
     header_raw = shared_state.get_db(FILECRYPT_SWEEP_STATE_TABLE).retrieve(
         FILECRYPT_SWEEP_KEY
@@ -289,11 +297,8 @@ def prepare_migration(shared_state, now, generation_id, protected_rows):
         if existing_header is None:
             return None, _RESULT_UNAVAILABLE
 
-    # Prove holds (only when migrating old state)
-    if old_raw is not None:
-        holds = _prove_holds(protected_rows, observations, now)
-    else:
-        holds = {}
+    # Prove holds: v2 defers are self-proving, legacy needs observations
+    holds = _prove_holds(protected_rows, observations, now)
 
     # Read existing link-state for each target fingerprint
     ls_db = shared_state.get_db(FILECRYPT_LINK_STATES_TABLE)
@@ -308,11 +313,8 @@ def prepare_migration(shared_state, now, generation_id, protected_rows):
             if ls is None:
                 return None, _RESULT_UNAVAILABLE
 
-    # Compute represented packages for cleanup (only when migrating old state)
-    if old_raw is not None:
-        represented = _represented_fingerprints(protected_rows, observations, now)
-    else:
-        represented = {}
+    # Compute represented packages for cleanup
+    represented = _represented_fingerprints(protected_rows, observations, now)
 
     # Read protected packages for their current raw values
     prot_db = shared_state.get_db("protected")
