@@ -897,6 +897,23 @@ class FilecryptLifecycleService:
                     and rcpt.get("generation_id") == _sweep_id
                 ):
                     resp = rcpt.get("response")
+                    # Blacklist receipt replay (retest mode)
+                    if rcpt.get("mode") == "retest":
+                        try:
+                            validate_blacklist_response(resp)
+                        except (ValueError, TypeError):
+                            pass
+                        else:
+                            if _canonical_top_id(_pkg_id) == _top_id:
+                                result[0] = {
+                                    **resp,
+                                    "terminal_required": False,
+                                    "fingerprint": _fp,
+                                    "package_id": _pkg_id,
+                                    "terminal_operation_id": _top_id,
+                                }
+                                return values
+                    # Normal defer receipt replay
                     try:
                         validate_defer_response(resp)
                     except (ValueError, TypeError):

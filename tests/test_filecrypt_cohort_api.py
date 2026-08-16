@@ -312,6 +312,7 @@ class CohortProtocolTests(unittest.TestCase):
         inventory = enumerate_filecrypt_candidates(list(rows.items()))
         occurrence = inventory.candidates[0].occurrences[0]
         offer = {
+            "capability": FILECRYPT_COHORT_CAPABILITY,
             "mode": "sweep",
             "sweep_id": "a" * 32,
             "offer_id": "b" * 32,
@@ -2439,6 +2440,309 @@ class RealDatabaseCohortTests(unittest.TestCase):
                 "state"
             ],
         )
+
+
+LIFECYCLE_CAPABILITIES = [
+    CRYPTER_DEFER_CAPABILITY,
+    FILECRYPT_COHORT_CAPABILITY,
+    "filecrypt_link_lifecycle_v1",
+]
+
+
+class LifecycleRouteTests(CohortApiTestCase):
+    """Route-level wiring for the Filecrypt link lifecycle protocol."""
+
+    def lifecycle_to_decrypt(self, **extra):
+        payload = {"supported_urls": ["filecrypt.invalid", "tolink.invalid"]}
+        payload["capabilities"] = list(LIFECYCLE_CAPABILITIES)
+        payload.update(extra)
+        return self.call(DECRYPT_RULE, payload)["to_decrypt"]
+
+    def lifecycle_blocked_payload(self, offer, package_id):
+        from quasarr.providers.terminal_operations import (
+            terminal_operation_id as top_id,
+        )
+
+        return {
+            "package_id": package_id,
+            "crypter": CRYPTER,
+            "reason_code": REASON,
+            "link_fingerprint": offer["link_fingerprint"],
+            "sweep_id": offer["sweep_id"],
+            "offer_id": offer["offer_id"],
+            "protocol_version": 2,
+            "terminal_operation_id": top_id(package_id),
+        }
+
+    def lifecycle_access_payload(self, offer, package_id, access="clear"):
+        from quasarr.providers.terminal_operations import (
+            terminal_operation_id as top_id,
+        )
+
+        return {
+            "package_id": package_id,
+            "crypter": CRYPTER,
+            "access": access,
+            "link_fingerprint": offer["link_fingerprint"],
+            "sweep_id": offer["sweep_id"],
+            "offer_id": offer["offer_id"],
+            "protocol_version": 2,
+            "terminal_operation_id": top_id(package_id),
+        }
+
+    def test_lifecycle_capability_and_offer_matrix(self):
+        from quasarr.api.sponsors_helper.cohort_protocol import (
+            FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
+            helper_supports_lifecycle,
+            render_crypter_offer,
+        )
+        from quasarr.providers.crypter_candidates import (
+            FilecryptOccurrence,
+        )
+
+        cases = [
+            (None, False),
+            ([], False),
+            ([CRYPTER_DEFER_CAPABILITY], False),
+            ([CRYPTER_DEFER_CAPABILITY, FILECRYPT_COHORT_CAPABILITY], False),
+            (["filecrypt_link_lifecycle_v1"], False),
+            (list(LIFECYCLE_CAPABILITIES), True),
+        ]
+        for caps, expected in cases:
+            with self.subTest(caps=caps):
+                payload = {} if caps is None else {"capabilities": caps}
+                self.assertIs(expected, helper_supports_lifecycle(payload))
+
+        # render_crypter_offer reads capability from offer
+        fp = fingerprint_of(filecrypt_url(1))
+        occ = FilecryptOccurrence(
+            package_id=package(1),
+            link_index=0,
+            link=[filecrypt_url(1), CRYPTER],
+            fingerprint=fp,
+        )
+        lifecycle_offer = {
+            "capability": FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
+            "mode": "sweep",
+            "sweep_id": "a" * 32,
+            "offer_id": "b" * 32,
+            "link_fingerprint": fp,
+            "deadline_epoch": NOW + 120,
+        }
+        rendered = render_crypter_offer(lifecycle_offer, occ)
+        self.assertEqual(FILECRYPT_LINK_LIFECYCLE_CAPABILITY, rendered["capability"])
+        self.assertEqual(7, len(rendered))
+
+        # CrypterCooldownService.prepare_offer adds explicit capability
+        self.store(filecrypt_rows(5))
+        handout = self.to_decrypt()
+        self.assertIn("crypter_offer", handout)
+        self.assertEqual(
+            FILECRYPT_COHORT_CAPABILITY, handout["crypter_offer"]["capability"]
+        )
+
+    def test_lifecycle_handout_selection_matrix(self):
+        self.store(filecrypt_rows(1))
+        # Also add a non-Filecrypt alternative
+        pkg = package(1)
+        data = json.loads(self.state.databases["protected"].rows[pkg])
+        data["links"].append(["https://tolink.invalid/file/1", "tolink"])
+        self.state.databases["protected"].rows[pkg] = json.dumps(data)
+
+        # With lifecycle offer present: the offered Filecrypt link survives
+        handout = self.lifecycle_to_decrypt()
+        self.assertIn("crypter_offer", handout)
+        self.assertEqual(
+            "filecrypt_link_lifecycle_v1",
+            handout["crypter_offer"]["capability"],
+        )
+        urls = handout["url"]
+        fc_urls = [u for u in urls if "filecrypt" in str(u[0]).lower()]
+        self.assertEqual(1, len(fc_urls))
+        # Non-Filecrypt alternative also survives
+        non_fc = [u for u in urls if "tolink" in str(u[0]).lower()]
+        self.assertGreaterEqual(len(non_fc), 1)
+
+        # When lifecycle has no typed offer: only-Filecrypt package is skipped
+        single_fc = filecrypt_rows(1, start=99)
+        self.state.databases["protected"].rows.clear()
+        for k, v in single_fc.items():
+            self.state.databases["protected"].rows[k] = v
+        # Blacklist the fingerprint so lifecycle can't offer it
+        from quasarr.providers.filecrypt_lifecycle import (
+            FILECRYPT_LINK_STATES_TABLE,
+            encode_link_state,
+        )
+
+        fp99 = fingerprint_of(filecrypt_url(99))
+        self.state.databases.setdefault(
+            FILECRYPT_LINK_STATES_TABLE, AtomicDatabase(tables=self.state.databases)
+        )
+        self.state.databases[FILECRYPT_LINK_STATES_TABLE].rows[fp99] = (
+            encode_link_state(
+                {
+                    "schema_version": 1,
+                    "state": "blacklisted",
+                    "first_blocked_epoch": NOW - 86400,
+                    "blacklisted_epoch": NOW,
+                }
+            )
+        )
+        with self.assertRaises(HTTPError) as raised:
+            self.lifecycle_to_decrypt()
+        self.assertEqual(404, raised.exception.status_code)
+
+    def test_lifecycle_report_classification_matrix(self):
+        from quasarr.api.sponsors_helper.cohort_protocol import (
+            LIFECYCLE_REPORT,
+            classify_access_report,
+            classify_blocked_report,
+        )
+        from quasarr.providers.terminal_operations import (
+            terminal_operation_id as top_id,
+        )
+
+        fp = fingerprint_of(filecrypt_url(1))
+        pkg = package(1)
+        sid = "a" * 32
+        oid = "b" * 32
+        top = top_id(pkg)
+
+        # Blocked classification table
+        blocked_cases = [
+            (
+                "v1",
+                {
+                    "package_id": pkg,
+                    "crypter": CRYPTER,
+                    "reason_code": REASON,
+                    "link_fingerprint": fp,
+                },
+                VERSION_ONE_REPORT,
+            ),
+            (
+                "cohort",
+                {
+                    "package_id": pkg,
+                    "crypter": CRYPTER,
+                    "reason_code": REASON,
+                    "link_fingerprint": fp,
+                    "sweep_id": sid,
+                    "offer_id": oid,
+                },
+                COHORT_REPORT,
+            ),
+            (
+                "lifecycle",
+                {
+                    "package_id": pkg,
+                    "crypter": CRYPTER,
+                    "reason_code": REASON,
+                    "link_fingerprint": fp,
+                    "sweep_id": sid,
+                    "offer_id": oid,
+                    "protocol_version": 2,
+                    "terminal_operation_id": top,
+                },
+                LIFECYCLE_REPORT,
+            ),
+            (
+                "partial_terminal",
+                {
+                    "package_id": pkg,
+                    "crypter": CRYPTER,
+                    "reason_code": REASON,
+                    "link_fingerprint": fp,
+                    "sweep_id": sid,
+                    "offer_id": oid,
+                    "protocol_version": 2,
+                },
+                MALFORMED_REPORT,
+            ),
+        ]
+        for name, payload, expected_kind in blocked_cases:
+            with self.subTest(route="blocked", case=name):
+                kind, _ = classify_blocked_report(payload)
+                self.assertEqual(expected_kind, kind)
+
+        # Access classification table
+        access_cases = [
+            (
+                "v1",
+                {
+                    "package_id": pkg,
+                    "crypter": CRYPTER,
+                    "access": "clear",
+                    "link_fingerprint": fp,
+                },
+                VERSION_ONE_REPORT,
+            ),
+            (
+                "lifecycle",
+                {
+                    "package_id": pkg,
+                    "crypter": CRYPTER,
+                    "access": "clear",
+                    "link_fingerprint": fp,
+                    "sweep_id": sid,
+                    "offer_id": oid,
+                    "protocol_version": 2,
+                    "terminal_operation_id": top,
+                },
+                LIFECYCLE_REPORT,
+            ),
+            (
+                "partial_terminal",
+                {
+                    "package_id": pkg,
+                    "crypter": CRYPTER,
+                    "access": "clear",
+                    "link_fingerprint": fp,
+                    "sweep_id": sid,
+                    "offer_id": oid,
+                    "terminal_operation_id": top,
+                },
+                MALFORMED_REPORT,
+            ),
+        ]
+        for name, payload, expected_kind in access_cases:
+            with self.subTest(route="access", case=name):
+                kind, _ = classify_access_report(payload)
+                self.assertEqual(expected_kind, kind)
+
+    def test_lifecycle_route_dispatch_matrix(self):
+        self.store(filecrypt_rows(1))
+        handout = self.lifecycle_to_decrypt()
+        offer = handout["crypter_offer"]
+        pkg_id = handout["id"]
+
+        # First-time BLOCKED → hold response
+        blocked = self.lifecycle_blocked_payload(offer, pkg_id)
+        response = self.call(DEFER_RULE, blocked)
+        self.assertIn("instruction", response)
+        self.assertEqual("hold", response["instruction"])
+        self.assertIn("sweep_id", response)
+
+        # Stale blocked (fail mode / deferred disabled)
+        self.state.values["crypter_block_mode"] = "fail"
+        stale = self.call(DEFER_RULE, blocked)
+        self.assertEqual("stale", stale["instruction"])
+        self.assertEqual("available", stale["state"])
+
+        # Stale access (fail mode)
+        access_payload = self.lifecycle_access_payload(offer, pkg_id, "clear")
+        stale_access = self.call(ACCESS_RULE, access_payload)
+        if isinstance(stale_access, HTTPResponse):
+            body = json.loads(stale_access.body)
+            self.assertEqual(409, stale_access.status_code)
+            self.assertEqual("stale", body["instruction"])
+
+        # Re-enable deferred mode; lifecycle access with stale offer → 409
+        self.state.values["crypter_block_mode"] = "defer"
+        access_resp = self.call(ACCESS_RULE, access_payload)
+        if isinstance(access_resp, HTTPResponse):
+            body = json.loads(access_resp.body)
+            self.assertEqual(409, access_resp.status_code)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,10 @@ would let a typo mutate a package hold the helper never meant to touch.
 
 import re
 
+from quasarr.providers.filecrypt_lifecycle_decisions import (
+    normalize_lifecycle_access_report,
+    normalize_lifecycle_blocked_report,
+)
 from quasarr.providers.terminal_operations import (
     TERMINAL_OPERATION_DOMAIN as TERMINAL_OPERATION_DOMAIN,  # explicit re-export
 )
@@ -25,6 +29,7 @@ from quasarr.providers.terminal_operations import (
 )
 
 FILECRYPT_COHORT_CAPABILITY = "filecrypt_cohort_sweep_v1"
+FILECRYPT_LINK_LIFECYCLE_CAPABILITY = "filecrypt_link_lifecycle_v1"
 CRYPTER_DEFER_CAPABILITY = "crypter_defer_v1"
 COHORT_CRYPTER = "filecrypt"
 
@@ -32,7 +37,10 @@ COHORT_ACCESS_VALUES = frozenset({"clear", "unknown"})
 
 VERSION_ONE_REPORT = "v1"
 COHORT_REPORT = "cohort"
+LIFECYCLE_REPORT = "lifecycle"
 MALFORMED_REPORT = "malformed"
+
+_LIFECYCLE_INTENT_FIELDS = ("protocol_version", "terminal_operation_id")
 
 _IDENTIFIER_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -59,6 +67,16 @@ def helper_supports_cohort(payload):
     return {CRYPTER_DEFER_CAPABILITY, FILECRYPT_COHORT_CAPABILITY} <= advertised
 
 
+def helper_supports_lifecycle(payload):
+    """Lifecycle needs defer, cohort, and the lifecycle capability together."""
+    advertised = _capabilities(payload)
+    return {
+        CRYPTER_DEFER_CAPABILITY,
+        FILECRYPT_COHORT_CAPABILITY,
+        FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
+    } <= advertised
+
+
 def render_crypter_offer(offer, occurrence):
     """The handout block for one leased offer, or None when it names no link.
 
@@ -67,10 +85,16 @@ def render_crypter_offer(offer, occurrence):
     """
     if not offer or occurrence is None:
         return None
+    capability = offer.get("capability")
+    if capability not in (
+        FILECRYPT_COHORT_CAPABILITY,
+        FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
+    ):
+        return None
     if occurrence.fingerprint != offer["link_fingerprint"]:
         return None
     return {
-        "capability": FILECRYPT_COHORT_CAPABILITY,
+        "capability": capability,
         "mode": offer["mode"],
         "crypter": COHORT_CRYPTER,
         "sweep_id": offer["sweep_id"],
@@ -109,10 +133,17 @@ def _offer_identity(payload):
     return identity
 
 
-def _classify(payload, complete):
-    """Split one report body into version-one, cohort, or malformed intent."""
+def _classify(payload, complete, normalize_lifecycle):
+    """Split one report body into version-one, cohort, lifecycle, or malformed."""
     if not isinstance(payload, dict):
         return VERSION_ONE_REPORT, None
+    # Lifecycle intent: either terminal field present → both mandatory
+    if any(field in payload for field in _LIFECYCLE_INTENT_FIELDS):
+        try:
+            normalized = normalize_lifecycle(payload)
+        except (ValueError, TypeError):
+            return MALFORMED_REPORT, None
+        return LIFECYCLE_REPORT, normalized
     if not any(field in payload for field in _COHORT_INTENT_FIELDS):
         return VERSION_ONE_REPORT, None
     identity = _offer_identity(payload)
@@ -142,12 +173,12 @@ def _complete_access(payload, identity):
 
 def classify_blocked_report(payload):
     """The intent of one BLOCKED body and its cohort report when it has one."""
-    return _classify(payload, _complete_blocked)
+    return _classify(payload, _complete_blocked, normalize_lifecycle_blocked_report)
 
 
 def classify_access_report(payload):
     """The intent of one access body and its cohort report when it has one."""
-    return _classify(payload, _complete_access)
+    return _classify(payload, _complete_access, normalize_lifecycle_access_report)
 
 
 def normalize_blocked_report(payload):
@@ -213,3 +244,36 @@ def render_access_response(decision, *, offer_id):
         "state": decision["state"],
         **common,
     }, 409
+
+
+def lifecycle_stale_blocked_response():
+    """A stale blocked lifecycle response: no state change, HTTP 200."""
+    return render_defer_response(
+        {
+            "instruction": "stale",
+            "state": "available",
+            "hold_type": "none",
+            "evidence_count": 0,
+            "retry_after_epoch": 0,
+            "sweep_id": "",
+            "sweep_tested": 0,
+            "sweep_total": 0,
+            "sweep_deadline_epoch": 0,
+        }
+    )
+
+
+def lifecycle_stale_access_response(offer_id):
+    """A stale access lifecycle response: no state change, HTTP 409."""
+    return render_access_response(
+        {
+            "cleared": False,
+            "accepted": "",
+            "state": "available",
+            "sweep_id": "",
+            "sweep_tested": 0,
+            "sweep_total": 0,
+            "sweep_deadline_epoch": 0,
+        },
+        offer_id=offer_id,
+    )

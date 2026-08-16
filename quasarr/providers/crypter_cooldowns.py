@@ -860,6 +860,7 @@ class CrypterCooldownService:
         if offer is None:
             return None
         return {
+            "capability": "filecrypt_cohort_sweep_v1",
             "mode": offer.mode,
             "sweep_id": offer.sweep_id,
             "offer_id": offer.offer_id,

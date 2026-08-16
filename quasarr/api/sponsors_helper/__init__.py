@@ -12,15 +12,22 @@ from bottle import HTTPResponse, abort, request
 from quasarr.api.sponsors_helper.cohort_protocol import (
     COHORT_CRYPTER,
     COHORT_REPORT,
+    LIFECYCLE_REPORT,
     MALFORMED_REPORT,
     classify_access_report,
     classify_blocked_report,
     helper_supports_cohort,
     helper_supports_defer,
+    helper_supports_lifecycle,
+    lifecycle_stale_access_response,
+    lifecycle_stale_blocked_response,
     render_access_response,
     render_crypter_offer,
     render_defer_response,
     terminal_operation_id,
+)
+from quasarr.api.sponsors_helper.cohort_protocol import (
+    FILECRYPT_LINK_LIFECYCLE_CAPABILITY as FILECRYPT_LINK_LIFECYCLE_CAPABILITY,
 )
 from quasarr.constants import PACKAGE_ID_PATTERN
 from quasarr.downloads import (
@@ -52,6 +59,7 @@ from quasarr.providers.crypter_sweeps import (
     bypass_decision,
     helper_package_is_candidate,
 )
+from quasarr.providers.filecrypt_lifecycle_service import FilecryptLifecycleService
 from quasarr.providers.log import debug, info, warn
 from quasarr.providers.notifications import update_release_notification
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
@@ -248,6 +256,7 @@ def select_helper_package(
     excluded_package_ids=None,
     enforce_package_contract=False,
     offered_occurrence=None,
+    lifecycle_service=None,
 ):
     """Pick the next protected package to hand out.
 
@@ -304,6 +313,15 @@ def select_helper_package(
             raw_links = _bind_offered_occurrence(raw_links, offered_occurrence)
             if raw_links is None:
                 continue
+        elif lifecycle_service is not None:
+            # No typed offer but lifecycle owns Filecrypt: strip all Filecrypt links
+            raw_links = [
+                link
+                for link in raw_links
+                if resolve_protected_crypter_key(link) != COHORT_CRYPTER
+            ]
+            if not raw_links:
+                continue
 
         # Order links by the category's mirror-whitelist: the whitelist order is
         # the priority ranking. Without an explicit whitelist, fall back to the
@@ -354,6 +372,16 @@ def select_helper_package(
         for link in supported_links:
             crypter = resolve_protected_crypter_key(link)
             if crypter is None:
+                eligible_supported_links.append(link)
+                continue
+
+            # Lifecycle-offered Filecrypt link bypasses legacy cooldown projection
+            if (
+                lifecycle_service is not None
+                and crypter == COHORT_CRYPTER
+                and offered_occurrence is not None
+                and _link_fingerprint(crypter, link) == offered_occurrence.fingerprint
+            ):
                 eligible_supported_links.append(link)
                 continue
 
@@ -1094,6 +1122,54 @@ def setup_sponsors_helper_routes(app):
         kind, cohort_report = classify_blocked_report(data)
         if kind == MALFORMED_REPORT:
             return abort(400, "Invalid Filecrypt cohort offer identity")
+        if kind == LIFECYCLE_REPORT:
+            if not crypter_blocks_deferred(shared_state):
+                return lifecycle_stale_blocked_response()
+            try:
+                protected_rows = shared_state.get_db("protected").retrieve_all_titles()
+                lifecycle = FilecryptLifecycleService(shared_state)
+                result = lifecycle.record_blocked(cohort_report, protected_rows)
+            except HTTPResponse:
+                raise
+            except Exception as error:
+                return internal_failure("A Filecrypt lifecycle block report", error)
+            if result is None:
+                return lifecycle_stale_blocked_response()
+            if not result.get("terminal_required"):
+                return render_defer_response(result)
+            # Terminal blacklist workflow
+            fp = result["fingerprint"]
+            pkg_id = result["package_id"]
+            top_id = result["terminal_operation_id"]
+            offer_id = result["offer_id"]
+            try:
+                protected_release = get_protected_release(pkg_id)
+                title = (
+                    protected_release.get("title", "Unknown")
+                    if protected_release
+                    else "Unknown"
+                )
+                with terminal_operation(data, "failed") as context:
+                    if context is None:
+                        return abort(500, "Internal server error")
+                    reason = (
+                        "Filecrypt URL remained unavailable after its 24-hour recheck."
+                    )
+                    terminal_result = confirm_terminal_failure(
+                        context, pkg_id, title, reason
+                    )
+                    if not terminal_result.get("package_terminal"):
+                        return abort(500, "Internal server error")
+                    blacklist = lifecycle.confirm_blacklist(fp, offer_id, top_id)
+                    if blacklist is None:
+                        return abort(500, "Internal server error")
+                    return render_defer_response(blacklist)
+            except HTTPResponse:
+                raise
+            except Exception as error:
+                return internal_failure(
+                    "A Filecrypt lifecycle terminal blacklist", error
+                )
         if kind == COHORT_REPORT:
             if not crypter_blocks_deferred(shared_state):
                 return render_defer_response(bypass_decision())
@@ -1173,6 +1249,21 @@ def setup_sponsors_helper_routes(app):
         kind, cohort_report = classify_access_report(data)
         if kind == MALFORMED_REPORT:
             return abort(400, "Invalid Filecrypt cohort offer identity")
+        if kind == LIFECYCLE_REPORT:
+            offer_id = cohort_report["offer_id"]
+            if not crypter_blocks_deferred(shared_state):
+                return json_response(*lifecycle_stale_access_response(offer_id))
+            try:
+                protected_rows = shared_state.get_db("protected").retrieve_all_titles()
+                lifecycle = FilecryptLifecycleService(shared_state)
+                result = lifecycle.record_access(cohort_report, protected_rows)
+            except HTTPResponse:
+                raise
+            except Exception as error:
+                return internal_failure("A Filecrypt lifecycle access report", error)
+            if result is None:
+                return json_response(*lifecycle_stale_access_response(offer_id))
+            return json_response(*render_access_response(result, offer_id=offer_id))
         if kind == COHORT_REPORT:
             offer_id = cohort_report["offer_id"]
             if not crypter_blocks_deferred(shared_state):
@@ -1268,6 +1359,7 @@ def setup_sponsors_helper_routes(app):
             # matches the helper's advertised support, and move that URL to the front.
             defer_capable = helper_supports_defer(payload)
             cohort_capable = helper_supports_cohort(payload)
+            lifecycle_capable = helper_supports_lifecycle(payload)
             # Legacy block mode selects exactly like an incapable helper: no
             # cooldown service is built, so no hold can gate this handout. The
             # package ID contract still applies, because it is what makes the
@@ -1280,7 +1372,25 @@ def setup_sponsors_helper_routes(app):
             excluded_package_ids = payload.get("excluded_package_ids")
             offer = None
             occurrence = None
-            if cohort_capable and cooldown_service is not None:
+            lifecycle_service = None
+
+            if lifecycle_capable and cooldown_service is not None:
+                lifecycle_service = FilecryptLifecycleService(shared_state)
+                preferred_fp = None
+                probe_occurrence = filecrypt_probe_occurrence(
+                    filecrypt_inventory(protected), protected
+                )
+                if probe_occurrence is not None:
+                    preferred_fp = probe_occurrence.fingerprint
+                offer = lifecycle_service.prepare_offer(
+                    protected,
+                    excluded_package_ids=normalize_excluded_package_ids(
+                        excluded_package_ids
+                    ),
+                    preferred_fingerprint=preferred_fp,
+                )
+                occurrence = offer.get("occurrence") if offer else None
+            elif cohort_capable and cooldown_service is not None:
                 inventory = filecrypt_inventory(protected)
                 offer, probe = lease_cohort_offer(
                     cooldown_service, inventory, protected
@@ -1298,12 +1408,14 @@ def setup_sponsors_helper_routes(app):
                     excluded_package_ids=excluded_package_ids,
                     enforce_package_contract=True,
                     offered_occurrence=occurrence,
+                    lifecycle_service=lifecycle_service,
                 )
                 if selected_package is None and occurrence is not None:
                     # The offered occurrence is not handable right now, so this
                     # request falls back to ordinary work and the unanswered
                     # lease simply expires.
                     occurrence = None
+                    offer = None
                     selected_package = select_helper_package(
                         protected,
                         supported_url_patterns,
@@ -1311,6 +1423,7 @@ def setup_sponsors_helper_routes(app):
                         cooldown_service=cooldown_service,
                         excluded_package_ids=excluded_package_ids,
                         enforce_package_contract=True,
+                        lifecycle_service=lifecycle_service,
                     )
             else:
                 selected_package = select_helper_package(
@@ -1338,8 +1451,7 @@ def setup_sponsors_helper_routes(app):
                 "password": password,
                 "max_attempts": 3,
             }
-            if cohort_capable:
-                # Output only: Task 6 owns the terminal endpoints that verify it.
+            if cohort_capable or lifecycle_capable:
                 to_decrypt["terminal_operation_id"] = terminal_operation_id(package_id)
                 crypter_offer = render_crypter_offer(offer, occurrence)
                 if crypter_offer is not None:
