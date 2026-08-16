@@ -1377,6 +1377,12 @@ def setup_sponsors_helper_routes(app):
 
             if lifecycle_capable and cooldown_service is not None:
                 lifecycle_service = FilecryptLifecycleService(shared_state)
+                migration = lifecycle_service.migrate_legacy(protected_rows=protected)
+                if migration["status"] in ("unavailable", "conflict"):
+                    return HTTPResponse(
+                        status=503,
+                        body="Filecrypt lifecycle migration unavailable",
+                    )
                 preferred_fp = None
                 probe_occurrence = filecrypt_probe_occurrence(
                     enumerate_filecrypt_lifecycle_candidates(protected), protected

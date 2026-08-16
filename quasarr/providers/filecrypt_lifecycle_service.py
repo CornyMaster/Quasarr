@@ -93,6 +93,31 @@ class FilecryptLifecycleService:
             else (lambda: secrets.token_hex(16))
         )
 
+    # ── migration ─────────────────────────────────────────────────────────────
+
+    def migrate_legacy(self, protected_rows=None):
+        """Atomically migrate proven legacy Filecrypt state into lifecycle rows."""
+        from quasarr.providers.filecrypt_lifecycle_migration import (
+            build_targets_and_mutator,
+            prepare_migration,
+        )
+
+        now = int(self._clock())
+        generation_id = self._ids()
+
+        pre_reads, plan = prepare_migration(
+            self._shared_state, now, generation_id, protected_rows
+        )
+        if pre_reads is None:
+            return plan
+
+        targets, mutator, result_ref = build_targets_and_mutator(pre_reads, plan, now)
+
+        self._shared_state.get_db(FILECRYPT_SWEEP_STATE_TABLE).mutate_values(
+            targets, mutator
+        )
+        return result_ref[0]
+
     # ── settings ──────────────────────────────────────────────────────────────
 
     def _sweep_window_seconds(self):
