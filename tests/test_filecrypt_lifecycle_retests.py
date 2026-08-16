@@ -1151,31 +1151,53 @@ class TestMalformedCooldownDeadlineProbe(RetestTestCase):
 
     def test_probe_blocked_zero_deadline_returns_none(self):
         rows, fingerprint, offer_id, blocked_report, _ = self._setup_malformed_probe()
+        pkg_id = rows[0][0]
 
+        # Snapshot all six before the call
         hdr_before = self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY)
+        member_before = self.members_db().retrieve(fingerprint)
         ls_before = self.ls_db().retrieve(fingerprint)
+        receipt_before = self.receipts_db().retrieve(offer_id)
+        protected_before = self.state.get_db("protected").retrieve(pkg_id)
+        events_before = self.events_db().retrieve(CRYPTER_EVENT_KEY)
 
         result = self.service().record_blocked(blocked_report, rows)
 
         self.assertIsNone(result)
-        # No side effects: header, link state, receipt all unchanged.
+        # Verify all six are byte-identical after failed probe
         self.assertEqual(self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY), hdr_before)
+        self.assertEqual(self.members_db().retrieve(fingerprint), member_before)
         self.assertEqual(self.ls_db().retrieve(fingerprint), ls_before)
-        self.assertIsNone(self.receipts_db().retrieve(offer_id))
+        self.assertEqual(self.receipts_db().retrieve(offer_id), receipt_before)
+        self.assertEqual(
+            self.state.get_db("protected").retrieve(pkg_id), protected_before
+        )
+        self.assertEqual(self.events_db().retrieve(CRYPTER_EVENT_KEY), events_before)
 
     def test_probe_unknown_zero_deadline_returns_none(self):
         rows, fingerprint, offer_id, _, access_report = self._setup_malformed_probe()
+        pkg_id = rows[0][0]
 
+        # Snapshot all six before the call
         hdr_before = self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY)
+        member_before = self.members_db().retrieve(fingerprint)
         ls_before = self.ls_db().retrieve(fingerprint)
+        receipt_before = self.receipts_db().retrieve(offer_id)
+        protected_before = self.state.get_db("protected").retrieve(pkg_id)
+        events_before = self.events_db().retrieve(CRYPTER_EVENT_KEY)
 
         result = self.service().record_access(access_report, rows)
 
         self.assertIsNone(result)
-        # No side effects: header, link state, receipt all unchanged.
+        # Verify all six are byte-identical after failed probe
         self.assertEqual(self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY), hdr_before)
+        self.assertEqual(self.members_db().retrieve(fingerprint), member_before)
         self.assertEqual(self.ls_db().retrieve(fingerprint), ls_before)
-        self.assertIsNone(self.receipts_db().retrieve(offer_id))
+        self.assertEqual(self.receipts_db().retrieve(offer_id), receipt_before)
+        self.assertEqual(
+            self.state.get_db("protected").retrieve(pkg_id), protected_before
+        )
+        self.assertEqual(self.events_db().retrieve(CRYPTER_EVENT_KEY), events_before)
 
 
 if __name__ == "__main__":
