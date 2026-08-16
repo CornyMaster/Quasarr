@@ -422,6 +422,7 @@ class CrypterBlockSettingTests(unittest.TestCase):
                 effective=15,
                 override=None,
                 source="default",
+                expects_warning=True,
             ),
             dict(
                 label="invalid_stored",
@@ -430,6 +431,16 @@ class CrypterBlockSettingTests(unittest.TestCase):
                 effective=15,
                 override=None,
                 source="default",
+                expects_warning=False,
+            ),
+            dict(
+                label="out_of_range_env",
+                stored={},
+                env="1441",
+                effective=15,
+                override=None,
+                source="default",
+                expects_warning=True,
             ),
         ]
         for case in cases:
@@ -461,9 +472,9 @@ class CrypterBlockSettingTests(unittest.TestCase):
                     case["effective"],
                     shared_state.values["filecrypt_sweep_window_minutes"],
                 )
-                if case["label"] == "invalid_env":
+                if case.get("expects_warning"):
                     mock_log.warning.assert_called_once()
-                    self.assertNotIn("abc", mock_log.warning.call_args[0][0])
+                    self.assertNotIn(case["env"], mock_log.warning.call_args[0][0])
                 else:
                     mock_log.warning.assert_not_called()
 
@@ -530,6 +541,42 @@ class CrypterBlockSettingTests(unittest.TestCase):
                     "mode": "defer",
                     "cooldown_hours": 24,
                     "filecrypt_sweep_window_minutes": "30",
+                },
+                env="",
+                expected_row="60",
+                expected_effective=60,
+                expected_override=60,
+                expected_source="stored",
+            ),
+            dict(
+                label="invalid_bool",
+                initial={
+                    "mode": "defer",
+                    "cooldown_hours": "24",
+                    "filecrypt_sweep_window_minutes": "60",
+                },
+                payload={
+                    "mode": "defer",
+                    "cooldown_hours": 24,
+                    "filecrypt_sweep_window_minutes": True,
+                },
+                env="",
+                expected_row="60",
+                expected_effective=60,
+                expected_override=60,
+                expected_source="stored",
+            ),
+            dict(
+                label="out_of_range_1441",
+                initial={
+                    "mode": "defer",
+                    "cooldown_hours": "24",
+                    "filecrypt_sweep_window_minutes": "60",
+                },
+                payload={
+                    "mode": "defer",
+                    "cooldown_hours": 24,
+                    "filecrypt_sweep_window_minutes": 1441,
                 },
                 env="",
                 expected_row="60",
@@ -933,6 +980,10 @@ class DashboardControlsTests(unittest.TestCase):
         self.assertIn("filecrypt_sweep_window_minutes:", html)
         # Response restoration includes override field to drive checkbox/disabled state
         self.assertIn("filecrypt_sweep_window_override", html)
+        # Page-load change listener enables/disables input reactively (outside saveCrypterBlockSettings)
+        self.assertIn("function bindSweepWindowDefault()", html)
+        self.assertIn("bindSweepWindowDefault();", html)
+        self.assertIn("sweepInput.disabled = sweepCheckbox.checked", html)
 
 
 class CrypterBlockModeBehaviorTests(unittest.TestCase):

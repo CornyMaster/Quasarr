@@ -1657,6 +1657,17 @@ def get_api(shared_state_dict, shared_state_lock):
                 }}
             }}
 
+            function bindSweepWindowDefault() {{
+                var sweepCheckbox = document.getElementById('filecrypt-sweep-window-default');
+                var sweepInput = document.getElementById('filecrypt-sweep-window-minutes');
+                if (sweepCheckbox && sweepInput) {{
+                    sweepCheckbox.addEventListener('change', function() {{
+                        sweepInput.disabled = sweepCheckbox.checked;
+                    }});
+                }}
+            }}
+
+            bindSweepWindowDefault();
             bindTimeoutSlowModePreview();
         </script>
         """
