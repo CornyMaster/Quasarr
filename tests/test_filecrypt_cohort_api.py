@@ -2669,15 +2669,104 @@ class LifecycleRouteTests(CohortApiTestCase):
             self.assertIn("links", pkg_after)
 
             # Second identical poll must NOT return a probe from same marker
+            second_was_404 = False
             try:
                 handout2 = self.lifecycle_to_decrypt()
-            except HTTPError:
+            except HTTPError as exc:
+                self.assertEqual(404, exc.status_code)
+                second_was_404 = True
                 handout2 = None
             if handout2 is not None:
-                # A non-probe lifecycle offer or alternative is acceptable
                 offer2 = handout2.get("crypter_offer")
-                if offer2 is not None:
-                    self.assertNotEqual("probe", offer2.get("mode"))
+                self.assertTrue(
+                    offer2 is None or offer2.get("mode") != "probe",
+                    "consumed probe must not reappear",
+                )
+            self.assertTrue(
+                second_was_404 or handout2 is not None,
+                "second poll must produce a definitive result",
+            )
+
+        # --- subTest: shared fingerprint routes probe to owner package ---
+        with self.subTest(case="shared_fingerprint_probe_owner"):
+            self.setUp()
+            # Two packages share the exact same Filecrypt URL
+            shared_url = filecrypt_url(500)
+            shared_fp = fingerprint_of(shared_url)
+            lower_pkg = package(10)
+            higher_pkg = package(20)
+            self.state.databases["protected"].rows[lower_pkg] = protected_blob(
+                [[shared_url, CRYPTER], ["https://tolink.invalid/lo", "tolink"]]
+            )
+            self.state.databases["protected"].rows[higher_pkg] = protected_blob(
+                [[shared_url, CRYPTER], ["https://tolink.invalid/hi", "tolink"]]
+            )
+
+            import time as _time
+
+            real_now = int(_time.time())
+
+            # Lifecycle cooldown with held state for the shared fingerprint
+            sweep_db = self.state.databases.setdefault(
+                FILECRYPT_SWEEP_STATE_TABLE,
+                AtomicDatabase(tables=self.state.databases),
+            )
+            gen_id = "e" * 32
+            sweep_db.rows[FILECRYPT_SWEEP_KEY] = encode_sweep_header(
+                {
+                    "schema_version": 1,
+                    "state": "cooldown",
+                    "generation_id": gen_id,
+                    "sweep_deadline_epoch": real_now + COOLDOWN_SECONDS,
+                    "retry_after_epoch": real_now + COOLDOWN_SECONDS,
+                }
+            )
+            ls_db = self.state.databases.setdefault(
+                FILECRYPT_LINK_STATES_TABLE,
+                AtomicDatabase(tables=self.state.databases),
+            )
+            ls_db.rows[shared_fp] = encode_link_state(
+                {
+                    "schema_version": 1,
+                    "state": "held",
+                    "first_blocked_epoch": real_now - 100,
+                    "retry_after_epoch": real_now + COOLDOWN_SECONDS,
+                    "lease": None,
+                }
+            )
+
+            # Only the HIGHER package has probe_requested; lower has no probe
+            higher_data = json.loads(self.state.databases["protected"].rows[higher_pkg])
+            higher_data["deferred"] = {
+                "schema_version": 2,
+                "crypter": "filecrypt",
+                "reason_code": "ip_block_suspected",
+                "since_epoch": real_now - 100,
+                "retry_after_epoch": real_now + COOLDOWN_SECONDS,
+                "probe_requested": True,
+                "observation_holds": 1,
+                "sweep_id": gen_id,
+                "link_fingerprints": [shared_fp],
+            }
+            self.state.databases["protected"].rows[higher_pkg] = json.dumps(higher_data)
+
+            # Handout must route probe to higher package (the owner)
+            handout = self.lifecycle_to_decrypt()
+            self.assertIn("crypter_offer", handout)
+            offer = handout["crypter_offer"]
+            self.assertEqual("probe", offer["mode"])
+            self.assertEqual(shared_fp, offer["link_fingerprint"])
+            # Handout package must be the higher (probe-owning) package
+            self.assertEqual(higher_pkg, handout["id"])
+
+            # Higher package deferred removed; lower package unchanged
+            higher_after = json.loads(
+                self.state.databases["protected"].rows[higher_pkg]
+            )
+            self.assertNotIn("deferred", higher_after)
+            lower_after = json.loads(self.state.databases["protected"].rows[lower_pkg])
+            self.assertNotIn("deferred", lower_after)
+            self.assertIn("links", lower_after)
 
         # --- subTest: malformed deferred blocks probe (fail-closed) ---
         with self.subTest(case="malformed_defer_no_probe"):
@@ -2724,14 +2813,23 @@ class LifecycleRouteTests(CohortApiTestCase):
             self.state.databases["protected"].rows[target_pkg] = json.dumps(pkg_data)
 
             # Malformed defer cannot produce a probe occurrence
+            malformed_was_404 = False
             try:
                 handout = self.lifecycle_to_decrypt()
-            except HTTPError:
+            except HTTPError as exc:
+                self.assertEqual(404, exc.status_code)
+                malformed_was_404 = True
                 handout = None
             if handout is not None:
                 offer = handout.get("crypter_offer")
-                if offer is not None:
-                    self.assertNotEqual("probe", offer.get("mode"))
+                self.assertTrue(
+                    offer is None or offer.get("mode") != "probe",
+                    "malformed defer must not produce probe",
+                )
+            self.assertTrue(
+                malformed_was_404 or handout is not None,
+                "malformed defer must produce a definitive result",
+            )
 
     def test_lifecycle_report_classification_matrix(self):
         from quasarr.api.sponsors_helper.cohort_protocol import (

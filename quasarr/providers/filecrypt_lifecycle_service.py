@@ -361,9 +361,20 @@ class FilecryptLifecycleService:
         ls = decode_link_state(ls_raw)
         if ls is None or ls["state"] != "held" or now >= ls["retry_after_epoch"]:
             return None
-        occurrence = _first_handable_occurrence(
-            fp_map[preferred_fingerprint], excluded_package_ids
-        )
+        if probe_package_id is not None:
+            # Bind to exact owner: lowest link_index in the probe's package
+            excluded = frozenset(excluded_package_ids)
+            if probe_package_id in excluded:
+                return None
+            occurrence = None
+            for occ in fp_map[preferred_fingerprint].occurrences:
+                if occ.package_id == probe_package_id:
+                    occurrence = occ
+                    break
+        else:
+            occurrence = _first_handable_occurrence(
+                fp_map[preferred_fingerprint], excluded_package_ids
+            )
         if occurrence is None:
             return None
 
