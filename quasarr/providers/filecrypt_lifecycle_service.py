@@ -8,6 +8,7 @@ confirmation, pruning, migration, route wiring, settings persistence, and
 terminal effects are deferred to later tasks.
 """
 
+import re
 import secrets
 import time
 
@@ -42,11 +43,13 @@ from quasarr.providers.filecrypt_lifecycle import (
 )
 from quasarr.providers.filecrypt_lifecycle_decisions import (
     RECEIPT_RETENTION_SECONDS,
+    build_blacklist_decision,
     build_lifecycle_access_decision,
     build_lifecycle_defer_decision,
     normalize_lifecycle_access_report,
     normalize_lifecycle_blocked_report,
     validate_access_response,
+    validate_blacklist_response,
     validate_defer_response,
 )
 
@@ -58,6 +61,8 @@ OFFER_LEASE_SECONDS = 120
 _SCHEMA_VERSION = 1
 _WINDOW_MIN = 1
 _WINDOW_MAX = 1440
+_FP_RE = re.compile(r"^[0-9a-f]{64}$")
+_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _first_handable_occurrence(candidate, excluded_package_ids):
@@ -1711,3 +1716,120 @@ class FilecryptLifecycleService:
             "package_id": _pkg_id,
             "terminal_operation_id": _top_id,
         }
+
+    # ── blacklist confirmation (Task 3B2B) ────────────────────────────────────
+
+    def confirm_blacklist(self, fingerprint, offer_id, terminal_operation_id):
+        """Confirm a terminal blacklist for a link in blacklisting state.
+
+        Returns the exact wrapper dict on success or replay, None if not
+        applicable.  Raises ValueError for invalid argument syntax.
+        """
+        if not isinstance(fingerprint, str) or not _FP_RE.fullmatch(fingerprint):
+            raise ValueError("fingerprint must be 64 lowercase hex")
+        if not isinstance(offer_id, str) or not _ID_RE.fullmatch(offer_id):
+            raise ValueError("offer_id must be 32 lowercase hex")
+        if not isinstance(terminal_operation_id, str) or not _FP_RE.fullmatch(
+            terminal_operation_id
+        ):
+            raise ValueError("terminal_operation_id must be 64 lowercase hex")
+
+        now = int(self._clock())
+        _now = now
+        _fp = fingerprint
+        _offer_id = offer_id
+        _top_id = terminal_operation_id
+        _window = self._sweep_window_seconds()
+        result = [None]
+
+        targets = [
+            (FILECRYPT_LINK_STATES_TABLE, _fp),
+            (FILECRYPT_OFFER_RECEIPTS_TABLE, _offer_id),
+        ]
+
+        def mutator(values):
+            ls_raw, receipt_raw = values
+
+            # Receipt-first replay
+            if receipt_raw is not None:
+                rcpt = decode_offer_receipt(receipt_raw)
+                if rcpt is None:
+                    result[0] = None
+                    return values
+                if (
+                    rcpt.get("fingerprint") == _fp
+                    and rcpt.get("outcome") == "blocked"
+                    and rcpt.get("mode") == "retest"
+                ):
+                    resp = rcpt.get("response")
+                    try:
+                        validate_blacklist_response(resp)
+                    except (ValueError, TypeError):
+                        result[0] = None
+                        return values
+                    result[0] = {
+                        **resp,
+                        "terminal_required": False,
+                        "fingerprint": _fp,
+                        "package_id": rcpt.get("package_id"),
+                        "terminal_operation_id": _top_id,
+                    }
+                    return values
+                # Malformed or conflicting receipt → fail closed
+                result[0] = None
+                return values
+
+            # Fresh confirmation
+            ls = decode_link_state(ls_raw) if ls_raw is not None else None
+            if ls is None or ls.get("state") != "blacklisting":
+                result[0] = None
+                return values
+
+            blacklisting = ls
+            if blacklisting.get("recheck_offer_id") != _offer_id:
+                result[0] = None
+                return values
+            if blacklisting.get("terminal_operation_id") != _top_id:
+                result[0] = None
+                return values
+
+            sweep_id = blacklisting["recheck_sweep_id"]
+            package_id = blacklisting["recheck_package_id"]
+
+            response = build_blacklist_decision(
+                sweep_id=sweep_id,
+                sweep_deadline_epoch=_now + _window,
+            )
+
+            new_ls = {
+                "schema_version": _SCHEMA_VERSION,
+                "state": "blacklisted",
+                "first_blocked_epoch": blacklisting["first_blocked_epoch"],
+                "blacklisted_epoch": _now,
+            }
+            new_receipt = encode_offer_receipt(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "generation_id": sweep_id,
+                    "fingerprint": _fp,
+                    "package_id": package_id,
+                    "mode": "retest",
+                    "outcome": "blocked",
+                    "response": response,
+                    "accepted_epoch": _now,
+                    "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                }
+            )
+            result[0] = {
+                **response,
+                "terminal_required": False,
+                "fingerprint": _fp,
+                "package_id": package_id,
+                "terminal_operation_id": _top_id,
+            }
+            return (encode_link_state(new_ls), new_receipt)
+
+        self._shared_state.get_db(FILECRYPT_LINK_STATES_TABLE).mutate_values(
+            targets, mutator
+        )
+        return result[0]

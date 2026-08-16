@@ -271,3 +271,60 @@ def build_lifecycle_access_decision(
     }
     validate_access_response(resp)
     return resp
+
+
+BLACKLIST_RESPONSE_KEYS = frozenset(
+    {
+        "instruction",
+        "state",
+        "hold_type",
+        "evidence_count",
+        "retry_after_epoch",
+        "sweep_id",
+        "sweep_tested",
+        "sweep_total",
+        "sweep_deadline_epoch",
+    }
+)
+
+
+def validate_blacklist_response(response):
+    """Raise ValueError if response does not match the exact blacklist shape."""
+    if (
+        not isinstance(response, dict)
+        or set(response.keys()) != BLACKLIST_RESPONSE_KEYS
+    ):
+        raise ValueError("invalid blacklist response key set")
+    if response["instruction"] != "blacklist":
+        raise ValueError("instruction must be 'blacklist'")
+    if response["state"] != "individual":
+        raise ValueError("state must be 'individual'")
+    if response["hold_type"] != "none":
+        raise ValueError("hold_type must be 'none'")
+    for field in ("evidence_count", "retry_after_epoch", "sweep_tested", "sweep_total"):
+        v = response[field]
+        if not (type(v) is int and v == 0):
+            raise ValueError(f"{field} must be exactly 0")
+    v = response["sweep_deadline_epoch"]
+    if not (type(v) is int and v > 0):
+        raise ValueError("sweep_deadline_epoch must be strictly positive")
+    sid = response["sweep_id"]
+    if not isinstance(sid, str) or not _ID_RE.fullmatch(sid):
+        raise ValueError("sweep_id must be 32 lowercase hex")
+
+
+def build_blacklist_decision(*, sweep_id, sweep_deadline_epoch):
+    """Build and validate a blacklist response dict."""
+    resp = {
+        "instruction": "blacklist",
+        "state": "individual",
+        "hold_type": "none",
+        "evidence_count": 0,
+        "retry_after_epoch": 0,
+        "sweep_id": sweep_id,
+        "sweep_tested": 0,
+        "sweep_total": 0,
+        "sweep_deadline_epoch": sweep_deadline_epoch,
+    }
+    validate_blacklist_response(resp)
+    return resp

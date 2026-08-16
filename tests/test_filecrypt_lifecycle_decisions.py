@@ -5,14 +5,17 @@ import json
 import unittest
 
 from quasarr.providers.filecrypt_lifecycle_decisions import (
+    BLACKLIST_RESPONSE_KEYS,
     LIFECYCLE_ACCESS_REPORT_KEYS,
     LIFECYCLE_BLOCKED_REPORT_KEYS,
     RECEIPT_RETENTION_SECONDS,
+    build_blacklist_decision,
     build_lifecycle_access_decision,
     build_lifecycle_defer_decision,
     normalize_lifecycle_access_report,
     normalize_lifecycle_blocked_report,
     validate_access_response,
+    validate_blacklist_response,
     validate_defer_response,
 )
 from quasarr.providers.terminal_operations import terminal_operation_id
@@ -349,6 +352,175 @@ class TestBuildDeferDecision(unittest.TestCase):
                 sweep_tested=0,
                 sweep_total=0,
                 sweep_deadline_epoch=5000,
+            )
+
+
+class TestBlacklistResponseValidation(unittest.TestCase):
+    """Exact blacklist response key set and constant constraints enforced."""
+
+    DEADLINE = 9999
+
+    def _valid(self):
+        return {
+            "instruction": "blacklist",
+            "state": "individual",
+            "hold_type": "none",
+            "evidence_count": 0,
+            "retry_after_epoch": 0,
+            "sweep_id": "a" * 32,
+            "sweep_tested": 0,
+            "sweep_total": 0,
+            "sweep_deadline_epoch": self.DEADLINE,
+        }
+
+    def test_valid_blacklist_response_accepted(self):
+        validate_blacklist_response(self._valid())
+
+    def test_extra_key_rejected(self):
+        r = self._valid()
+        r["extra"] = 1
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_missing_key_rejected(self):
+        r = self._valid()
+        del r["sweep_id"]
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_wrong_instruction_rejected(self):
+        r = self._valid()
+        r["instruction"] = "hold"
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_wrong_state_rejected(self):
+        r = self._valid()
+        r["state"] = "sweeping"
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_wrong_hold_type_rejected(self):
+        r = self._valid()
+        r["hold_type"] = "provisional"
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_nonzero_evidence_count_rejected(self):
+        r = self._valid()
+        r["evidence_count"] = 1
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_nonzero_retry_after_rejected(self):
+        r = self._valid()
+        r["retry_after_epoch"] = 1
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_nonzero_sweep_tested_rejected(self):
+        r = self._valid()
+        r["sweep_tested"] = 1
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_nonzero_sweep_total_rejected(self):
+        r = self._valid()
+        r["sweep_total"] = 1
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_bool_evidence_count_rejected(self):
+        r = self._valid()
+        r["evidence_count"] = True  # True == 1 == nonzero; bool fails type guard
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_bool_deadline_rejected(self):
+        r = self._valid()
+        r["sweep_deadline_epoch"] = True  # True == 1 but not int
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_zero_deadline_rejected(self):
+        r = self._valid()
+        r["sweep_deadline_epoch"] = 0
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_bad_sweep_id_rejected(self):
+        r = self._valid()
+        r["sweep_id"] = "XXXX" * 8
+        with self.assertRaises(ValueError):
+            validate_blacklist_response(r)
+
+    def test_non_dict_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_blacklist_response("not a dict")
+
+
+class TestBuildBlacklistDecision(unittest.TestCase):
+    """Builder produces exact shape, no extra/internal fields."""
+
+    SWEEP_ID = "b" * 32
+    DEADLINE = 5000
+
+    def _built(self):
+        return build_blacklist_decision(
+            sweep_id=self.SWEEP_ID,
+            sweep_deadline_epoch=self.DEADLINE,
+        )
+
+    def test_builder_accepted(self):
+        resp = self._built()
+        validate_blacklist_response(resp)
+
+    def test_builder_exact_key_set(self):
+        resp = self._built()
+        self.assertEqual(set(resp.keys()), BLACKLIST_RESPONSE_KEYS)
+
+    def test_builder_instruction_is_blacklist(self):
+        self.assertEqual(self._built()["instruction"], "blacklist")
+
+    def test_builder_state_is_individual(self):
+        self.assertEqual(self._built()["state"], "individual")
+
+    def test_builder_hold_type_is_none(self):
+        self.assertEqual(self._built()["hold_type"], "none")
+
+    def test_builder_zero_counters(self):
+        resp = self._built()
+        for field in (
+            "evidence_count",
+            "retry_after_epoch",
+            "sweep_tested",
+            "sweep_total",
+        ):
+            self.assertEqual(resp[field], 0)
+
+    def test_builder_sweep_id_preserved(self):
+        self.assertEqual(self._built()["sweep_id"], self.SWEEP_ID)
+
+    def test_builder_deadline_preserved(self):
+        self.assertEqual(self._built()["sweep_deadline_epoch"], self.DEADLINE)
+
+    def test_serialized_no_url_title_reason_error(self):
+        raw = json.dumps(self._built())
+        for keyword in ("http", "title", "reason", "error"):
+            self.assertNotIn(keyword, raw)
+
+    def test_invalid_sweep_id_raises(self):
+        with self.assertRaises(ValueError):
+            build_blacklist_decision(
+                sweep_id="not-hex",
+                sweep_deadline_epoch=self.DEADLINE,
+            )
+
+    def test_zero_deadline_raises(self):
+        with self.assertRaises(ValueError):
+            build_blacklist_decision(
+                sweep_id=self.SWEEP_ID,
+                sweep_deadline_epoch=0,
             )
 
 
