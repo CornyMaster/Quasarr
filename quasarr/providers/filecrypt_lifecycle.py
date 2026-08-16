@@ -68,6 +68,7 @@ _BLACKLISTING_KEYS = frozenset(
         "first_blocked_epoch",
         "recheck_offer_id",
         "recheck_package_id",
+        "recheck_sweep_id",
         "terminal_operation_id",
     }
 )
@@ -297,6 +298,8 @@ def decode_link_state(value):
             return None
         if not _pkg_ok(record.get("recheck_package_id")):
             return None
+        if not _id_ok(record.get("recheck_sweep_id")):
+            return None
         if not _fp_ok(record.get("terminal_operation_id")):
             return None
         return record
@@ -342,6 +345,8 @@ def encode_link_state(record):
             raise ValueError("recheck_offer_id must be 32 lowercase hex")
         if not _pkg_ok(record.get("recheck_package_id")):
             raise ValueError("recheck_package_id must be a canonical package ID")
+        if not _id_ok(record.get("recheck_sweep_id")):
+            raise ValueError("recheck_sweep_id must be 32 lowercase hex")
         if not _fp_ok(record.get("terminal_operation_id")):
             raise ValueError("terminal_operation_id must be 64 lowercase hex")
     else:  # blacklisted

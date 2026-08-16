@@ -62,6 +62,7 @@ _BLACKLISTING = {
     "first_blocked_epoch": 1000,
     "recheck_offer_id": _ID3,
     "recheck_package_id": _PKG,
+    "recheck_sweep_id": _ID,
     "terminal_operation_id": _TOP_ID,
 }
 _BLACKLISTED = {
@@ -286,6 +287,56 @@ class LinkStateBlacklistingCodecTests(unittest.TestCase):
     def test_decode_rejects_non_canonical_package_id(self):
         bad = dict(_BLACKLISTING, recheck_package_id="Quasarr_MOVIES_" + "a" * 32)
         self.assertIsNone(decode_link_state(json.dumps(bad)))
+
+    def test_decode_rejects_missing_recheck_sweep_id(self):
+        bad = {k: v for k, v in _BLACKLISTING.items() if k != "recheck_sweep_id"}
+        self.assertIsNone(decode_link_state(json.dumps(bad)))
+
+    def test_decode_rejects_bad_recheck_sweep_id(self):
+        for bad_id in ("", "Z" * 32, "G" * 32, _ID[:-1]):
+            with self.subTest(id=bad_id):
+                bad = dict(_BLACKLISTING, recheck_sweep_id=bad_id)
+                self.assertIsNone(decode_link_state(json.dumps(bad)))
+
+    def test_decode_rejects_recheck_sweep_id_as_bool(self):
+        bad = dict(_BLACKLISTING, recheck_sweep_id=True)
+        self.assertIsNone(decode_link_state(json.dumps(bad)))
+
+    def test_decode_rejects_recheck_sweep_id_as_integer(self):
+        bad = dict(_BLACKLISTING, recheck_sweep_id=12345)
+        self.assertIsNone(decode_link_state(json.dumps(bad)))
+
+    def test_round_trip_different_sweep_and_offer_ids(self):
+        # Verify round trip preserves both different recheck_sweep_id and recheck_offer_id
+        encoded = encode_link_state(_BLACKLISTING)
+        decoded = decode_link_state(encoded)
+        self.assertEqual(_BLACKLISTING, decoded)
+        # Ensure sweep_id is different from offer_id (not confused)
+        self.assertNotEqual(decoded["recheck_sweep_id"], decoded["recheck_offer_id"])
+        self.assertEqual(decoded["recheck_sweep_id"], _ID)
+        self.assertEqual(decoded["recheck_offer_id"], _ID3)
+
+    def test_encode_raises_for_missing_recheck_sweep_id(self):
+        bad = {k: v for k, v in _BLACKLISTING.items() if k != "recheck_sweep_id"}
+        with self.assertRaises(ValueError):
+            encode_link_state(bad)
+
+    def test_encode_raises_for_bad_recheck_sweep_id(self):
+        for bad_id in ("", "Z" * 32, "G" * 32, _ID[:-1]):
+            with self.subTest(id=bad_id):
+                bad = dict(_BLACKLISTING, recheck_sweep_id=bad_id)
+                with self.assertRaises(ValueError):
+                    encode_link_state(bad)
+
+    def test_encode_raises_for_recheck_sweep_id_as_bool(self):
+        bad = dict(_BLACKLISTING, recheck_sweep_id=False)
+        with self.assertRaises(ValueError):
+            encode_link_state(bad)
+
+    def test_encode_raises_for_extra_key(self):
+        bad = dict(_BLACKLISTING, extra="x")
+        with self.assertRaises(ValueError):
+            encode_link_state(bad)
 
 
 class LinkStateBlacklistedCodecTests(unittest.TestCase):
