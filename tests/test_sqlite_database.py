@@ -378,20 +378,11 @@ class SQLiteDatabaseTests(unittest.TestCase):
             # Mutate 5,000 None values to specific values and commit
             writer.mutate_values(targets, lambda current_values: tuple(f"value-{i}" for i in range(len(current_values))))
 
-            # Verify all 5,000 keys are visible through a second connection
-            row_count = reader._conn.execute(
-                "SELECT COUNT(*) FROM members"
-            ).fetchone()[0]
-            self.assertEqual(5000, row_count)
-
-            # Verify a sample of values exist with correct values via SQL
-            for sample_key in [0, 100, 500, 2500, 4999]:
-                result = reader._conn.execute(
-                    "SELECT value FROM members WHERE key = ?",
-                    (f"fingerprint-{sample_key}",)
-                ).fetchone()
-                self.assertIsNotNone(result)
-                self.assertEqual(f"value-{sample_key}", result[0])
+            # Verify all 5,000 key/value pairs are visible through a second connection
+            # by comparing the exact full dictionary, not just COUNT plus samples
+            expected = {f"fingerprint-{i}": f"value-{i}" for i in range(5000)}
+            actual = dict(reader._conn.execute("SELECT key, value FROM members").fetchall())
+            self.assertEqual(expected, actual)
         finally:
             writer._conn.close()
             reader._conn.close()
@@ -409,35 +400,37 @@ class SQLiteDatabaseTests(unittest.TestCase):
             )
             writer._conn.commit()
 
-            # Verify initial state
-            initial_count = writer._conn.execute(
-                "SELECT COUNT(*) FROM members"
-            ).fetchone()[0]
-            self.assertEqual(5000, initial_count)
-
             targets = tuple(("members", f"fingerprint-{index}") for index in range(5000))
 
-            # Try to mutate all 5,000 keys but exception occurs mid-transaction
-            def exploding_mutator(_current_values):
-                raise RuntimeError("atomic rollback test")
+            # Patch _upsert_value to fail after 2,500 writes, proving BEGIN IMMEDIATE rollback
+            # restores every partially changed row.
+            original_upsert = writer._upsert_value
+            upsert_counter = [0]  # Use list to allow modification in nested function
+            writes_completed_at_failure = [None]
 
-            with self.assertRaisesRegex(RuntimeError, "atomic rollback test"):
-                writer.mutate_values(targets, exploding_mutator)
+            def failing_upsert_wrapper(table, key, value):
+                original_upsert(table, key, value)
+                upsert_counter[0] += 1
+                if upsert_counter[0] == 2500:
+                    writes_completed_at_failure[0] = upsert_counter[0]
+                    raise RuntimeError("simulated failure after 2500 writes")
 
-            # Verify rollback: row count unchanged
-            final_count = reader._conn.execute(
-                "SELECT COUNT(*) FROM members"
-            ).fetchone()[0]
-            self.assertEqual(5000, final_count)
+            with patch.object(writer, "_upsert_value", side_effect=failing_upsert_wrapper):
+                with self.assertRaisesRegex(RuntimeError, "simulated failure after 2500 writes"):
+                    # Call mutate_values with 5,000 NEW values so all writes start fresh
+                    writer.mutate_values(
+                        targets,
+                        lambda current_values: tuple(f"mutated-{i}" for i in range(len(current_values)))
+                    )
 
-            # Verify rollback: sampled sentinel values unchanged
-            for sample_key in [0, 100, 500, 2500, 4999]:
-                result = reader._conn.execute(
-                    "SELECT value FROM members WHERE key = ?",
-                    (f"fingerprint-{sample_key}",)
-                ).fetchone()
-                self.assertIsNotNone(result)
-                self.assertEqual(f"sentinel-{sample_key}", result[0])
+            # Assert the failure occurred at exactly 2,500 upserts
+            self.assertEqual(2500, writes_completed_at_failure[0])
+
+            # Verify rollback: compare the FULL 5,000-row dict exactly against all original sentinel mappings
+            # from SECOND connection, proving BEGIN IMMEDIATE rollback restores every partially changed row
+            expected_sentinels = {f"fingerprint-{i}": f"sentinel-{i}" for i in range(5000)}
+            actual_after_rollback = dict(reader._conn.execute("SELECT key, value FROM members").fetchall())
+            self.assertEqual(expected_sentinels, actual_after_rollback)
         finally:
             writer._conn.close()
             reader._conn.close()
