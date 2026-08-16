@@ -22,6 +22,13 @@ from quasarr.downloads.packages import get_packages
 from quasarr.providers import shared_state as provider_shared_state
 from quasarr.providers.auth import audit_route_auth_modes
 from quasarr.providers.crypter_cooldowns import CrypterCooldownService
+from quasarr.providers.filecrypt_lifecycle import (
+    FILECRYPT_SWEEP_KEY,
+    FILECRYPT_SWEEP_MEMBERS_TABLE,
+    FILECRYPT_SWEEP_STATE_TABLE,
+    decode_sweep_header,
+)
+from quasarr.providers.filecrypt_lifecycle_service import FilecryptLifecycleService
 from quasarr.storage.setup import (
     get_crypter_block_settings_data,
     initialize_crypter_block_settings,
@@ -153,6 +160,10 @@ class MemorySettingsDatabase:
         self.events.append(("update_store", key, value))
         self.rows[key] = value
 
+    def delete(self, key):
+        self.events.append(("delete", key))
+        self.rows.pop(key, None)
+
 
 class FakeSharedState:
     def __init__(self, values=None, events=None):
@@ -179,9 +190,19 @@ class CrypterBlockSettingTests(unittest.TestCase):
     def test_empty_table_initializes_defer_mode_and_24_hour_cooldown(self):
         shared_state = FakeSharedState()
 
-        settings = initialize_crypter_block_settings(shared_state)
+        with mock.patch.dict("os.environ", {"FILECRYPT_SWEEP_WINDOW_MINUTES": ""}):
+            settings = initialize_crypter_block_settings(shared_state)
 
-        self.assertEqual({"mode": "defer", "cooldown_hours": 24}, settings)
+        self.assertEqual(
+            {
+                "mode": "defer",
+                "cooldown_hours": 24,
+                "filecrypt_sweep_window_minutes": 15,
+                "filecrypt_sweep_window_override": None,
+                "filecrypt_sweep_window_source": "default",
+            },
+            settings,
+        )
         self.assertEqual("defer", shared_state.values["crypter_block_mode"])
         self.assertEqual(24, shared_state.values["crypter_cooldown_hours"])
         self.database_factory.assert_called_with(CRYPTER_BLOCK_SETTINGS_TABLE)
@@ -198,18 +219,32 @@ class CrypterBlockSettingTests(unittest.TestCase):
             events=events,
         )
 
-        result = get_crypter_block_settings_data(shared_state)
+        with mock.patch.dict("os.environ", {"FILECRYPT_SWEEP_WINDOW_MINUTES": ""}):
+            result = get_crypter_block_settings_data(shared_state)
 
         self.assertEqual(
-            {"success": True, "settings": {"mode": "fail", "cooldown_hours": 72}},
+            {
+                "success": True,
+                "settings": {
+                    "mode": "fail",
+                    "cooldown_hours": 72,
+                    "filecrypt_sweep_window_minutes": 15,
+                    "filecrypt_sweep_window_override": None,
+                    "filecrypt_sweep_window_source": "default",
+                },
+            },
             result,
         )
         self.assertEqual(
             [
                 ("retrieve", "mode"),
                 ("retrieve", "cooldown_hours"),
+                ("retrieve", "filecrypt_sweep_window_minutes"),
                 ("update", "crypter_block_mode", "fail"),
                 ("update", "crypter_cooldown_hours", 72),
+                ("update", "filecrypt_sweep_window_minutes", 15),
+                ("update", "filecrypt_sweep_window_override", None),
+                ("update", "filecrypt_sweep_window_source", "default"),
             ],
             events,
         )
@@ -217,19 +252,37 @@ class CrypterBlockSettingTests(unittest.TestCase):
     def test_save_persists_valid_settings_for_a_fresh_shared_state(self):
         shared_state = FakeSharedState()
 
-        with mock.patch(
-            "quasarr.storage.setup.crypter_blocks.request",
-            mock.Mock(json={"mode": "fail", "cooldown_hours": 48}),
+        with (
+            mock.patch(
+                "quasarr.storage.setup.crypter_blocks.request",
+                mock.Mock(json={"mode": "fail", "cooldown_hours": 48}),
+            ),
+            mock.patch.dict("os.environ", {"FILECRYPT_SWEEP_WINDOW_MINUTES": ""}),
         ):
             result = save_crypter_block_settings(shared_state)
 
         self.assertTrue(result["success"])
-        self.assertEqual({"mode": "fail", "cooldown_hours": 48}, result["settings"])
+        self.assertEqual(
+            {
+                "mode": "fail",
+                "cooldown_hours": 48,
+                "filecrypt_sweep_window_minutes": 15,
+                "filecrypt_sweep_window_override": None,
+                "filecrypt_sweep_window_source": "default",
+            },
+            result["settings"],
+        )
         self.assertEqual({"mode": "fail", "cooldown_hours": "48"}, self.database.rows)
 
         restored_state = FakeSharedState()
         self.assertEqual(
-            {"mode": "fail", "cooldown_hours": 48},
+            {
+                "mode": "fail",
+                "cooldown_hours": 48,
+                "filecrypt_sweep_window_minutes": 15,
+                "filecrypt_sweep_window_override": None,
+                "filecrypt_sweep_window_source": "default",
+            },
             initialize_crypter_block_settings(restored_state),
         )
 
@@ -237,39 +290,75 @@ class CrypterBlockSettingTests(unittest.TestCase):
         self.database.rows.update({"mode": "fail", "cooldown_hours": "48"})
         shared_state = FakeSharedState()
 
-        with mock.patch(
-            "quasarr.storage.setup.crypter_blocks.request",
-            mock.Mock(json={"mode": "pause", "cooldown_hours": 72}),
+        with (
+            mock.patch(
+                "quasarr.storage.setup.crypter_blocks.request",
+                mock.Mock(json={"mode": "pause", "cooldown_hours": 72}),
+            ),
+            mock.patch.dict("os.environ", {"FILECRYPT_SWEEP_WINDOW_MINUTES": ""}),
         ):
             result = save_crypter_block_settings(shared_state)
 
-        self.assertEqual({"mode": "fail", "cooldown_hours": 72}, result["settings"])
+        self.assertEqual(
+            {
+                "mode": "fail",
+                "cooldown_hours": 72,
+                "filecrypt_sweep_window_minutes": 15,
+                "filecrypt_sweep_window_override": None,
+                "filecrypt_sweep_window_source": "default",
+            },
+            result["settings"],
+        )
         self.assertEqual({"mode": "fail", "cooldown_hours": "72"}, self.database.rows)
 
     def test_non_integer_hours_preserve_current_hours_and_save_valid_mode(self):
         self.database.rows.update({"mode": "defer", "cooldown_hours": "48"})
         shared_state = FakeSharedState()
 
-        with mock.patch(
-            "quasarr.storage.setup.crypter_blocks.request",
-            mock.Mock(json={"mode": "fail", "cooldown_hours": "72"}),
+        with (
+            mock.patch(
+                "quasarr.storage.setup.crypter_blocks.request",
+                mock.Mock(json={"mode": "fail", "cooldown_hours": "72"}),
+            ),
+            mock.patch.dict("os.environ", {"FILECRYPT_SWEEP_WINDOW_MINUTES": ""}),
         ):
             result = save_crypter_block_settings(shared_state)
 
-        self.assertEqual({"mode": "fail", "cooldown_hours": 48}, result["settings"])
+        self.assertEqual(
+            {
+                "mode": "fail",
+                "cooldown_hours": 48,
+                "filecrypt_sweep_window_minutes": 15,
+                "filecrypt_sweep_window_override": None,
+                "filecrypt_sweep_window_source": "default",
+            },
+            result["settings"],
+        )
         self.assertEqual({"mode": "fail", "cooldown_hours": "48"}, self.database.rows)
 
     def test_hours_below_24_preserve_current_hours(self):
         self.database.rows.update({"mode": "defer", "cooldown_hours": "96"})
         shared_state = FakeSharedState()
 
-        with mock.patch(
-            "quasarr.storage.setup.crypter_blocks.request",
-            mock.Mock(json={"mode": "defer", "cooldown_hours": 23}),
+        with (
+            mock.patch(
+                "quasarr.storage.setup.crypter_blocks.request",
+                mock.Mock(json={"mode": "defer", "cooldown_hours": 23}),
+            ),
+            mock.patch.dict("os.environ", {"FILECRYPT_SWEEP_WINDOW_MINUTES": ""}),
         ):
             result = save_crypter_block_settings(shared_state)
 
-        self.assertEqual({"mode": "defer", "cooldown_hours": 96}, result["settings"])
+        self.assertEqual(
+            {
+                "mode": "defer",
+                "cooldown_hours": 96,
+                "filecrypt_sweep_window_minutes": 15,
+                "filecrypt_sweep_window_override": None,
+                "filecrypt_sweep_window_source": "default",
+            },
+            result["settings"],
+        )
         self.assertEqual({"mode": "defer", "cooldown_hours": "96"}, self.database.rows)
 
     def test_malformed_json_preserves_database_and_cached_settings(self):
@@ -299,6 +388,253 @@ class CrypterBlockSettingTests(unittest.TestCase):
                 self.assertEqual(before_rows, self.database.rows)
                 self.assertEqual(before_values, shared_state.values)
                 self.assertEqual([], self.database.events)
+
+    def test_sweep_window_precedence_matrix(self):
+        cases = [
+            dict(
+                label="default",
+                stored={},
+                env="",
+                effective=15,
+                override=None,
+                source="default",
+            ),
+            dict(
+                label="valid_env",
+                stored={},
+                env="30",
+                effective=30,
+                override=None,
+                source="environment",
+            ),
+            dict(
+                label="stored_over_env",
+                stored={"filecrypt_sweep_window_minutes": "60"},
+                env="30",
+                effective=60,
+                override=60,
+                source="stored",
+            ),
+            dict(
+                label="invalid_env",
+                stored={},
+                env="abc",
+                effective=15,
+                override=None,
+                source="default",
+            ),
+            dict(
+                label="invalid_stored",
+                stored={"filecrypt_sweep_window_minutes": "xyz"},
+                env="",
+                effective=15,
+                override=None,
+                source="default",
+            ),
+        ]
+        for case in cases:
+            with self.subTest(label=case["label"]):
+                self.database.rows = {
+                    "mode": "defer",
+                    "cooldown_hours": "24",
+                    **case["stored"],
+                }
+                shared_state = FakeSharedState()
+                with (
+                    mock.patch.dict(
+                        "os.environ",
+                        {"FILECRYPT_SWEEP_WINDOW_MINUTES": case["env"]},
+                    ),
+                    mock.patch("quasarr.storage.setup.crypter_blocks._log") as mock_log,
+                ):
+                    settings = initialize_crypter_block_settings(shared_state)
+                self.assertEqual(
+                    case["effective"], settings["filecrypt_sweep_window_minutes"]
+                )
+                self.assertEqual(
+                    case["override"], settings["filecrypt_sweep_window_override"]
+                )
+                self.assertEqual(
+                    case["source"], settings["filecrypt_sweep_window_source"]
+                )
+                self.assertEqual(
+                    case["effective"],
+                    shared_state.values["filecrypt_sweep_window_minutes"],
+                )
+                if case["label"] == "invalid_env":
+                    mock_log.warning.assert_called_once()
+                    self.assertNotIn("abc", mock_log.warning.call_args[0][0])
+                else:
+                    mock_log.warning.assert_not_called()
+
+    def test_save_clear_and_invalid_sweep_window_override(self):
+        cases = [
+            dict(
+                label="valid_int",
+                initial={"mode": "defer", "cooldown_hours": "24"},
+                payload={
+                    "mode": "defer",
+                    "cooldown_hours": 24,
+                    "filecrypt_sweep_window_minutes": 30,
+                },
+                env="",
+                expected_row="30",
+                expected_effective=30,
+                expected_override=30,
+                expected_source="stored",
+            ),
+            dict(
+                label="null_clear_to_env",
+                initial={
+                    "mode": "defer",
+                    "cooldown_hours": "24",
+                    "filecrypt_sweep_window_minutes": "60",
+                },
+                payload={
+                    "mode": "defer",
+                    "cooldown_hours": 24,
+                    "filecrypt_sweep_window_minutes": None,
+                },
+                env="45",
+                expected_row=None,
+                expected_effective=45,
+                expected_override=None,
+                expected_source="environment",
+            ),
+            dict(
+                label="null_clear_to_default",
+                initial={
+                    "mode": "defer",
+                    "cooldown_hours": "24",
+                    "filecrypt_sweep_window_minutes": "60",
+                },
+                payload={
+                    "mode": "defer",
+                    "cooldown_hours": 24,
+                    "filecrypt_sweep_window_minutes": None,
+                },
+                env="",
+                expected_row=None,
+                expected_effective=15,
+                expected_override=None,
+                expected_source="default",
+            ),
+            dict(
+                label="invalid_preserve",
+                initial={
+                    "mode": "defer",
+                    "cooldown_hours": "24",
+                    "filecrypt_sweep_window_minutes": "60",
+                },
+                payload={
+                    "mode": "defer",
+                    "cooldown_hours": 24,
+                    "filecrypt_sweep_window_minutes": "30",
+                },
+                env="",
+                expected_row="60",
+                expected_effective=60,
+                expected_override=60,
+                expected_source="stored",
+            ),
+        ]
+        for case in cases:
+            with self.subTest(label=case["label"]):
+                events = []
+                self.database.rows = dict(case["initial"])
+                self.database.events = events
+                shared_state = FakeSharedState(events=events)
+                with (
+                    mock.patch(
+                        "quasarr.storage.setup.crypter_blocks.request",
+                        mock.Mock(json=case["payload"]),
+                    ),
+                    mock.patch.dict(
+                        "os.environ",
+                        {"FILECRYPT_SWEEP_WINDOW_MINUTES": case["env"]},
+                    ),
+                ):
+                    result = save_crypter_block_settings(shared_state)
+                self.assertTrue(result["success"])
+                if case["expected_row"] is None:
+                    self.assertNotIn(
+                        "filecrypt_sweep_window_minutes", self.database.rows
+                    )
+                else:
+                    self.assertEqual(
+                        case["expected_row"],
+                        self.database.rows.get("filecrypt_sweep_window_minutes"),
+                    )
+                s = result["settings"]
+                self.assertEqual(
+                    case["expected_effective"], s["filecrypt_sweep_window_minutes"]
+                )
+                self.assertEqual(
+                    case["expected_override"], s["filecrypt_sweep_window_override"]
+                )
+                self.assertEqual(
+                    case["expected_source"], s["filecrypt_sweep_window_source"]
+                )
+                # Cache updates come after all DB operations
+                update_idxs = [i for i, e in enumerate(events) if e[0] == "update"]
+                db_idxs = [
+                    i
+                    for i, e in enumerate(events)
+                    if e[0] in ("retrieve", "update_store", "delete")
+                ]
+                if update_idxs and db_idxs:
+                    self.assertGreater(update_idxs[0], db_idxs[-1])
+
+    def test_active_generation_keeps_frozen_sweep_deadline(self):
+        state = BlockModeSharedState()
+        state.values["filecrypt_sweep_window_minutes"] = 7
+        ids_seq = [0]
+
+        def seq_id():
+            ids_seq[0] += 1
+            return f"{ids_seq[0]:032x}"
+
+        service = FilecryptLifecycleService(
+            state, clock=lambda: NOW, identifier_factory=seq_id
+        )
+        rows = [
+            [
+                PACKAGE_ID,
+                protected_blob(
+                    "T1", [["https://filecrypt.invalid/link/1", "filecrypt"]]
+                ),
+            ],
+            [
+                ALTERNATIVE_PACKAGE_ID,
+                protected_blob(
+                    "T2", [["https://filecrypt.invalid/link/2", "filecrypt"]]
+                ),
+            ],
+        ]
+
+        offer = service.prepare_offer(rows)
+        self.assertIsNotNone(offer)
+        self.assertEqual("sweep", offer["mode"])
+
+        header = decode_sweep_header(
+            state.get_db(FILECRYPT_SWEEP_STATE_TABLE).retrieve(FILECRYPT_SWEEP_KEY)
+        )
+        self.assertEqual(NOW + 7 * 60, header["deadline_epoch"])
+        self.assertEqual(7 * 60, header["window_seconds"])
+
+        # Changing the cached setting does not reopen or extend the active generation
+        state.values["filecrypt_sweep_window_minutes"] = 30
+        service.prepare_offer(rows)
+
+        header_after = decode_sweep_header(
+            state.get_db(FILECRYPT_SWEEP_STATE_TABLE).retrieve(FILECRYPT_SWEEP_KEY)
+        )
+        self.assertEqual(header["deadline_epoch"], header_after["deadline_epoch"])
+        self.assertEqual(header["window_seconds"], header_after["window_seconds"])
+        members = (
+            state.get_db(FILECRYPT_SWEEP_MEMBERS_TABLE).retrieve_all_titles() or []
+        )
+        self.assertEqual(header["total"], len(members))
 
 
 class CrypterBlockRouteTests(unittest.TestCase):
@@ -481,6 +817,8 @@ class DashboardControlsTests(unittest.TestCase):
             "filecrypt_enabled": True,
             "crypter_block_mode": "fail",
             "crypter_cooldown_hours": 72,
+            "filecrypt_sweep_window_minutes": 15,
+            "filecrypt_sweep_window_override": None,
         }
         protected_db = mock.Mock()
         protected_db.retrieve_all_titles.return_value = None
@@ -582,6 +920,19 @@ class DashboardControlsTests(unittest.TestCase):
         self.assertIn("quasarrApiFetch('/api/crypter-block/settings'", html)
         self.assertIn("mode: modeSelect.value", html)
         self.assertIn("cooldown_hours: Number.parseInt", html)
+        # Sweep window input and checkbox
+        self.assertIn(
+            '<input type="number" id="filecrypt-sweep-window-minutes" min="1" max="1440" step="1" value="15" disabled>',
+            link_protection_html,
+        )
+        self.assertIn(
+            'id="filecrypt-sweep-window-default" checked', link_protection_html
+        )
+        # POST payload carries null when checkbox checked, int otherwise
+        self.assertIn("sweepWindowDefaultCheckbox.checked ? null", html)
+        self.assertIn("filecrypt_sweep_window_minutes:", html)
+        # Response restoration includes override field to drive checkbox/disabled state
+        self.assertIn("filecrypt_sweep_window_override", html)
 
 
 class CrypterBlockModeBehaviorTests(unittest.TestCase):

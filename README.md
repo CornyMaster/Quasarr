@@ -193,6 +193,7 @@ docker run -d \
 | `USER` / `PASS`    | Optional, but recommended! Username / Password to protect the web UI.                                      |
 | `AUTH`             | Authentication mode. Supported values: `form` or `basic`.                                                  |
 | `TZ`               | Optional. Timezone. Incorrect values may cause HTTPS/SSL issues.                                           |
+| `FILECRYPT_SWEEP_WINDOW_MINUTES` | Optional. Filecrypt sweep window in minutes (1–1440, default 15). A WebGUI override under **Link Protection** takes precedence over this value. |
 
 # Manual setup
 

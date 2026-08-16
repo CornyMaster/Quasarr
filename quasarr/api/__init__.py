@@ -251,6 +251,24 @@ def get_api(shared_state_dict, shared_state_lock):
         except (TypeError, ValueError):
             crypter_cooldown_hours = 24
         crypter_cooldown_hours = max(24, crypter_cooldown_hours)
+        try:
+            filecrypt_sweep_window_minutes = int(
+                shared_state.values.get("filecrypt_sweep_window_minutes", 15)
+            )
+        except (TypeError, ValueError):
+            filecrypt_sweep_window_minutes = 15
+        filecrypt_sweep_window_minutes = max(
+            1, min(1440, filecrypt_sweep_window_minutes)
+        )
+        filecrypt_sweep_window_override = shared_state.values.get(
+            "filecrypt_sweep_window_override"
+        )
+        sweep_window_input_disabled = (
+            " disabled" if filecrypt_sweep_window_override is None else ""
+        )
+        sweep_window_default_checked = (
+            "checked" if filecrypt_sweep_window_override is None else ""
+        )
 
         def render_switch(input_id, checked):
             return (
@@ -419,6 +437,13 @@ def get_api(shared_state_dict, shared_state_lock):
                         <label for="crypter-cooldown-hours">Cooldown (hours)</label>
                         <div class="input-row">
                             <input type="number" id="crypter-cooldown-hours" min="24" step="1" value="{crypter_cooldown_hours}">
+                        </div>
+                    </div>
+                    <div class="input-group">
+                        <label for="filecrypt-sweep-window-minutes">Filecrypt sweep window (minutes)</label>
+                        <div class="input-row">
+                            <input type="number" id="filecrypt-sweep-window-minutes" min="1" max="1440" step="1" value="{filecrypt_sweep_window_minutes}"{sweep_window_input_disabled}>
+                            <label><input type="checkbox" id="filecrypt-sweep-window-default" {sweep_window_default_checked}> Use Docker/default value</label>
                         </div>
                     </div>
                     <p class="api-hint setting-row-hint">
@@ -1562,6 +1587,8 @@ def get_api(shared_state_dict, shared_state_lock):
                 var saveButton = document.getElementById('crypterBlockSaveBtn');
                 var modeSelect = document.getElementById('crypter-block-mode');
                 var cooldownInput = document.getElementById('crypter-cooldown-hours');
+                var sweepWindowInput = document.getElementById('filecrypt-sweep-window-minutes');
+                var sweepWindowDefaultCheckbox = document.getElementById('filecrypt-sweep-window-default');
                 setNotificationStatus('crypter-block-status', 'Saving block settings...', true);
 
                 if (saveButton) {{
@@ -1574,6 +1601,12 @@ def get_api(shared_state_dict, shared_state_lock):
                 if (cooldownInput) {{
                     cooldownInput.disabled = true;
                 }}
+                if (sweepWindowInput) {{
+                    sweepWindowInput.disabled = true;
+                }}
+                if (sweepWindowDefaultCheckbox) {{
+                    sweepWindowDefaultCheckbox.disabled = true;
+                }}
 
                 try {{
                     var response = await quasarrApiFetch('/api/crypter-block/settings', {{
@@ -1581,7 +1614,8 @@ def get_api(shared_state_dict, shared_state_lock):
                         headers: {{ 'Content-Type': 'application/json' }},
                         body: JSON.stringify({{
                             mode: modeSelect.value,
-                            cooldown_hours: Number.parseInt(cooldownInput.value, 10)
+                            cooldown_hours: Number.parseInt(cooldownInput.value, 10),
+                            filecrypt_sweep_window_minutes: sweepWindowDefaultCheckbox && sweepWindowDefaultCheckbox.checked ? null : Number.parseInt(sweepWindowInput.value, 10)
                         }})
                     }});
                     var data = await response.json();
@@ -1592,6 +1626,13 @@ def get_api(shared_state_dict, shared_state_lock):
                     if (data.settings) {{
                         modeSelect.value = data.settings.mode;
                         cooldownInput.value = data.settings.cooldown_hours;
+                        if (sweepWindowInput) {{
+                            sweepWindowInput.value = data.settings.filecrypt_sweep_window_minutes;
+                            sweepWindowInput.disabled = data.settings.filecrypt_sweep_window_override == null;
+                        }}
+                        if (sweepWindowDefaultCheckbox) {{
+                            sweepWindowDefaultCheckbox.checked = data.settings.filecrypt_sweep_window_override == null;
+                        }}
                     }}
                     setNotificationStatus('crypter-block-status', '✅ ' + data.message, true);
                 }} catch (error) {{
@@ -1606,6 +1647,12 @@ def get_api(shared_state_dict, shared_state_lock):
                     }}
                     if (cooldownInput) {{
                         cooldownInput.disabled = false;
+                    }}
+                    if (sweepWindowDefaultCheckbox) {{
+                        sweepWindowDefaultCheckbox.disabled = false;
+                    }}
+                    if (sweepWindowInput) {{
+                        sweepWindowInput.disabled = sweepWindowDefaultCheckbox ? sweepWindowDefaultCheckbox.checked : false;
                     }}
                 }}
             }}
