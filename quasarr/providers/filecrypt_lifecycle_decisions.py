@@ -199,6 +199,12 @@ def validate_access_response(response):
         raise ValueError("cleared must be bool")
     if response["accepted"] not in _ACCESS_ACCEPTED_VALUES:
         raise ValueError("accepted must be '' or 'unknown'")
+    if response["cleared"] and response["accepted"] != "":
+        raise ValueError("cleared=True requires accepted=''")
+    if response["cleared"] and response["state"] != "healthy":
+        raise ValueError("cleared=True requires state='healthy'")
+    if not response["cleared"] and response["accepted"] != "unknown":
+        raise ValueError("cleared=False requires accepted='unknown'")
     for field in ("sweep_tested", "sweep_total", "sweep_deadline_epoch"):
         v = response[field]
         if not (type(v) is int and v >= 0):

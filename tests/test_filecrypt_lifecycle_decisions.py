@@ -299,6 +299,20 @@ class TestAccessResponseValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_access_response(r)
 
+    def test_cleared_true_requires_accepted_empty(self):
+        r = self._valid()
+        r["cleared"] = True
+        r["accepted"] = "unknown"
+        with self.assertRaises(ValueError):
+            validate_access_response(r)
+
+    def test_cleared_false_requires_accepted_unknown(self):
+        r = self._valid()
+        r["cleared"] = False
+        r["accepted"] = ""
+        with self.assertRaises(ValueError):
+            validate_access_response(r)
+
 
 class TestBuildDeferDecision(unittest.TestCase):
     """RED: builder produces validated response."""
