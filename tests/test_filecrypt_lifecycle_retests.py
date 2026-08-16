@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Tests for FilecryptLifecycleService retest and probe outcomes (Task 3B2A)."""
 
+import json
 import unittest
 
 from quasarr.providers.crypter_cooldowns import (
@@ -18,6 +19,7 @@ from quasarr.providers.filecrypt_lifecycle import (
     decode_offer_receipt,
     decode_sweep_header,
     decode_sweep_member,
+    encode_link_state,
 )
 from quasarr.providers.filecrypt_lifecycle_decisions import (
     validate_access_response,
@@ -33,6 +35,7 @@ from tests.test_filecrypt_lifecycle_service import (
     AtomicSharedState,
     FakeClock,
     SequentialIds,
+    fp,
     rows_for,
 )
 
@@ -1068,6 +1071,111 @@ class TestAccessResponseCooldownState(RetestTestCase):
         }
         with self.assertRaises(ValueError):
             validate_access_response(resp)
+
+
+# ── malformed cooldown deadline regression ────────────────────────────────────
+
+
+class TestMalformedCooldownDeadlineProbe(RetestTestCase):
+    """Regression: cooldown header with sweep_deadline_epoch=0 must be rejected.
+
+    After the lifecycle codec fix, decode_sweep_header returns None for any
+    cooldown header carrying a zero epoch, so is_live_cooldown is False and
+    both probe paths fall to the stale branch: None, no exception, no writes.
+    """
+
+    def _setup_malformed_probe(self):
+        """5 normal blocked to enter cooldown, then corrupt sweep_deadline_epoch=0."""
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        for i in range(5):
+            offer = svc.prepare_offer(rows)
+            self.assertIsNotNone(offer, f"offer {i}")
+            svc.record_blocked(_report_blocked(offer), rows)
+
+        hdr_raw = self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY)
+        hdr = decode_sweep_header(hdr_raw)
+        self.assertIsNotNone(hdr, "cooldown header expected after 5 blocked")
+        self.assertEqual(hdr["state"], "cooldown")
+
+        generation_id = hdr["generation_id"]
+        fingerprint = fp(0)
+        pkg_id = rows[0][0]
+
+        # Bypass encoder to install a cooldown header with sweep_deadline_epoch=0.
+        malformed_raw = json.dumps(
+            dict(hdr, sweep_deadline_epoch=0),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self.sweep_db().store(FILECRYPT_SWEEP_KEY, malformed_raw)
+
+        # Install an active probe lease directly on the held link state.
+        offer_id = "f" * 32
+        ls_raw = self.ls_db().retrieve(fingerprint)
+        ls = decode_link_state(ls_raw)
+        self.assertIsNotNone(ls)
+        self.assertEqual(ls["state"], "held")
+        probe_ls = dict(
+            ls,
+            lease={
+                "sweep_id": generation_id,
+                "offer_id": offer_id,
+                "package_id": pkg_id,
+                "offer_expires_epoch": self.clock.now + OFFER_LEASE_SECONDS,
+            },
+        )
+        self.ls_db().store(fingerprint, encode_link_state(probe_ls))
+
+        blocked_report = {
+            "package_id": pkg_id,
+            "crypter": "filecrypt",
+            "reason_code": "ip_block_suspected",
+            "link_fingerprint": fingerprint,
+            "sweep_id": generation_id,
+            "offer_id": offer_id,
+            "protocol_version": 2,
+            "terminal_operation_id": terminal_operation_id(pkg_id),
+        }
+        access_report = {
+            "package_id": pkg_id,
+            "crypter": "filecrypt",
+            "access": "unknown",
+            "link_fingerprint": fingerprint,
+            "sweep_id": generation_id,
+            "offer_id": offer_id,
+            "protocol_version": 2,
+            "terminal_operation_id": terminal_operation_id(pkg_id),
+        }
+        return rows, fingerprint, offer_id, blocked_report, access_report
+
+    def test_probe_blocked_zero_deadline_returns_none(self):
+        rows, fingerprint, offer_id, blocked_report, _ = self._setup_malformed_probe()
+
+        hdr_before = self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY)
+        ls_before = self.ls_db().retrieve(fingerprint)
+
+        result = self.service().record_blocked(blocked_report, rows)
+
+        self.assertIsNone(result)
+        # No side effects: header, link state, receipt all unchanged.
+        self.assertEqual(self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY), hdr_before)
+        self.assertEqual(self.ls_db().retrieve(fingerprint), ls_before)
+        self.assertIsNone(self.receipts_db().retrieve(offer_id))
+
+    def test_probe_unknown_zero_deadline_returns_none(self):
+        rows, fingerprint, offer_id, _, access_report = self._setup_malformed_probe()
+
+        hdr_before = self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY)
+        ls_before = self.ls_db().retrieve(fingerprint)
+
+        result = self.service().record_access(access_report, rows)
+
+        self.assertIsNone(result)
+        # No side effects: header, link state, receipt all unchanged.
+        self.assertEqual(self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY), hdr_before)
+        self.assertEqual(self.ls_db().retrieve(fingerprint), ls_before)
+        self.assertIsNone(self.receipts_db().retrieve(offer_id))
 
 
 if __name__ == "__main__":

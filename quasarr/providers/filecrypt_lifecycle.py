@@ -408,7 +408,9 @@ def decode_sweep_header(value, *, now=None):
             return None
         if not _id_ok(record.get("generation_id")):
             return None
-        if not _epoch(record.get("sweep_deadline_epoch")):
+        # cooldown deadline must be strictly positive; epoch 0 is invalid
+        v = record.get("sweep_deadline_epoch")
+        if not (type(v) is int and v > 0):
             return None
         if not _epoch(record.get("retry_after_epoch")):
             return None
@@ -459,8 +461,10 @@ def encode_sweep_header(record):
             raise ValueError("cooldown record key set mismatch")
         if not _id_ok(record.get("generation_id")):
             raise ValueError("generation_id must be 32 lowercase hex")
-        if not _epoch(record.get("sweep_deadline_epoch")):
-            raise ValueError("sweep_deadline_epoch must be a non-negative int")
+        # cooldown deadline must be strictly positive; epoch 0 is invalid
+        v = record.get("sweep_deadline_epoch")
+        if not (type(v) is int and v > 0):
+            raise ValueError("sweep_deadline_epoch must be a strictly positive int")
         if not _epoch(record.get("retry_after_epoch")):
             raise ValueError("retry_after_epoch must be a non-negative int")
     return _encode(record)

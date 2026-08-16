@@ -1520,6 +1520,8 @@ class FilecryptLifecycleService:
                     # Every other combination → stale
                     result[0] = None
                     return values
+                # Held but lease doesn't match → fall through to first-time check
+                # which will reject because ls_raw is not None
 
             # 4. First-time: validate member
             m = decode_sweep_member(member_raw)

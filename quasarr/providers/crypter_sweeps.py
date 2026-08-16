@@ -198,13 +198,6 @@ def _epoch(value, field_name):
     return value
 
 
-def _epoch_positive(value, field_name):
-    """Validate a positive epoch timestamp, rejecting 0 (epoch start)."""
-    if type(value) is not int or value <= 0:
-        raise ValueError(f'Invalid linkcrypter decision field "{field_name}"')
-    return value
-
-
 def _choice(value, allowed, field_name):
     if not isinstance(value, str) or value not in allowed:
         raise ValueError(f'Invalid linkcrypter decision field "{field_name}"')
@@ -325,7 +318,7 @@ def _accepted_offers(value, used):
             ),
             "sweep_tested": _epoch(entry["sweep_tested"], "sweep_tested"),
             "sweep_total": _epoch(entry["sweep_total"], "sweep_total"),
-            "sweep_deadline_epoch": _epoch_positive(
+            "sweep_deadline_epoch": _epoch(
                 entry["sweep_deadline_epoch"], "sweep_deadline_epoch"
             ),
         }

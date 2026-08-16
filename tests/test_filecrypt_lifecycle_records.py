@@ -468,6 +468,20 @@ class SweepHeaderCooldownCodecTests(unittest.TestCase):
         bad = dict(_SWEEP_COOLDOWN, state="observing")
         self.assertIsNone(decode_sweep_header(json.dumps(bad)))
 
+    def test_decode_rejects_zero_sweep_deadline_epoch(self):
+        # Epoch 0 is not a valid deadline; cooldown must have a strictly positive deadline.
+        bad = dict(_SWEEP_COOLDOWN, sweep_deadline_epoch=0)
+        self.assertIsNone(decode_sweep_header(json.dumps(bad)))
+
+    def test_encode_raises_for_zero_sweep_deadline_epoch(self):
+        bad = dict(_SWEEP_COOLDOWN, sweep_deadline_epoch=0)
+        with self.assertRaises(ValueError):
+            encode_sweep_header(bad)
+
+    def test_positive_sweep_deadline_epoch_round_trips(self):
+        record = dict(_SWEEP_COOLDOWN, sweep_deadline_epoch=1)
+        self.assertEqual(record, decode_sweep_header(encode_sweep_header(record)))
+
 
 # ── sweep-member codecs ───────────────────────────────────────────────────────
 
