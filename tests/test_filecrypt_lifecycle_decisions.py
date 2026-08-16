@@ -313,6 +313,12 @@ class TestAccessResponseValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_access_response(r)
 
+    def test_cleared_true_requires_state_healthy(self):
+        r = self._valid()
+        r["state"] = "sweeping"
+        with self.assertRaises(ValueError):
+            validate_access_response(r)
+
 
 class TestBuildDeferDecision(unittest.TestCase):
     """RED: builder produces validated response."""
