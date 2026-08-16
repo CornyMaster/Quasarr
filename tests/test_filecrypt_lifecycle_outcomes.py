@@ -38,6 +38,7 @@ from tests.test_filecrypt_lifecycle_service import (
 
 COOLDOWN_HOURS = 24
 COOLDOWN_SECONDS = COOLDOWN_HOURS * 3600
+WINDOW_SECONDS = 15 * 60
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -67,6 +68,17 @@ def _report_access(offer, *, access="clear"):
         "protocol_version": 2,
         "terminal_operation_id": terminal_operation_id(offer["occurrence"].package_id),
     }
+
+
+def _response_of(result):
+    """Strip wrapper fields, returning only the decision response dict."""
+    excluded = {
+        "terminal_required",
+        "fingerprint",
+        "package_id",
+        "terminal_operation_id",
+    }
+    return {k: v for k, v in result.items() if k not in excluded}
 
 
 class OutcomeTestCase(unittest.TestCase):
@@ -145,10 +157,17 @@ class TestFirstSweepBlocked(OutcomeTestCase):
         result = svc.record_blocked(report, rows)
 
         self.assertIsNotNone(result)
-        validate_defer_response(result)
+        validate_defer_response(_response_of(result))
         self.assertEqual(result["instruction"], "hold")
         self.assertEqual(result["state"], "sweeping")
         self.assertEqual(result["hold_type"], "provisional")
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], offer["link_fingerprint"])
+        self.assertEqual(result["package_id"], offer["occurrence"].package_id)
+        self.assertEqual(
+            result["terminal_operation_id"],
+            terminal_operation_id(offer["occurrence"].package_id),
+        )
 
         ls = self.link_state(offer["link_fingerprint"])
         self.assertIsNotNone(ls)
@@ -205,7 +224,7 @@ class TestFirstSweepBlocked(OutcomeTestCase):
         self.assertIsNotNone(rcpt)
         self.assertEqual(rcpt["outcome"], "blocked")
         self.assertEqual(rcpt["mode"], "sweep")
-        self.assertEqual(rcpt["response"], result)
+        self.assertEqual(rcpt["response"], _response_of(result))
 
     def test_blocked_does_not_prevent_next_member_offer(self):
         svc = self.service()
@@ -237,12 +256,15 @@ class TestFirstIndividualBlocked(OutcomeTestCase):
         result = svc.record_blocked(report, rows)
 
         self.assertIsNotNone(result)
-        validate_defer_response(result)
+        validate_defer_response(_response_of(result))
         self.assertEqual(result["instruction"], "hold")
         self.assertEqual(result["state"], "individual")
         self.assertEqual(result["hold_type"], "provisional")
         self.assertEqual(result["sweep_tested"], 0)
         self.assertEqual(result["sweep_total"], 0)
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], offer["link_fingerprint"])
+        self.assertEqual(result["package_id"], offer["occurrence"].package_id)
 
         ls = self.link_state(offer["link_fingerprint"])
         self.assertEqual(ls["state"], "held")
@@ -263,9 +285,15 @@ class TestClearUnknown(OutcomeTestCase):
         result = svc.record_access(report, rows)
 
         self.assertIsNotNone(result)
-        validate_access_response(result)
+        validate_access_response(_response_of(result))
         self.assertTrue(result["cleared"])
         self.assertEqual(result["state"], "healthy")
+        self.assertEqual(result["accepted"], "")
+        self.assertEqual(result["sweep_tested"], 0)
+        self.assertEqual(result["sweep_total"], 0)
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], offer["link_fingerprint"])
+        self.assertEqual(result["package_id"], offer["occurrence"].package_id)
 
         m = self.member(offer["link_fingerprint"])
         self.assertEqual(m["state"], "clear")
@@ -290,8 +318,10 @@ class TestClearUnknown(OutcomeTestCase):
         result = svc.record_access(report, rows)
 
         self.assertIsNotNone(result)
-        validate_access_response(result)
+        validate_access_response(_response_of(result))
         self.assertEqual(result["accepted"], "unknown")
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], offer["link_fingerprint"])
 
         m = self.member(offer["link_fingerprint"])
         self.assertEqual(m["state"], "unknown")
@@ -338,11 +368,10 @@ class TestFiveAllBlockedCooldown(OutcomeTestCase):
             report = _report_blocked(offer)
             svc.record_blocked(report, rows)
 
-        # Last result should be cooldown
+        # Last result should be cooldown (replay)
         last_report = _report_blocked(offers[-1])
         last_result = svc.record_blocked(last_report, rows)
-        # Replay
-        validate_defer_response(last_result)
+        validate_defer_response(_response_of(last_result))
         self.assertEqual(last_result["instruction"], "cooldown")
         self.assertEqual(last_result["state"], "cooldown")
         self.assertEqual(last_result["hold_type"], "crypter_cooldown")
@@ -408,7 +437,7 @@ class TestMixedSweepNoCooldown(OutcomeTestCase):
         report = _report_access(offer_clear, access="clear")
         result = svc.record_access(report, rows)
 
-        validate_access_response(result)
+        validate_access_response(_response_of(result))
         self.assertTrue(result["cleared"])
 
         events = self.pending_events()
@@ -477,6 +506,8 @@ class TestReplay(OutcomeTestCase):
         result1 = svc.record_blocked(report, rows)
         result2 = svc.record_blocked(report, rows)
         self.assertEqual(result1, result2)
+        self.assertFalse(result2["terminal_required"])
+        self.assertEqual(result2["fingerprint"], offer["link_fingerprint"])
 
         events = self.pending_events()
         self.assertEqual(events["observations"], 1)
@@ -502,6 +533,7 @@ class TestReplay(OutcomeTestCase):
         result1 = svc.record_access(report, rows)
         result2 = svc.record_access(report, rows)
         self.assertEqual(result1, result2)
+        self.assertFalse(result2["terminal_required"])
 
     def test_conflicting_receipt_not_replayed(self):
         svc = self.service()
@@ -656,6 +688,388 @@ class TestProtectedUnchanged(OutcomeTestCase):
         protected_db = self.state.get_db("protected")
         current_raw = protected_db.retrieve(pkg_id)
         self.assertEqual(current_raw, original_raw)
+
+
+# ── service wrapper exact keys (fix 1) ───────────────────────────────────────
+
+
+class TestServiceWrapperKeys(OutcomeTestCase):
+    """Fix 1: record_blocked/access returns full wrapper with internal fields."""
+
+    def test_blocked_fresh_wrapper_keys(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], offer["link_fingerprint"])
+        self.assertEqual(result["package_id"], offer["occurrence"].package_id)
+        self.assertEqual(
+            result["terminal_operation_id"],
+            terminal_operation_id(offer["occurrence"].package_id),
+        )
+
+    def test_blocked_replay_wrapper_keys(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_blocked(offer)
+        svc.record_blocked(report, rows)
+        result = svc.record_blocked(report, rows)
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], offer["link_fingerprint"])
+        self.assertEqual(result["package_id"], offer["occurrence"].package_id)
+        self.assertEqual(
+            result["terminal_operation_id"],
+            terminal_operation_id(offer["occurrence"].package_id),
+        )
+
+    def test_access_fresh_wrapper_keys(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="clear")
+        result = svc.record_access(report, rows)
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], offer["link_fingerprint"])
+        self.assertEqual(result["package_id"], offer["occurrence"].package_id)
+        self.assertEqual(
+            result["terminal_operation_id"],
+            terminal_operation_id(offer["occurrence"].package_id),
+        )
+
+    def test_access_replay_wrapper_keys(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="unknown")
+        svc.record_access(report, rows)
+        result = svc.record_access(report, rows)
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], offer["link_fingerprint"])
+
+
+# ── CLEAR counters (fix 2) ───────────────────────────────────────────────────
+
+
+class TestClearCounters(OutcomeTestCase):
+    """Fix 2: every CLEAR response has counters 0/0 and positive deadline."""
+
+    def test_sweep_clear_response_counters_zero(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="clear")
+        result = svc.record_access(report, rows)
+        self.assertEqual(result["sweep_tested"], 0)
+        self.assertEqual(result["sweep_total"], 0)
+        self.assertTrue(result["cleared"])
+        self.assertEqual(result["accepted"], "")
+        self.assertEqual(result["state"], "healthy")
+        self.assertGreater(result["sweep_deadline_epoch"], 0)
+
+    def test_individual_clear_response_counters_zero(self):
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="clear")
+        result = svc.record_access(report, rows)
+        self.assertEqual(result["sweep_tested"], 0)
+        self.assertEqual(result["sweep_total"], 0)
+        self.assertTrue(result["cleared"])
+        self.assertGreater(result["sweep_deadline_epoch"], 0)
+
+    def test_persisted_header_still_sweeping_after_clear(self):
+        """CLEAR response says healthy but persisted header remains sweeping."""
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="clear")
+        result = svc.record_access(report, rows)
+        # Response says healthy
+        self.assertEqual(result["state"], "healthy")
+        # But persisted header is still sweeping with incremented tested
+        hdr = self.header()
+        self.assertEqual(hdr["state"], "sweeping")
+        self.assertEqual(hdr["tested"], 1)
+        self.assertFalse(hdr["global_possible"])
+
+
+# ── header derivation (fix 3) ────────────────────────────────────────────────
+
+
+class TestHeaderDerivation(OutcomeTestCase):
+    """Fix 3: header classification for blocked/access both paths."""
+
+    def test_no_header_permits_individual(self):
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        self.assertEqual(offer["mode"], "individual")
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["state"], "individual")
+
+    def test_live_healthy_header_stale_blocked(self):
+        """A live healthy header makes a blocked report stale."""
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        # offer writes a healthy header (individual writes healthy on success)
+        # Instead, manually seed a healthy header and individual member
+        from quasarr.providers.filecrypt_lifecycle import encode_sweep_header
+
+        gen_id = offer["sweep_id"]
+        healthy_hdr = {
+            "schema_version": 1,
+            "state": "healthy",
+            "generation_id": gen_id,
+            "until_epoch": NOW + WINDOW_SECONDS,
+        }
+        self.sweep_db().rows[FILECRYPT_SWEEP_KEY] = encode_sweep_header(healthy_hdr)
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        self.assertIsNone(result)
+
+    def test_live_cooldown_header_stale_blocked(self):
+        """A live cooldown header makes a blocked report stale."""
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        from quasarr.providers.filecrypt_lifecycle import encode_sweep_header
+
+        gen_id = offer["sweep_id"]
+        cooldown_hdr = {
+            "schema_version": 1,
+            "state": "cooldown",
+            "generation_id": gen_id,
+            "sweep_deadline_epoch": NOW + 100,
+            "retry_after_epoch": NOW + COOLDOWN_SECONDS,
+        }
+        self.sweep_db().rows[FILECRYPT_SWEEP_KEY] = encode_sweep_header(cooldown_hdr)
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        self.assertIsNone(result)
+
+    def test_expired_header_permits_individual(self):
+        """An expired valid header permits individual mode."""
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        from quasarr.providers.filecrypt_lifecycle import encode_sweep_header
+
+        gen_id = offer["sweep_id"]
+        expired_hdr = {
+            "schema_version": 1,
+            "state": "healthy",
+            "generation_id": gen_id,
+            "until_epoch": NOW - 1,
+        }
+        self.sweep_db().rows[FILECRYPT_SWEEP_KEY] = encode_sweep_header(expired_hdr)
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["state"], "individual")
+
+    def test_malformed_header_stale(self):
+        """A malformed non-None header causes stale."""
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        self.sweep_db().rows[FILECRYPT_SWEEP_KEY] = "not valid json {"
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        self.assertIsNone(result)
+
+    def test_live_sweeping_mismatched_generation_stale(self):
+        """A live sweeping header with different generation is stale."""
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        from quasarr.providers.filecrypt_lifecycle import encode_sweep_header
+
+        sweeping_hdr = {
+            "schema_version": 1,
+            "state": "sweeping",
+            "generation_id": "f" * 32,
+            "opened_epoch": NOW,
+            "deadline_epoch": NOW + WINDOW_SECONDS,
+            "window_seconds": WINDOW_SECONDS,
+            "total": 5,
+            "tested": 0,
+            "blocked": 0,
+            "global_possible": True,
+        }
+        self.sweep_db().rows[FILECRYPT_SWEEP_KEY] = encode_sweep_header(sweeping_hdr)
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        self.assertIsNone(result)
+
+    def test_live_healthy_stale_access(self):
+        """Live healthy also stales access reports."""
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        from quasarr.providers.filecrypt_lifecycle import encode_sweep_header
+
+        gen_id = offer["sweep_id"]
+        healthy_hdr = {
+            "schema_version": 1,
+            "state": "healthy",
+            "generation_id": gen_id,
+            "until_epoch": NOW + WINDOW_SECONDS,
+        }
+        self.sweep_db().rows[FILECRYPT_SWEEP_KEY] = encode_sweep_header(healthy_hdr)
+        report = _report_access(offer, access="clear")
+        result = svc.record_access(report, rows)
+        self.assertIsNone(result)
+
+
+# ── generation binding (fix 4) ───────────────────────────────────────────────
+
+
+class TestGenerationBinding(OutcomeTestCase):
+    """Fix 4: sweep_id must equal member.generation_id."""
+
+    def test_mismatched_generation_blocked_stale(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_blocked(offer)
+        # Tamper with sweep_id in report
+        report["sweep_id"] = "f" * 32
+        result = svc.record_blocked(report, rows)
+        self.assertIsNone(result)
+
+    def test_mismatched_generation_access_stale(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="clear")
+        report["sweep_id"] = "f" * 32
+        result = svc.record_access(report, rows)
+        self.assertIsNone(result)
+
+    def test_receipt_replay_requires_matching_generation(self):
+        """Receipt with mismatched generation_id is not replayed."""
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_blocked(offer)
+        svc.record_blocked(report, rows)
+
+        # Craft a report with different sweep_id (but same offer_id)
+        bad_report = dict(report)
+        bad_report["sweep_id"] = "e" * 32
+        result = svc.record_blocked(bad_report, rows)
+        self.assertIsNone(result)
+
+    def test_receipt_replay_requires_matching_generation_access(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="clear")
+        svc.record_access(report, rows)
+
+        bad_report = dict(report)
+        bad_report["sweep_id"] = "e" * 32
+        result = svc.record_access(bad_report, rows)
+        self.assertIsNone(result)
+
+
+# ── response matrix (fix 5) ──────────────────────────────────────────────────
+
+
+class TestResponseMatrix(OutcomeTestCase):
+    """Fix 5: exact response field validation for all outcome scenarios."""
+
+    def test_sweep_blocked_incomplete_response(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        resp = _response_of(result)
+        self.assertEqual(resp["instruction"], "hold")
+        self.assertEqual(resp["state"], "sweeping")
+        self.assertEqual(resp["hold_type"], "provisional")
+        self.assertGreater(resp["retry_after_epoch"], 0)
+        self.assertGreater(resp["sweep_deadline_epoch"], 0)
+        self.assertLessEqual(resp["sweep_tested"], resp["sweep_total"])
+
+    def test_individual_blocked_response(self):
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        report = _report_blocked(offer)
+        result = svc.record_blocked(report, rows)
+        resp = _response_of(result)
+        self.assertEqual(resp["instruction"], "hold")
+        self.assertEqual(resp["state"], "individual")
+        self.assertEqual(resp["hold_type"], "provisional")
+        self.assertGreater(resp["sweep_deadline_epoch"], 0)
+        self.assertGreater(resp["retry_after_epoch"], 0)
+        self.assertEqual(resp["sweep_tested"], 0)
+        self.assertEqual(resp["sweep_total"], 0)
+
+    def test_cooldown_response_exact(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        for _i in range(5):
+            offer = svc.prepare_offer(rows)
+            report = _report_blocked(offer)
+            result = svc.record_blocked(report, rows)
+        resp = _response_of(result)
+        self.assertEqual(resp["instruction"], "cooldown")
+        self.assertEqual(resp["state"], "cooldown")
+        self.assertEqual(resp["hold_type"], "crypter_cooldown")
+        self.assertGreater(resp["evidence_count"], 0)
+        self.assertGreater(resp["retry_after_epoch"], 0)
+        self.assertGreater(resp["sweep_deadline_epoch"], 0)
+        self.assertLessEqual(resp["sweep_tested"], resp["sweep_total"])
+
+    def test_clear_response_exact_shape(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="clear")
+        result = svc.record_access(report, rows)
+        resp = _response_of(result)
+        self.assertEqual(resp["state"], "healthy")
+        self.assertTrue(resp["cleared"])
+        self.assertEqual(resp["accepted"], "")
+        self.assertEqual(resp["sweep_tested"], 0)
+        self.assertEqual(resp["sweep_total"], 0)
+        self.assertGreater(resp["sweep_deadline_epoch"], 0)
+
+    def test_unknown_incomplete_sweep_response(self):
+        svc = self.service()
+        rows = self.protected_rows(range(5))
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="unknown")
+        result = svc.record_access(report, rows)
+        resp = _response_of(result)
+        self.assertEqual(resp["state"], "sweeping")
+        self.assertFalse(resp["cleared"])
+        self.assertEqual(resp["accepted"], "unknown")
+        self.assertLessEqual(resp["sweep_tested"], resp["sweep_total"])
+        self.assertGreater(resp["sweep_deadline_epoch"], 0)
+
+    def test_unknown_individual_response(self):
+        svc = self.service()
+        rows = self.protected_rows([0])
+        offer = svc.prepare_offer(rows)
+        report = _report_access(offer, access="unknown")
+        result = svc.record_access(report, rows)
+        resp = _response_of(result)
+        self.assertEqual(resp["state"], "individual")
+        self.assertFalse(resp["cleared"])
+        self.assertEqual(resp["accepted"], "unknown")
+        self.assertEqual(resp["sweep_tested"], 0)
+        self.assertEqual(resp["sweep_total"], 0)
+        self.assertGreater(resp["sweep_deadline_epoch"], 0)
 
 
 if __name__ == "__main__":

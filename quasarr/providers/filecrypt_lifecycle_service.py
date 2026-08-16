@@ -837,6 +837,7 @@ class FilecryptLifecycleService:
         package_id = report["package_id"]
         offer_id = report["offer_id"]
         sweep_id = report["sweep_id"]
+        top_id = report["terminal_operation_id"]
 
         # Resolve ownership from supplied rows
         raw_package = None
@@ -855,6 +856,7 @@ class FilecryptLifecycleService:
         _pkg_id = package_id
         _offer_id = offer_id
         _sweep_id = sweep_id
+        _top_id = top_id
         _raw_package = raw_package
         _cooldown = cooldown_secs
         _window = window_secs
@@ -882,6 +884,7 @@ class FilecryptLifecycleService:
                     rcpt.get("fingerprint") == _fp
                     and rcpt.get("package_id") == _pkg_id
                     and rcpt.get("outcome") == "blocked"
+                    and rcpt.get("generation_id") == _sweep_id
                 ):
                     resp = rcpt.get("response")
                     try:
@@ -927,27 +930,38 @@ class FilecryptLifecycleService:
                 return values
             gen_id = m.get("generation_id")
 
-            # 4. Validate link state is exactly None (first-time)
+            # 4. Generation binding: report sweep_id must equal member generation
+            if _sweep_id != gen_id:
+                result[0] = None
+                return values
+
+            # 5. Validate link state is exactly None (first-time)
             if ls_raw is not None:
                 result[0] = None
                 return values
 
-            # 5. Derive mode from header
+            # 6. Derive mode from header
             hdr = decode_sweep_header(hdr_raw) if hdr_raw is not None else None
             is_sweep = False
+            if hdr_raw is not None and hdr is None:
+                # Malformed non-None header → stale
+                result[0] = None
+                return values
             if hdr is not None:
-                if hdr.get("state") == "sweeping" and _now < hdr.get(
-                    "deadline_epoch", 0
-                ):
+                s = hdr.get("state")
+                if s == "sweeping" and _now < hdr.get("deadline_epoch", 0):
                     if hdr.get("generation_id") == gen_id:
                         is_sweep = True
                     else:
                         result[0] = None
                         return values
-                elif hdr_raw is not None and hdr is None:
-                    # Malformed header → fail-closed
+                elif s == "healthy" and _now < hdr.get("until_epoch", 0):
                     result[0] = None
                     return values
+                elif s == "cooldown" and _now < hdr.get("retry_after_epoch", 0):
+                    result[0] = None
+                    return values
+                # Expired valid header → individual permitted
 
             mode = "sweep" if is_sweep else "individual"
 
@@ -979,7 +993,7 @@ class FilecryptLifecycleService:
             new_hdr_raw = hdr_raw
             sweep_tested = 0
             sweep_total = 0
-            sweep_deadline_epoch = 0
+            sweep_deadline_epoch = _now + _cooldown
             sweep_blocked = 0
             is_complete = False
             is_global_cooldown = False
@@ -1019,7 +1033,6 @@ class FilecryptLifecycleService:
                     new_hdr_raw = encode_sweep_header(cooldown_hdr)
                     new_ls["retry_after_epoch"] = _now + _cooldown
                 elif is_complete and not is_global_cooldown:
-                    # Complete but not global → healthy
                     healthy_hdr = {
                         "schema_version": _SCHEMA_VERSION,
                         "state": "healthy",
@@ -1054,7 +1067,6 @@ class FilecryptLifecycleService:
                     sweep_deadline_epoch=sweep_deadline_epoch,
                 )
             elif is_sweep and is_complete and not is_global_cooldown:
-                # Completed non-global BLOCKED
                 response = build_lifecycle_defer_decision(
                     instruction="hold",
                     state="individual",
@@ -1077,7 +1089,7 @@ class FilecryptLifecycleService:
                     sweep_id=_sweep_id,
                     sweep_tested=0,
                     sweep_total=0,
-                    sweep_deadline_epoch=_now + _cooldown,
+                    sweep_deadline_epoch=sweep_deadline_epoch,
                 )
 
             # Receipt
@@ -1116,7 +1128,13 @@ class FilecryptLifecycleService:
         )
         if result[0] is None:
             return None
-        return result[0]
+        return {
+            **result[0],
+            "terminal_required": False,
+            "fingerprint": _fp,
+            "package_id": _pkg_id,
+            "terminal_operation_id": _top_id,
+        }
 
     def record_access(self, report, protected_rows):
         """Accept a first-time CLEAR or UNKNOWN report, or return None if stale."""
@@ -1130,6 +1148,7 @@ class FilecryptLifecycleService:
         offer_id = report["offer_id"]
         sweep_id = report["sweep_id"]
         access = report["access"]
+        top_id = report["terminal_operation_id"]
 
         raw_package = None
         for row in protected_rows or ():
@@ -1147,6 +1166,7 @@ class FilecryptLifecycleService:
         _offer_id = offer_id
         _sweep_id = sweep_id
         _access = access
+        _top_id = top_id
         _raw_package = raw_package
         _window = window_secs
         result = [None]
@@ -1173,6 +1193,7 @@ class FilecryptLifecycleService:
                     rcpt.get("fingerprint") == _fp
                     and rcpt.get("package_id") == _pkg_id
                     and rcpt.get("outcome") == _access
+                    and rcpt.get("generation_id") == _sweep_id
                 ):
                     resp = rcpt.get("response")
                     try:
@@ -1218,24 +1239,34 @@ class FilecryptLifecycleService:
                 return values
             gen_id = m.get("generation_id")
 
-            # 4. Link state must be None
+            # 4. Generation binding
+            if _sweep_id != gen_id:
+                result[0] = None
+                return values
+
+            # 5. Link state must be None
             if ls_raw is not None:
                 result[0] = None
                 return values
 
-            # 5. Derive mode from header
+            # 6. Derive mode from header
             hdr = decode_sweep_header(hdr_raw) if hdr_raw is not None else None
             is_sweep = False
+            if hdr_raw is not None and hdr is None:
+                result[0] = None
+                return values
             if hdr is not None:
-                if hdr.get("state") == "sweeping" and _now < hdr.get(
-                    "deadline_epoch", 0
-                ):
+                s = hdr.get("state")
+                if s == "sweeping" and _now < hdr.get("deadline_epoch", 0):
                     if hdr.get("generation_id") == gen_id:
                         is_sweep = True
                     else:
                         result[0] = None
                         return values
-                elif hdr_raw is not None and hdr is None:
+                elif s == "healthy" and _now < hdr.get("until_epoch", 0):
+                    result[0] = None
+                    return values
+                elif s == "cooldown" and _now < hdr.get("retry_after_epoch", 0):
                     result[0] = None
                     return values
 
@@ -1263,7 +1294,7 @@ class FilecryptLifecycleService:
             new_hdr_raw = hdr_raw
             sweep_tested = 0
             sweep_total = 0
-            sweep_deadline_epoch = 0
+            sweep_deadline_epoch = _now + _window
 
             if is_sweep:
                 tested = hdr["tested"] + 1
@@ -1295,7 +1326,6 @@ class FilecryptLifecycleService:
                     "until_epoch": _now + _window,
                 }
                 new_hdr_raw = encode_sweep_header(healthy_hdr)
-                sweep_deadline_epoch = _now + _window
 
             # Build response
             if _access == "clear":
@@ -1304,8 +1334,8 @@ class FilecryptLifecycleService:
                     cleared=True,
                     accepted="",
                     sweep_id=_sweep_id,
-                    sweep_tested=sweep_tested if is_sweep else 0,
-                    sweep_total=sweep_total if is_sweep else 0,
+                    sweep_tested=0,
+                    sweep_total=0,
                     sweep_deadline_epoch=sweep_deadline_epoch,
                 )
             else:
@@ -1367,4 +1397,10 @@ class FilecryptLifecycleService:
         )
         if result[0] is None:
             return None
-        return result[0]
+        return {
+            **result[0],
+            "terminal_required": False,
+            "fingerprint": _fp,
+            "package_id": _pkg_id,
+            "terminal_operation_id": _top_id,
+        }

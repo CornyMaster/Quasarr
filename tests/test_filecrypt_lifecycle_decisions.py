@@ -208,6 +208,39 @@ class TestDeferResponseValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_defer_response(r)
 
+    def test_tested_exceeds_total_rejected(self):
+        r = self._valid()
+        r["sweep_tested"] = 6
+        r["sweep_total"] = 5
+        with self.assertRaises(ValueError):
+            validate_defer_response(r)
+
+    def test_zero_deadline_rejected(self):
+        r = self._valid()
+        r["sweep_deadline_epoch"] = 0
+        with self.assertRaises(ValueError):
+            validate_defer_response(r)
+
+    def test_zero_retry_rejected(self):
+        r = self._valid()
+        r["retry_after_epoch"] = 0
+        with self.assertRaises(ValueError):
+            validate_defer_response(r)
+
+    def test_hold_cooldown_state_rejected(self):
+        r = self._valid()
+        r["instruction"] = "hold"
+        r["state"] = "cooldown"
+        r["hold_type"] = "crypter_cooldown"
+        with self.assertRaises(ValueError):
+            validate_defer_response(r)
+
+    def test_sweeping_crypter_cooldown_rejected(self):
+        r = self._valid()
+        r["hold_type"] = "crypter_cooldown"
+        with self.assertRaises(ValueError):
+            validate_defer_response(r)
+
 
 class TestAccessResponseValidation(unittest.TestCase):
     """RED: every access response key set/type matrix enforced."""
@@ -231,6 +264,8 @@ class TestAccessResponseValidation(unittest.TestCase):
         r["cleared"] = False
         r["accepted"] = "unknown"
         r["state"] = "sweeping"
+        r["sweep_tested"] = 1
+        r["sweep_total"] = 5
         validate_access_response(r)
 
     def test_bad_accepted_rejected(self):
@@ -248,6 +283,19 @@ class TestAccessResponseValidation(unittest.TestCase):
     def test_extra_key_rejected(self):
         r = self._valid()
         r["extra"] = True
+        with self.assertRaises(ValueError):
+            validate_access_response(r)
+
+    def test_tested_exceeds_total_rejected(self):
+        r = self._valid()
+        r["sweep_tested"] = 3
+        r["sweep_total"] = 2
+        with self.assertRaises(ValueError):
+            validate_access_response(r)
+
+    def test_zero_deadline_rejected(self):
+        r = self._valid()
+        r["sweep_deadline_epoch"] = 0
         with self.assertRaises(ValueError):
             validate_access_response(r)
 

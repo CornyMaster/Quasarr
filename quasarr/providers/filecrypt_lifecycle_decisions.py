@@ -159,6 +159,31 @@ def validate_defer_response(response):
         v = response[field]
         if not (type(v) is int and v >= 0):
             raise ValueError(f"{field} must be a non-negative int")
+    if response["sweep_tested"] > response["sweep_total"]:
+        raise ValueError("sweep_tested must not exceed sweep_total")
+    if not (
+        type(response["sweep_deadline_epoch"]) is int
+        and response["sweep_deadline_epoch"] > 0
+    ):
+        raise ValueError("sweep_deadline_epoch must be strictly positive")
+    if not (
+        type(response["retry_after_epoch"]) is int and response["retry_after_epoch"] > 0
+    ):
+        raise ValueError("retry_after_epoch must be strictly positive")
+    # State-pairing coherence
+    inst = response["instruction"]
+    state = response["state"]
+    hold = response["hold_type"]
+    if inst == "hold" and state == "cooldown":
+        raise ValueError("hold cannot pair with cooldown state")
+    if inst == "cooldown" and state != "cooldown":
+        raise ValueError("cooldown instruction requires cooldown state")
+    if inst == "cooldown" and hold != "crypter_cooldown":
+        raise ValueError("cooldown instruction requires crypter_cooldown hold_type")
+    if state == "cooldown" and hold != "crypter_cooldown":
+        raise ValueError("cooldown state requires crypter_cooldown hold_type")
+    if state in ("sweeping", "individual") and hold == "crypter_cooldown":
+        raise ValueError("sweeping/individual cannot pair with crypter_cooldown")
     sid = response["sweep_id"]
     if not isinstance(sid, str) or not _ID_RE.fullmatch(sid):
         raise ValueError("sweep_id must be 32 lowercase hex")
@@ -178,6 +203,13 @@ def validate_access_response(response):
         v = response[field]
         if not (type(v) is int and v >= 0):
             raise ValueError(f"{field} must be a non-negative int")
+    if response["sweep_tested"] > response["sweep_total"]:
+        raise ValueError("sweep_tested must not exceed sweep_total")
+    if not (
+        type(response["sweep_deadline_epoch"]) is int
+        and response["sweep_deadline_epoch"] > 0
+    ):
+        raise ValueError("sweep_deadline_epoch must be strictly positive")
     sid = response["sweep_id"]
     if not isinstance(sid, str) or not _ID_RE.fullmatch(sid):
         raise ValueError("sweep_id must be 32 lowercase hex")
