@@ -2,10 +2,10 @@
 # Quasarr
 """Filecrypt link-lifecycle service: opening, leasing, projections, and outcomes.
 
-Implements opening/leasing/projection (Task 3A) and first-time outcome
-recording (Task 3B1).  Retest/probe outcomes, blacklist confirmation,
-pruning, migration, route wiring, settings persistence, and terminal effects
-are deferred to later tasks.
+Implements opening/leasing/projection (Task 3A), first-time outcome recording
+(Task 3B1), and retest/probe outcome recording (Task 3B2A).  Blacklist
+confirmation, pruning, migration, route wiring, settings persistence, and
+terminal effects are deferred to later tasks.
 """
 
 import secrets
@@ -874,7 +874,7 @@ class FilecryptLifecycleService:
         def mutator(values):
             hdr_raw, member_raw, ls_raw, receipt_raw, prot_raw, events_raw = values
 
-            # 1. Check receipt first (replay)
+            # 1. Check receipt first (replay for first-time and probe blocked)
             if receipt_raw is not None:
                 rcpt = decode_offer_receipt(receipt_raw)
                 if rcpt is None:
@@ -898,7 +898,28 @@ class FilecryptLifecycleService:
                 result[0] = None
                 return values
 
-            # 2. Validate protected row ownership
+            # 2. Blacklisting replay (retest BLOCKED that already transitioned)
+            ls = decode_link_state(ls_raw) if ls_raw is not None else None
+            if ls is not None and ls.get("state") == "blacklisting":
+                if (
+                    ls.get("recheck_sweep_id") == _sweep_id
+                    and ls.get("recheck_offer_id") == _offer_id
+                    and ls.get("recheck_package_id") == _pkg_id
+                    and ls.get("terminal_operation_id") == _top_id
+                ):
+                    result[0] = {
+                        "terminal_required": True,
+                        "fingerprint": _fp,
+                        "package_id": _pkg_id,
+                        "terminal_operation_id": _top_id,
+                        "offer_id": _offer_id,
+                        "sweep_id": _sweep_id,
+                    }
+                    return values
+                result[0] = None
+                return values
+
+            # 3. Validate protected row ownership
             if prot_raw is None:
                 result[0] = None
                 return values
@@ -907,7 +928,108 @@ class FilecryptLifecycleService:
                 result[0] = None
                 return values
 
-            # 3. Validate member: matching offered, correct generation/offer/fp
+            # 4. Held link-state with matching lease → retest or probe BLOCKED
+            if ls is not None and ls.get("state") == "held":
+                held_lease = ls.get("lease")
+                if (
+                    isinstance(held_lease, dict)
+                    and held_lease.get("sweep_id") == _sweep_id
+                    and held_lease.get("offer_id") == _offer_id
+                    and held_lease.get("package_id") == _pkg_id
+                    and _now < held_lease.get("offer_expires_epoch", 0)
+                ):
+                    hdr = decode_sweep_header(hdr_raw) if hdr_raw is not None else None
+                    is_live_cooldown = (
+                        hdr is not None
+                        and hdr.get("state") == "cooldown"
+                        and _now < hdr.get("retry_after_epoch", 0)
+                    )
+                    retry_after = ls.get("retry_after_epoch", 0)
+
+                    if _now >= retry_after and not is_live_cooldown:
+                        # Retest BLOCKED → blacklisting, no receipt/counters
+                        new_ls = {
+                            "schema_version": _SCHEMA_VERSION,
+                            "state": "blacklisting",
+                            "first_blocked_epoch": ls["first_blocked_epoch"],
+                            "recheck_offer_id": _offer_id,
+                            "recheck_package_id": _pkg_id,
+                            "recheck_sweep_id": _sweep_id,
+                            "terminal_operation_id": _top_id,
+                        }
+                        result[0] = {
+                            "terminal_required": True,
+                            "fingerprint": _fp,
+                            "package_id": _pkg_id,
+                            "terminal_operation_id": _top_id,
+                            "offer_id": _offer_id,
+                            "sweep_id": _sweep_id,
+                        }
+                        return (
+                            hdr_raw,
+                            member_raw,
+                            encode_link_state(new_ls),
+                            receipt_raw,
+                            prot_raw,
+                            events_raw,
+                        )
+
+                    if _now < retry_after and is_live_cooldown:
+                        # Probe BLOCKED → clear lease, receipt, probes+1
+                        new_ls = dict(ls)
+                        new_ls["lease"] = None
+                        new_receipt = encode_offer_receipt(
+                            {
+                                "schema_version": _SCHEMA_VERSION,
+                                "generation_id": _sweep_id,
+                                "fingerprint": _fp,
+                                "package_id": _pkg_id,
+                                "mode": "probe",
+                                "outcome": "blocked",
+                                "response": build_lifecycle_defer_decision(
+                                    instruction="cooldown",
+                                    state="cooldown",
+                                    hold_type="crypter_cooldown",
+                                    evidence_count=1,
+                                    retry_after_epoch=hdr["retry_after_epoch"],
+                                    sweep_id=_sweep_id,
+                                    sweep_tested=0,
+                                    sweep_total=0,
+                                    sweep_deadline_epoch=hdr["sweep_deadline_epoch"],
+                                ),
+                                "accepted_epoch": _now,
+                                "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                            }
+                        )
+                        new_events = _add_pending_crypter_events(events_raw, probes=1)
+                        result[0] = build_lifecycle_defer_decision(
+                            instruction="cooldown",
+                            state="cooldown",
+                            hold_type="crypter_cooldown",
+                            evidence_count=1,
+                            retry_after_epoch=hdr["retry_after_epoch"],
+                            sweep_id=_sweep_id,
+                            sweep_tested=0,
+                            sweep_total=0,
+                            sweep_deadline_epoch=hdr["sweep_deadline_epoch"],
+                        )
+                        return (
+                            hdr_raw,
+                            member_raw,
+                            encode_link_state(new_ls),
+                            new_receipt,
+                            prot_raw,
+                            new_events,
+                        )
+
+                    # Every other combination → stale
+                    result[0] = None
+                    return values
+                # Held but lease doesn't match → fall through to first-time check
+                # which will reject because ls_raw is not None
+                pass
+
+            # 5. First-time: validate member
             m = decode_sweep_member(member_raw)
             if m is None:
                 result[0] = None
@@ -1128,6 +1250,8 @@ class FilecryptLifecycleService:
         )
         if result[0] is None:
             return None
+        if result[0].get("terminal_required"):
+            return result[0]
         return {
             **result[0],
             "terminal_required": False,
@@ -1216,7 +1340,188 @@ class FilecryptLifecycleService:
                 result[0] = None
                 return values
 
-            # 3. Validate member
+            # 3. Held link-state with matching lease → retest or probe access
+            ls = decode_link_state(ls_raw) if ls_raw is not None else None
+            if ls is not None and ls.get("state") == "held":
+                held_lease = ls.get("lease")
+                if (
+                    isinstance(held_lease, dict)
+                    and held_lease.get("sweep_id") == _sweep_id
+                    and held_lease.get("offer_id") == _offer_id
+                    and held_lease.get("package_id") == _pkg_id
+                    and _now < held_lease.get("offer_expires_epoch", 0)
+                ):
+                    hdr = decode_sweep_header(hdr_raw) if hdr_raw is not None else None
+                    is_live_cooldown = (
+                        hdr is not None
+                        and hdr.get("state") == "cooldown"
+                        and _now < hdr.get("retry_after_epoch", 0)
+                    )
+                    retry_after = ls.get("retry_after_epoch", 0)
+
+                    if _now >= retry_after and not is_live_cooldown:
+                        # Retest access
+                        if _access == "clear":
+                            new_hdr = {
+                                "schema_version": _SCHEMA_VERSION,
+                                "state": "healthy",
+                                "generation_id": _sweep_id,
+                                "until_epoch": _now + _window,
+                            }
+                            response = build_lifecycle_access_decision(
+                                state="healthy",
+                                cleared=True,
+                                accepted="",
+                                sweep_id=_sweep_id,
+                                sweep_tested=0,
+                                sweep_total=0,
+                                sweep_deadline_epoch=_now + _window,
+                            )
+                            new_receipt = encode_offer_receipt(
+                                {
+                                    "schema_version": _SCHEMA_VERSION,
+                                    "generation_id": _sweep_id,
+                                    "fingerprint": _fp,
+                                    "package_id": _pkg_id,
+                                    "mode": "retest",
+                                    "outcome": "clear",
+                                    "response": response,
+                                    "accepted_epoch": _now,
+                                    "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                                }
+                            )
+                            result[0] = response
+                            return (
+                                encode_sweep_header(new_hdr),
+                                member_raw,
+                                None,
+                                new_receipt,
+                                prot_raw,
+                                events_raw,
+                            )
+                        else:
+                            # Retest UNKNOWN: clear lease, preserve epochs
+                            new_ls = dict(ls)
+                            new_ls["lease"] = None
+                            response = build_lifecycle_access_decision(
+                                state="individual",
+                                cleared=False,
+                                accepted="unknown",
+                                sweep_id=_sweep_id,
+                                sweep_tested=0,
+                                sweep_total=0,
+                                sweep_deadline_epoch=_now + _window,
+                            )
+                            new_receipt = encode_offer_receipt(
+                                {
+                                    "schema_version": _SCHEMA_VERSION,
+                                    "generation_id": _sweep_id,
+                                    "fingerprint": _fp,
+                                    "package_id": _pkg_id,
+                                    "mode": "retest",
+                                    "outcome": "unknown",
+                                    "response": response,
+                                    "accepted_epoch": _now,
+                                    "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                                }
+                            )
+                            result[0] = response
+                            return (
+                                hdr_raw,
+                                member_raw,
+                                encode_link_state(new_ls),
+                                new_receipt,
+                                prot_raw,
+                                events_raw,
+                            )
+
+                    if _now < retry_after and is_live_cooldown:
+                        # Probe access
+                        if _access == "clear":
+                            new_hdr = {
+                                "schema_version": _SCHEMA_VERSION,
+                                "state": "healthy",
+                                "generation_id": _sweep_id,
+                                "until_epoch": _now + _window,
+                            }
+                            response = build_lifecycle_access_decision(
+                                state="healthy",
+                                cleared=True,
+                                accepted="",
+                                sweep_id=_sweep_id,
+                                sweep_tested=0,
+                                sweep_total=0,
+                                sweep_deadline_epoch=_now + _window,
+                            )
+                            new_receipt = encode_offer_receipt(
+                                {
+                                    "schema_version": _SCHEMA_VERSION,
+                                    "generation_id": _sweep_id,
+                                    "fingerprint": _fp,
+                                    "package_id": _pkg_id,
+                                    "mode": "probe",
+                                    "outcome": "clear",
+                                    "response": response,
+                                    "accepted_epoch": _now,
+                                    "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                                }
+                            )
+                            new_events = _add_pending_crypter_events(
+                                events_raw, probes=1
+                            )
+                            result[0] = response
+                            return (
+                                encode_sweep_header(new_hdr),
+                                member_raw,
+                                None,
+                                new_receipt,
+                                prot_raw,
+                                new_events,
+                            )
+                        else:
+                            # Probe UNKNOWN: clear lease, header unchanged
+                            new_ls = dict(ls)
+                            new_ls["lease"] = None
+                            response = build_lifecycle_access_decision(
+                                state="cooldown",
+                                cleared=False,
+                                accepted="unknown",
+                                sweep_id=_sweep_id,
+                                sweep_tested=0,
+                                sweep_total=0,
+                                sweep_deadline_epoch=hdr["sweep_deadline_epoch"],
+                            )
+                            new_receipt = encode_offer_receipt(
+                                {
+                                    "schema_version": _SCHEMA_VERSION,
+                                    "generation_id": _sweep_id,
+                                    "fingerprint": _fp,
+                                    "package_id": _pkg_id,
+                                    "mode": "probe",
+                                    "outcome": "unknown",
+                                    "response": response,
+                                    "accepted_epoch": _now,
+                                    "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                                }
+                            )
+                            new_events = _add_pending_crypter_events(
+                                events_raw, probes=1
+                            )
+                            result[0] = response
+                            return (
+                                hdr_raw,
+                                member_raw,
+                                encode_link_state(new_ls),
+                                new_receipt,
+                                prot_raw,
+                                new_events,
+                            )
+
+                    # Every other combination → stale
+                    result[0] = None
+                    return values
+
+            # 4. First-time: validate member
             m = decode_sweep_member(member_raw)
             if m is None:
                 result[0] = None

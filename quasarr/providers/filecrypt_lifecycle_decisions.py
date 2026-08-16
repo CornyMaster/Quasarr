@@ -67,7 +67,7 @@ _ACCESS_RESPONSE_KEYS = frozenset(
 _DEFER_INSTRUCTIONS = frozenset({"hold", "cooldown"})
 _DEFER_STATES = frozenset({"sweeping", "individual", "cooldown"})
 _DEFER_HOLD_TYPES = frozenset({"provisional", "crypter_cooldown"})
-_ACCESS_STATES = frozenset({"sweeping", "healthy", "individual"})
+_ACCESS_STATES = frozenset({"sweeping", "healthy", "individual", "cooldown"})
 _ACCESS_ACCEPTED_VALUES = frozenset({"", "unknown"})
 
 
