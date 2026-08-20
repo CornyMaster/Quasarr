@@ -32,8 +32,10 @@ from quasarr.storage.setup.flaresolverr import (
     save_flaresolverr_url,
 )
 from quasarr.storage.setup.hostnames import (
+    build_hostname_rows,
     check_credentials,
     clear_skip_login,
+    get_hostnames_data,
     get_skip_login,
     hostname_credentials_config,
     hostname_form_html,
@@ -83,6 +85,7 @@ from quasarr.storage.setup.timeouts import (
 
 __all__ = [
     "add_no_cache_headers",
+    "build_hostname_rows",
     "check_credentials",
     "clear_skip_login",
     "delete_skip_flaresolverr_preference",
@@ -93,6 +96,7 @@ __all__ = [
     "get_crypter_block_settings_data",
     "get_filecrypt_setting_data",
     "get_flaresolverr_status_data",
+    "get_hostnames_data",
     "get_notification_settings_data",
     "get_radarr_settings_data",
     "get_skip_login",

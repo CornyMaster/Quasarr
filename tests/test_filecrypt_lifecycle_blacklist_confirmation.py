@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for FilecryptLifecycleService.confirm_blacklist (Task 3B2B)."""
+"""Tests for FilecryptLifecycleService.confirm_blacklist."""
 
 import json
 import threading

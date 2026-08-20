@@ -57,16 +57,18 @@ def get_jdownloader_status_pill(shared_state):
 
 def get_jdownloader_disconnected_page(shared_state, back_url="/"):
     """Return a full error page when JDownloader is disconnected."""
-    import quasarr.providers.html_images as images
-    from quasarr.providers.html_templates import render_centered_html
 
-    status_pill = get_jdownloader_status_pill(shared_state)
+    def classic():
+        import quasarr.providers.html_images as images
+        from quasarr.providers.html_templates import render_centered_html
 
-    back_btn = render_button(
-        "Back", "secondary", {"onclick": f"location.href='{back_url}'"}
-    )
+        status_pill = get_jdownloader_status_pill(shared_state)
 
-    content = f'''
+        back_btn = render_button(
+            "Back", "secondary", {"onclick": f"location.href='{back_url}'"}
+        )
+
+        content = f'''
         <h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
         <div class="status-bar">
             {status_pill}
@@ -103,4 +105,34 @@ def get_jdownloader_disconnected_page(shared_state, back_url="/"):
         </style>
     '''
 
-    return render_centered_html(content)
+        return render_centered_html(content)
+
+    def carbon():
+        from html import escape
+
+        from quasarr.providers.carbon_templates import (
+            page_header,
+            render_carbon_simple_page,
+            tag,
+            tile,
+        )
+
+        status = get_jdownloader_status(shared_state)
+        tone = "green" if status["connected"] else "red"
+        text = "Connected" if status["connected"] else "Disconnected"
+        device_html = (
+            f"<p>{escape(status['device_name'], quote=True)}</p>"
+            if status["device_name"]
+            else ""
+        )
+        safe_back_url = escape(back_url, quote=True)
+        back_btn = (
+            f'<a class="cds-btn cds-btn--primary" href="{safe_back_url}">Back</a>'
+        )
+        body = f"{tag(text, tone=tone)}{device_html}<p>{back_btn}</p>"
+        content = page_header("JDownloader", "Connection Required") + tile(body)
+        return render_carbon_simple_page(content, title="JDownloader")
+
+    from quasarr.providers.page_dispatch import render_page
+
+    return render_page("jd-disconnected", carbon, classic, shared_state=shared_state)

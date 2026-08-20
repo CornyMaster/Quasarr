@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for FilecryptLifecycleService record_blocked / record_access (Task 3B1)."""
+"""Tests for FilecryptLifecycleService record_blocked / record_access."""
 
 import unittest
 

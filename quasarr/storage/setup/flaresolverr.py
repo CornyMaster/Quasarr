@@ -14,6 +14,7 @@ from quasarr.providers.html_templates import (
     render_form,
 )
 from quasarr.providers.log import info
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.utils import check_flaresolverr
 from quasarr.providers.web_server import Server
 from quasarr.storage.config import Config
@@ -25,10 +26,41 @@ from quasarr.storage.setup.common import (
 from quasarr.storage.sqlite_database import DataBase
 
 
+def _flaresolverr_request_wants_json():
+    """True when the caller posted a JSON body (Carbon Settings JS) rather
+    than the classic form-encoded submission (Classic UI / setup flow).
+    """
+    content_type = (request.content_type or "").split(";")[0].strip().lower()
+    return content_type == "application/json"
+
+
 def save_flaresolverr_url(shared_state, is_setup=False):
-    """Save flaresolverr-next URL from web UI."""
-    url = request.forms.get("url", "").strip()
+    """Save flaresolverr-next URL from web UI.
+
+    Form-encoded submissions (Classic UI, first-run setup) keep their exact
+    existing HTML reconnect/fail response. A JSON request body (Carbon
+    Settings) gets an additive ``{success, message}`` JSON response instead -
+    same validation, same persistence, same side effects.
+    """
+    as_json = _flaresolverr_request_wants_json()
+    if as_json:
+        payload = request.json
+        if not isinstance(payload, dict):
+            response.content_type = "application/json"
+            return {"success": False, "message": "Invalid JSON payload"}
+        url = str(payload.get("url", "")).strip()
+    else:
+        url = request.forms.get("url", "").strip()
+
     config = Config("FlareSolverr")
+
+    def _respond(success, message):
+        if as_json:
+            response.content_type = "application/json"
+            return {"success": success, "message": message}
+        if success:
+            return render_reconnect_success(message)
+        return render_fail(message)
 
     if not url:
         config.save("url", "")
@@ -39,14 +71,15 @@ def save_flaresolverr_url(shared_state, is_setup=False):
         if is_setup:
             quasarr.providers.web_server.temp_server_success = True
 
-        return render_reconnect_success("flaresolverr-next URL cleared.")
+        return _respond(True, "flaresolverr-next URL cleared.")
 
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "http://" + url
 
     if not re.search(r"/v\d+$", url):
-        return render_fail(
-            "flaresolverr-next URL must end with /v1 (or similar version path)."
+        return _respond(
+            False,
+            "flaresolverr-next URL must end with /v1 (or similar version path).",
         )
 
     if check_flaresolverr(shared_state, url):
@@ -61,8 +94,8 @@ def save_flaresolverr_url(shared_state, is_setup=False):
         if is_setup:
             quasarr.providers.web_server.temp_server_success = True
 
-        return render_reconnect_success("flaresolverr-next URL saved successfully!")
-    return render_fail("Could not reach flaresolverr-next!")
+        return _respond(True, "flaresolverr-next URL saved successfully!")
+    return _respond(False, "Could not reach flaresolverr-next!")
 
 
 def get_flaresolverr_status_data(shared_state):
@@ -201,11 +234,24 @@ def flaresolverr_config(shared_state):
     add_no_cache_headers(app)
     setup_auth(app)
 
-    @app.get("/")
-    def url_form():
+    def _classic_url_form():
         return render_form(
             "Set flaresolverr-next URL",
             flaresolverr_form_html(shared_state, is_setup=True),
+        )
+
+    @app.get("/")
+    def url_form():
+        def carbon():
+            from quasarr.storage.setup.carbon import render_setup_flaresolverr
+
+            return render_setup_flaresolverr(shared_state)
+
+        return render_page(
+            "setup-flaresolverr",
+            carbon,
+            _classic_url_form,
+            shared_state=shared_state,
         )
 
     @app.get("/skip-success")

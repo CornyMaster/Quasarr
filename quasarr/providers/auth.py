@@ -141,7 +141,24 @@ def require_basic_auth():
     """Send 401 response for Basic Auth."""
     response.status = 401
     response.set_header("WWW-Authenticate", 'Basic realm="Quasarr"')
-    return "Authentication required"
+
+    def classic():
+        return "Authentication required"
+
+    def carbon():
+        from quasarr.providers.carbon_templates import render_carbon_error_page
+
+        return render_carbon_error_page(
+            401,
+            "Sign in with your configured credentials to continue.",
+            title="Unauthorized",
+            show_classic_switch=False,
+        )
+
+    from quasarr.providers import shared_state
+    from quasarr.providers.page_dispatch import render_page
+
+    return render_page("basic-auth-401", carbon, classic, shared_state=shared_state)
 
 
 def is_browser_authenticated():
@@ -186,17 +203,18 @@ def _normalize_next_url(next_url):
 
 def _render_login_page(error=None):
     """Render login form page using Quasarr styling."""
-    error_html = (
-        f'<p style="color: #dc3545; margin-bottom: 1rem;"><b>{html.escape(str(error))}</b></p>'
-        if error
-        else ""
-    )
-    next_url = html.escape(
-        _normalize_next_url(request.query.get("next", "/")), quote=True
-    )
+    next_url_raw = _normalize_next_url(request.query.get("next", "/"))
+    next_url = html.escape(next_url_raw, quote=True)
 
-    # Inline the centered HTML to avoid circular import
-    return f'''<html>
+    def classic():
+        error_html = (
+            f'<p style="color: #dc3545; margin-bottom: 1rem;"><b>{html.escape(str(error))}</b></p>'
+            if error
+            else ""
+        )
+
+        # Inline the centered HTML to avoid circular import
+        return f'''<html>
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -269,6 +287,41 @@ def _render_login_page(error=None):
         <footer>Quasarr v.{get_version()}</footer>
     </body>
     </html>'''
+
+    def carbon():
+        from quasarr.providers.carbon_templates import (
+            notification,
+            page_header,
+            render_carbon_simple_page,
+            tile,
+        )
+
+        error_html = notification("error", "Login failed", str(error)) if error else ""
+        form_html = (
+            '<form method="post" action="/login">'
+            f'<input type="hidden" name="next" value="{next_url}">'
+            '<div class="cds-field">'
+            '<label class="cds-field__label" for="carbon-login-username">Username</label>'
+            '<input class="cds-field__input" id="carbon-login-username" name="username" '
+            'type="text" autocomplete="username" required>'
+            "</div>"
+            '<div class="cds-field">'
+            '<label class="cds-field__label" for="carbon-login-password">Password</label>'
+            '<input class="cds-field__input" id="carbon-login-password" name="password" '
+            'type="password" autocomplete="current-password" required>'
+            "</div>"
+            '<button class="cds-btn cds-btn--primary" type="submit">Login</button>'
+            "</form>"
+        )
+        content = page_header("Access", "Login") + error_html + tile(form_html)
+        return render_carbon_simple_page(
+            content, title="Login", show_classic_switch=False
+        )
+
+    from quasarr.providers import shared_state
+    from quasarr.providers.page_dispatch import render_page
+
+    return render_page("login", carbon, classic, shared_state=shared_state)
 
 
 def _handle_login_post():

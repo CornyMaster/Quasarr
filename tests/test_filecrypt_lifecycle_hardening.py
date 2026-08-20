@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Task 3C hardening: prune_receipts and lifecycle storage resilience."""
+"""Hardening tests: prune_receipts and lifecycle storage resilience."""
 
 import os
 import tempfile

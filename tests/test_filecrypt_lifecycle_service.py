@@ -287,7 +287,7 @@ class TestPrepareOfferBasic(LifecycleServiceTestCase):
         # No sweep header
         self.assertIsNone(self.header())
 
-        # No link-state at offer time; only Task 3B BLOCKED creates held state
+        # No link-state at offer time; only record_blocked()'s accepted BLOCKED creates held state
         self.assertIsNone(self.link_state(fp(1)))
         self.assertEqual(
             {"state": "available", "retry_after_epoch": 0},
@@ -419,7 +419,7 @@ class TestAtomicity(LifecycleServiceTestCase):
         self.assertIsNotNone(member)
         self.assertEqual("offered", member["state"])
 
-        # No link-state at offer time; only Task 3B BLOCKED creates held state
+        # No link-state at offer time; only record_blocked()'s accepted BLOCKED creates held state
         self.assertIsNone(self.link_state(leased_fp))
 
         # One mutation call for opening + leasing
@@ -491,7 +491,7 @@ class TestIndividualLifecycle(LifecycleServiceTestCase):
         self.assertEqual(offer2["offer_id"], m["lease"]["offer_id"])
 
     def test_first_time_offer_never_produces_retest_without_held_row(self):
-        """After individual offer+expiry, re-offer is individual (not retest); retest needs Task 3B held."""
+        """After individual offer+expiry, re-offer is individual (not retest); retest needs a held row."""
         svc = self.service()
         offer1 = svc.prepare_offer(rows_for([1]))
         self.assertEqual("individual", offer1["mode"])
@@ -504,7 +504,7 @@ class TestIndividualLifecycle(LifecycleServiceTestCase):
         self.assertEqual("individual", offer2["mode"])  # NOT retest
         self.assertIsNone(self.link_state(fp(1)))
 
-        # Now simulate Task 3B installing a held row
+        # Now simulate record_blocked() installing a held row
         self.install_link_state(
             fp(1),
             self.make_held_ls(
@@ -663,7 +663,7 @@ class TestRetestAndHeld(LifecycleServiceTestCase):
         self.assertEqual(fp(1), offer["link_fingerprint"])
 
     def test_preexisting_held_row_produces_retest_unchanged(self):
-        """A held row installed by Task 3B (accepted BLOCKED) alone triggers retest."""
+        """A held row installed by record_blocked() (accepted BLOCKED) alone triggers retest."""
         gen_id = "a" * 32
         retry = NOW - 1  # expired hold
         self.install_link_state(

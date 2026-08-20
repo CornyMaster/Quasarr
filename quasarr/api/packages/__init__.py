@@ -25,6 +25,7 @@ from quasarr.providers.crypter_cooldowns import (
     crypter_blocks_deferred,
 )
 from quasarr.providers.html_templates import render_button, render_centered_html
+from quasarr.providers.page_dispatch import render_page
 from quasarr.storage.categories import get_download_category_emoji
 
 
@@ -615,8 +616,27 @@ def setup_packages_routes(app):
             "history_count": len(downloads.get("history", [])),
         }
 
-    @app.get("/packages")
-    def packages_status():
+    @app.get("/api/packages/list")
+    @require_api_key
+    def packages_list_api():
+        """Carbon Downloads data contract: PackageListResponse (see api/packages/carbon.py).
+
+        The carbon.py import stays local to this callback, matching every
+        other Carbon import in this file, so a broken projection module can
+        never prevent this module from loading.
+        """
+        from quasarr.api.packages.carbon import (
+            build_package_list_response,
+            empty_package_list_response,
+        )
+
+        device = shared_state.values.get("device")
+        if not device:
+            return empty_package_list_response()
+
+        return build_package_list_response(shared_state, device)
+
+    def _classic_downloads():
         try:
             device = shared_state.values["device"]
         except KeyError:
@@ -1124,3 +1144,17 @@ def setup_packages_routes(app):
         '''
 
         return render_centered_html(packages_html)
+
+    @app.get("/packages")
+    def packages_status():
+        def carbon():
+            from quasarr.api.packages.carbon import render_downloads
+
+            return render_downloads(shared_state)
+
+        return render_page(
+            "downloads",
+            carbon,
+            _classic_downloads,
+            shared_state=shared_state,
+        )

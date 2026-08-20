@@ -427,9 +427,10 @@ def _legacy_shaped_snapshot(projected):
     """Express a version-two decision in the snapshot shape callers read today.
 
     `projected` is `crypter_sweeps.decision_snapshot()` of that same decision, so
-    both halves of a projection always describe one row. Task 4 owns the
-    transitions; until then a version-two row only has to answer the existing
-    keys, and only a real cooldown may gate a linkcrypter. A sweep is the closest
+    both halves of a projection always describe one row. The sweep-commit path
+    elsewhere in this module owns the transitions; until one runs, a
+    version-two row only has to answer the existing keys, and only a real
+    cooldown may gate a linkcrypter. A sweep is the closest
     analogue of the legacy evidence-gathering state, while healthy and individual
     suppress global blocking and therefore read as available.
     """

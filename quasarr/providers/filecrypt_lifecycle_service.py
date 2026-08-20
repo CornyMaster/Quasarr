@@ -2,10 +2,10 @@
 # Quasarr
 """Filecrypt link-lifecycle service: opening, leasing, projections, and outcomes.
 
-Implements opening/leasing/projection (Task 3A), first-time outcome recording
-(Task 3B1), and retest/probe outcome recording (Task 3B2A).  Blacklist
-confirmation, pruning, migration, route wiring, settings persistence, and
-terminal effects are deferred to later tasks.
+Implements opening/leasing/projection, first-time outcome recording, and
+retest/probe outcome recording, plus blacklist confirmation, pruning, and
+migration. Route wiring, settings persistence, and terminal effects live in
+the surrounding API/storage/provider layers.
 """
 
 import json
@@ -549,7 +549,7 @@ class FilecryptLifecycleService:
         """Open an individual generation for one first-time fingerprint.
 
         Writes an offered member row only.  No link-state row is created;
-        only Task 3B's accepted BLOCKED creates held state.
+        only `record_blocked()`'s accepted BLOCKED creates held state.
         """
         occurrence = _first_handable_occurrence(fp_map[fp], excluded_package_ids)
         if occurrence is None:
@@ -922,7 +922,7 @@ class FilecryptLifecycleService:
 
         return None
 
-    # ── outcome recording (Task 3B1) ──────────────────────────────────────────
+    # ── outcome recording ───────────────────────────────────────────────────
 
     def _cooldown_seconds(self):
         configured = self._shared_state.values.get(
@@ -1837,7 +1837,7 @@ class FilecryptLifecycleService:
             "terminal_operation_id": _top_id,
         }
 
-    # ── owner scrub (Task 6B) ─────────────────────────────────────────────────
+    # ── owner scrub ────────────────────────────────────────────────────────
 
     def blacklisted_owners(self, protected_rows, fingerprint):
         """Sorted tuple of package_ids in protected_rows that own the fingerprint."""
@@ -1902,7 +1902,7 @@ class FilecryptLifecycleService:
         self._shared_state.get_db("protected").mutate_value(package_id, _mutator)
         return result[0]
 
-    # ── blacklist confirmation (Task 3B2B) ────────────────────────────────────
+    # ── blacklist confirmation ────────────────────────────────────────────────
 
     def confirm_blacklist(self, fingerprint, offer_id, terminal_operation_id):
         """Confirm a terminal blacklist for a link in blacklisting state.
@@ -2023,7 +2023,7 @@ class FilecryptLifecycleService:
         )
         return result[0]
 
-    # ── receipt pruning (Task 3C) ─────────────────────────────────────────────
+    # ── receipt pruning ───────────────────────────────────────────────────────
 
     def prune_receipts(self) -> int:
         """Prune expired offer receipts.  Returns the number of rows deleted."""

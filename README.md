@@ -50,6 +50,47 @@ login required).
 
 ---
 
+## Web UI
+
+Quasarr's Web UI is built on the [Carbon Design System](https://carbondesignsystem.com/) and is the default UI. It supports light and dark themes (toggle in the header, remembered per device) and works down to mobile viewport widths.
+
+<details>
+<summary>Screenshots</summary>
+
+Dashboard, light and dark:
+
+<img src="https://raw.githubusercontent.com/rix1337/Quasarr/main/readme-assets/carbon-dashboard-desktop-light.png" width="49%" alt="Dashboard, light theme" /> <img src="https://raw.githubusercontent.com/rix1337/Quasarr/main/readme-assets/carbon-dashboard-desktop-dark.png" width="49%" alt="Dashboard, dark theme" />
+
+Downloads and Settings:
+
+<img src="https://raw.githubusercontent.com/rix1337/Quasarr/main/readme-assets/carbon-downloads-desktop-light.png" width="49%" alt="Downloads" /> <img src="https://raw.githubusercontent.com/rix1337/Quasarr/main/readme-assets/carbon-settings-desktop-light.png" width="49%" alt="Settings" />
+
+Mobile, light and dark:
+
+<img src="https://raw.githubusercontent.com/rix1337/Quasarr/main/readme-assets/carbon-dashboard-mobile-light.png" width="30%" alt="Dashboard, mobile, light theme" /> <img src="https://raw.githubusercontent.com/rix1337/Quasarr/main/readme-assets/carbon-dashboard-mobile-dark.png" width="30%" alt="Dashboard, mobile, dark theme" />
+
+</details>
+
+### Classic UI
+
+The previous UI is still fully supported and easy to reach:
+
+- **For one browser:** click **Switch to Classic UI** in the footer (`/ui/classic`), or **Carbon UI** in Classic's footer to switch back (`/ui/carbon`). Both remember your choice via cookie.
+- **For one page load:** append `?ui=classic` (or `?ui=carbon`) to any URL.
+- **For the whole instance:** set the `QUASARR_UI=classic` environment variable. This takes precedence over every other setting, including the URL and cookie - useful for Docker deployments or anyone who prefers Classic permanently.
+- **For every user, persisted:** `POST /api/ui-preference` with `{"mode": "classic"}` and your API key (`X-Api-Key` header) sets the stored default for everyone without a more specific override.
+
+Carbon falls back to Classic automatically if its static assets are ever missing or fail to render, so a broken deployment never loses access to the Web UI.
+
+### Third-party notices
+
+The Carbon UI bundles:
+
+- [IBM Plex](https://github.com/IBM/plex) fonts, © IBM Corp., licensed under the [SIL Open Font License 1.1](quasarr/static/fonts/LICENSE-IBM-PLEX.txt).
+- Icon path data from the [Carbon Design System icons](https://github.com/carbon-design-system/carbon/tree/main/packages/icons), © IBM Corp., licensed under [Apache License 2.0](quasarr/static/icons/LICENSE-APACHE-2.0.txt).
+
+---
+
 ## JDownloader
 
 > ⚠️ If using Docker:

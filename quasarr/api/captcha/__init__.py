@@ -16,6 +16,7 @@ from quasarr.providers import obfuscated, shared_state
 from quasarr.providers.auth import public_endpoint
 from quasarr.providers.html_templates import render_button, render_centered_html
 from quasarr.providers.log import debug, error, info, trace
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.statistics import StatsHelper
 from quasarr.storage.categories import (
     get_download_category_from_package_id,
@@ -29,8 +30,11 @@ def js_single_quoted_string_safe(text):
 
 
 def check_package_exists(package_id):
-    if not shared_state.get_db("protected").retrieve(package_id):
-        raise HTTPResponse(
+    if shared_state.get_db("protected").retrieve(package_id):
+        return
+
+    def classic():
+        return HTTPResponse(
             status=404,
             body=render_centered_html(f'''
                 <h1><img src="{images.logo}" class="logo"/>Quasarr</h1>
@@ -42,17 +46,47 @@ def check_package_exists(package_id):
             content_type="text/html",
         )
 
+    def carbon():
+        from quasarr.providers.carbon_templates import render_carbon_error_page
+
+        # Status must live on the constructed HTTPResponse itself, not on
+        # the global bottle.response - response.status is a no-op once this
+        # is raised rather than returned. Returning (rather than raising)
+        # here lets render_page's _apply_csp attach the CSP header to the
+        # object before the caller below raises it.
+        return HTTPResponse(
+            status=404,
+            body=render_carbon_error_page(404, "Package not found or already solved."),
+            content_type="text/html",
+        )
+
+    raise render_page(
+        "captcha-package-not-found", carbon, classic, shared_state=shared_state
+    )
+
+
+def is_he_link(he_hostname, link):
+    """Shared with ``api.captcha.carbon``: classify a single link as HE by
+    its explicit mirror tag or a configured HE hostname substring match."""
+    url = link[0] if isinstance(link, (list, tuple)) else link
+    mirror = link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else ""
+    if str(mirror).lower() == "he":
+        return True
+    return bool(he_hostname and he_hostname.lower() in str(url).lower())
+
+
+def is_junkies_link(sj, dj, link):
+    """Shared with ``api.captcha.carbon``: classify a single link as Junkies
+    by its explicit mirror tag or a configured DJ/SJ hostname substring
+    match. Handles the ``[[url, mirror]]`` link format."""
+    url = link[0] if isinstance(link, (list, tuple)) else link
+    mirror = link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else ""
+    if mirror == "junkies":
+        return True
+    return bool((sj and sj in url) or (dj and dj in url))
+
 
 def setup_captcha_routes(app):
-    def is_he_link(link):
-        url = link[0] if isinstance(link, (list, tuple)) else link
-        mirror = link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else ""
-        if str(mirror).lower() == "he":
-            return True
-
-        he = shared_state.values["config"]("Hostnames").get("he")
-        return bool(he and he.lower() in str(url).lower())
-
     @app.get("/captcha")
     def check_captcha():
         try:
@@ -141,19 +175,14 @@ def setup_captcha_routes(app):
 
             sj = shared_state.values["config"]("Hostnames").get("sj")
             dj = shared_state.values["config"]("Hostnames").get("dj")
+            he_hostname = shared_state.values["config"]("Hostnames").get("he")
 
-            def is_junkies_link(link):
-                """Check if link is a junkies link (handles [[url, mirror]] format)."""
-                url = link[0] if isinstance(link, (list, tuple)) else link
-                mirror = (
-                    link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else ""
-                )
-                if mirror == "junkies":
-                    return True
-                return (sj and sj in url) or (dj and dj in url)
-
-            has_junkies_links = any(is_junkies_link(link) for link in prioritized_links)
-            has_he_links = any(is_he_link(link) for link in prioritized_links)
+            has_junkies_links = any(
+                is_junkies_link(sj, dj, link) for link in prioritized_links
+            )
+            has_he_links = any(
+                is_he_link(he_hostname, link) for link in prioritized_links
+            )
 
             # Hide uses nested arrays like FileCrypt: [["url", "mirror"]]
             has_hide_links = any(
@@ -402,8 +431,7 @@ def setup_captcha_routes(app):
             </script>
         '''
 
-    @app.get("/captcha/hide")
-    def serve_hide_captcha():
+    def _classic_hide_captcha():
         payload = decode_payload()
 
         if "error" in payload:
@@ -448,8 +476,21 @@ def setup_captcha_routes(app):
           </body>
         </html>""")
 
-    @app.get("/captcha/junkies")
-    def serve_junkies_captcha():
+    @app.get("/captcha/hide")
+    def serve_hide_captcha():
+        def carbon():
+            from quasarr.api.captcha.carbon import render_captcha
+
+            return render_captcha(shared_state, "hide")
+
+        return render_page(
+            "captcha",
+            carbon,
+            _classic_hide_captcha,
+            shared_state=shared_state,
+        )
+
+    def _classic_junkies_captcha():
         payload = decode_payload()
 
         if "error" in payload:
@@ -494,8 +535,21 @@ def setup_captcha_routes(app):
           </body>
         </html>""")
 
-    @app.get("/captcha/he")
-    def serve_he_captcha():
+    @app.get("/captcha/junkies")
+    def serve_junkies_captcha():
+        def carbon():
+            from quasarr.api.captcha.carbon import render_captcha
+
+            return render_captcha(shared_state, "junkies")
+
+        return render_page(
+            "captcha",
+            carbon,
+            _classic_junkies_captcha,
+            shared_state=shared_state,
+        )
+
+    def _classic_he_captcha():
         payload = decode_payload()
 
         if "error" in payload:
@@ -540,8 +594,21 @@ def setup_captcha_routes(app):
           </body>
         </html>""")
 
-    @app.get("/captcha/keeplinks")
-    def serve_keeplinks_captcha():
+    @app.get("/captcha/he")
+    def serve_he_captcha():
+        def carbon():
+            from quasarr.api.captcha.carbon import render_captcha
+
+            return render_captcha(shared_state, "he")
+
+        return render_page(
+            "captcha",
+            carbon,
+            _classic_he_captcha,
+            shared_state=shared_state,
+        )
+
+    def _classic_keeplinks_captcha():
         payload = decode_payload()
 
         if "error" in payload:
@@ -587,8 +654,21 @@ def setup_captcha_routes(app):
           </body>
         </html>""")
 
-    @app.get("/captcha/tolink")
-    def serve_tolink_captcha():
+    @app.get("/captcha/keeplinks")
+    def serve_keeplinks_captcha():
+        def carbon():
+            from quasarr.api.captcha.carbon import render_captcha
+
+            return render_captcha(shared_state, "keeplinks")
+
+        return render_page(
+            "captcha",
+            carbon,
+            _classic_keeplinks_captcha,
+            shared_state=shared_state,
+        )
+
+    def _classic_tolink_captcha():
         payload = decode_payload()
 
         if "error" in payload:
@@ -634,8 +714,21 @@ def setup_captcha_routes(app):
           </body>
         </html>""")
 
-    @app.get("/captcha/filecrypt")
-    def serve_filecrypt_captcha():
+    @app.get("/captcha/tolink")
+    def serve_tolink_captcha():
+        def carbon():
+            from quasarr.api.captcha.carbon import render_captcha
+
+            return render_captcha(shared_state, "tolink")
+
+        return render_page(
+            "captcha",
+            carbon,
+            _classic_tolink_captcha,
+            shared_state=shared_state,
+        )
+
+    def _classic_filecrypt_captcha():
         payload = decode_payload()
 
         if "error" in payload:
@@ -680,6 +773,20 @@ def setup_captcha_routes(app):
 
           </body>
         </html>""")
+
+    @app.get("/captcha/filecrypt")
+    def serve_filecrypt_captcha():
+        def carbon():
+            from quasarr.api.captcha.carbon import render_captcha
+
+            return render_captcha(shared_state, "filecrypt")
+
+        return render_page(
+            "captcha",
+            carbon,
+            _classic_filecrypt_captcha,
+            shared_state=shared_state,
+        )
 
     @app.get("/captcha/filecrypt.user.js")
     @public_endpoint
@@ -746,15 +853,7 @@ def setup_captcha_routes(app):
 
         sj = shared_state.values["config"]("Hostnames").get("sj")
         dj = shared_state.values["config"]("Hostnames").get("dj")
-
-        def is_junkies_link(link):
-            url = link[0] if isinstance(link, (list, tuple)) else link
-            mirror = (
-                link[1] if isinstance(link, (list, tuple)) and len(link) > 1 else ""
-            )
-            if mirror == "junkies":
-                return True
-            return (sj and sj in url) or (dj and dj in url)
+        he_hostname = shared_state.values["config"]("Hostnames").get("he")
 
         def get_captcha_type_for_links(links):
             """Determine which captcha type to use based on links"""
@@ -762,8 +861,8 @@ def setup_captcha_routes(app):
                 ("hide." in (l[0] if isinstance(l, (list, tuple)) else l))
                 for l in links
             )
-            has_junkies = any(is_junkies_link(l) for l in links)
-            has_he = any(is_he_link(l) for l in links)
+            has_junkies = any(is_junkies_link(sj, dj, l) for l in links)
+            has_he = any(is_he_link(he_hostname, l) for l in links)
             has_keeplinks = any(
                 ("keeplinks." in (l[0] if isinstance(l, (list, tuple)) else l))
                 for l in links

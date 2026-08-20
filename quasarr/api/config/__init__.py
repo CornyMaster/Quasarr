@@ -18,6 +18,7 @@ from quasarr.constants import (
 from quasarr.providers.auth import require_api_key
 from quasarr.providers.html_templates import render_button, render_form
 from quasarr.providers.log import info
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.utils import (
     get_search_capability_category,
     has_source_capability_for_category,
@@ -45,6 +46,7 @@ from quasarr.storage.setup import (
     get_crypter_block_settings_data,
     get_filecrypt_setting_data,
     get_flaresolverr_status_data,
+    get_hostnames_data,
     get_notification_settings_data,
     get_radarr_settings_data,
     get_skip_login,
@@ -75,8 +77,7 @@ def setup_config(app, shared_state):
 
         return {"issues": get_all_hostname_issues()}
 
-    @app.get("/hostnames")
-    def hostnames_ui():
+    def _classic_hostnames():
         message = """<p>
             Use status buttons to change credentials and check for errors.
         </p>"""
@@ -93,10 +94,29 @@ def setup_config(app, shared_state):
             + back_button,
         )
 
+    @app.get("/hostnames")
+    def hostnames_ui():
+        def carbon():
+            from quasarr.api.config.carbon import render_hostnames
+
+            return render_hostnames(shared_state)
+
+        return render_page(
+            "hostnames",
+            carbon,
+            _classic_hostnames,
+            shared_state=shared_state,
+        )
+
     @app.post("/api/hostnames")
     @require_api_key
     def hostnames_api():
         return save_hostnames(shared_state, timeout=1, first_run=False)
+
+    @app.get("/api/hostnames")
+    @require_api_key
+    def get_hostnames_api():
+        return get_hostnames_data(shared_state)
 
     @app.post("/api/hostnames/check-credentials/<shorthand>")
     @require_api_key
@@ -226,8 +246,7 @@ def setup_config(app, shared_state):
     def save_filecrypt_setting_api():
         return save_filecrypt_setting(shared_state)
 
-    @app.get("/categories")
-    def categories_ui():
+    def _classic_categories():
         """Web UI page for managing categories."""
         response.set_header("Cache-Control", "no-cache, no-store, must-revalidate")
         response.set_header("Pragma", "no-cache")
@@ -1021,6 +1040,20 @@ def setup_config(app, shared_state):
         </script>
         """
         return render_form("Categories", form_html)
+
+    @app.get("/categories")
+    def categories_ui():
+        def carbon():
+            from quasarr.api.config.carbon import render_categories
+
+            return render_categories(shared_state)
+
+        return render_page(
+            "categories",
+            carbon,
+            _classic_categories,
+            shared_state=shared_state,
+        )
 
     @app.post("/api/categories")
     @require_api_key

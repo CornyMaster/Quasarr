@@ -156,8 +156,8 @@ class SearchCacheTests(unittest.TestCase):
         self.assertIs(value[0], first[0])
 
     def test_reading_an_entry_makes_it_the_most_recent_one(self):
-        # The plan's worked example: "a" survives the third insert only because
-        # reading it moved it behind "b" in LRU order.
+        # "a" survives the third insert only because reading it moved it
+        # behind "b" in LRU order.
         cache = SearchCache(max_entries=2, max_releases=3, clock=self.clock)
         cache.set("a", [{"id": 1}, {"id": 2}], ttl=300)
         cache.set("b", [{"id": 3}], ttl=300)

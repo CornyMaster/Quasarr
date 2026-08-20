@@ -3,8 +3,9 @@
 # Project by https://github.com/rix1337
 
 import json
+from urllib.parse import unquote, urlsplit
 
-from bottle import Bottle
+from bottle import Bottle, HTTPError, abort, redirect, request, response
 
 import quasarr.providers.html_images as images
 from quasarr.api.arr import setup_arr_routes
@@ -23,6 +24,8 @@ from quasarr.providers.auth import (
     add_auth_hook,
     add_auth_routes,
     audit_route_auth_modes,
+    require_api_key,
+    require_browser_auth,
     show_logout_link,
 )
 from quasarr.providers.hostname_issues import get_all_hostname_issues
@@ -34,6 +37,13 @@ from quasarr.providers.html_templates import (
 from quasarr.providers.notifications.helpers.notification_types import (
     get_notification_type_label,
     get_user_configurable_notification_types,
+)
+from quasarr.providers.page_dispatch import render_page
+from quasarr.providers.static_assets import setup_static_routes
+from quasarr.providers.ui_preference import (
+    UI_COOKIE_NAME,
+    VALID_UI_MODES,
+    persist_ui_preference,
 )
 from quasarr.providers.web_server import Server
 from quasarr.search.sources.helpers import (
@@ -48,6 +58,67 @@ from quasarr.storage.setup.sonarr import is_sonarr_configured
 from quasarr.storage.sqlite_database import DataBase
 
 
+def _normalize_ui_next(next_url):
+    if not next_url:
+        return "/"
+
+    candidate = str(next_url).strip()
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return "/"
+    if "\\" in candidate or "\r" in candidate or "\n" in candidate:
+        return "/"
+
+    parsed = urlsplit(candidate)
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    decoded_path = unquote(parsed.path)
+    if any(segment in {".", ".."} for segment in decoded_path.split("/")):
+        return "/"
+    if parsed.path in {"/login", "/logout"}:
+        return "/"
+
+    normalized = parsed.path or "/"
+    if parsed.query:
+        normalized += f"?{parsed.query}"
+    return normalized
+
+
+def setup_ui_preference_routes(app, state):
+    @app.get("/ui/<mode>")
+    @require_browser_auth
+    def ui_mode(mode):
+        if mode not in VALID_UI_MODES:
+            abort(404)
+
+        response.set_cookie(
+            UI_COOKIE_NAME,
+            mode,
+            path="/",
+            httponly=True,
+            samesite="Lax",
+        )
+        redirect(_normalize_ui_next(request.query.get("next")))
+
+    @app.post("/api/ui-preference")
+    @require_api_key
+    def api_ui_preference():
+        try:
+            payload = request.json
+        except HTTPError:
+            payload = None
+        if not isinstance(payload, dict):
+            response.status = 400
+            return {"success": False, "message": "Invalid UI mode"}
+
+        mode = payload.get("mode")
+        if not isinstance(mode, str) or mode not in VALID_UI_MODES:
+            response.status = 400
+            return {"success": False, "message": "Invalid UI mode"}
+
+        persist_ui_preference(state, mode)
+        return {"success": True, "mode": mode}
+
+
 def get_api(shared_state_dict, shared_state_lock):
     shared_state.set_state(shared_state_dict, shared_state_lock)
 
@@ -57,20 +128,23 @@ def get_api(shared_state_dict, shared_state_lock):
     add_auth_routes(app)
     add_auth_hook(app, whitelist=[".user.js"])
 
+    # Serve static assets from the package (immutable by default)
+    setup_static_routes(app, immutable=True)
+
     setup_arr_routes(app)
     setup_captcha_routes(app)
     setup_config(app, shared_state)
     setup_statistics(app, shared_state)
     setup_sponsors_helper_routes(app)
     setup_packages_routes(app)
+    setup_ui_preference_routes(app, shared_state)
     audit_route_auth_modes(
         app,
         api_key_prefixes=("/api", "/download/", "/sponsors_helper/api/"),
         public_whitelist=(".user.js",),
     )
 
-    @app.get("/")
-    def index():
+    def _classic_dashboard():
         protected = shared_state.get_db("protected").retrieve_all_titles()
         api_key = Config("API").get("key")
 
@@ -1674,6 +1748,37 @@ def get_api(shared_state_dict, shared_state_lock):
         # Add logout link for form auth
         logout_html = '<a href="/logout">Logout</a>' if show_logout_link() else ""
         return render_centered_html(info, footer_content=logout_html)
+
+    @app.get("/")
+    def index():
+        def carbon():
+            from quasarr.api.carbon import render_dashboard
+
+            return render_dashboard(shared_state)
+
+        return render_page(
+            "dashboard",
+            carbon,
+            _classic_dashboard,
+            shared_state=shared_state,
+        )
+
+    def _classic_settings():
+        return redirect("/")
+
+    @app.get("/settings")
+    def settings():
+        def carbon():
+            from quasarr.api.carbon import render_settings
+
+            return render_settings(shared_state)
+
+        return render_page(
+            "settings",
+            carbon,
+            _classic_settings,
+            shared_state=shared_state,
+        )
 
     @app.get("/regenerate-api-key")
     def regenerate_api_key():

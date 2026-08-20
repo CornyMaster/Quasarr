@@ -3,11 +3,15 @@
 # Project by https://github.com/rix1337
 
 import time
+from html import escape
+
+from bottle import response
 
 import quasarr.providers.html_images as images
 from quasarr.providers import shared_state
 from quasarr.providers.auth import is_auth_enabled, is_browser_authenticated
 from quasarr.providers.log import warn
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.version import get_version
 from quasarr.storage.config import Config
 
@@ -435,6 +439,7 @@ def render_centered_html(inner_content, footer_content=""):
         footer_content,
         f"Quasarr v{get_version()}",
         f'<a href="https://github.com/rix1337/Quasarr?tab=readme-ov-file#sponsorshelper" target="_blank" title="{sponsors_helper_status}">{sponsors_helper_emoji}</a>',
+        '<a href="/ui/carbon?next=/">Carbon UI</a>',
     ]
     footer_html = " · ".join(filter(None, footer_list))
 
@@ -521,10 +526,13 @@ def render_form(header, form="", script="", footer_content=""):
 
 
 def render_success(message, timeout=10, optional_text=""):
-    button_html = render_button(
-        f"Wait time... {timeout}", "secondary", {"id": "nextButton", "disabled": "true"}
-    )
-    script = f"""
+    def classic():
+        button_html = render_button(
+            f"Wait time... {timeout}",
+            "secondary",
+            {"id": "nextButton", "disabled": "true"},
+        )
+        script = f"""
         <script>
             let counter = {timeout};
             const btn = document.getElementById('nextButton');
@@ -541,32 +549,146 @@ def render_success(message, timeout=10, optional_text=""):
             }}, 1000);
         </script>
     """
-    content = f'''<h1 onclick="window.location.href='/'"><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+        content = f'''<h1 onclick="window.location.href='/'"><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
     <h2>{message}</h2>
     {optional_text}
     {button_html}
     {script}
     '''
-    return render_centered_html(content)
+        return render_centered_html(content)
+
+    def carbon():
+        from quasarr.providers.carbon_templates import (
+            render_carbon_simple_page,
+            simple_page,
+        )
+
+        button_html = (
+            '<button class="cds-btn cds-btn--secondary" type="button" '
+            'data-action="continue-countdown" '
+            f'data-seconds="{int(timeout)}" data-target="/" disabled>'
+            f"Wait time... {int(timeout)}</button>"
+        )
+        body = f"<p>{escape(str(message))}</p>{optional_text}{button_html}"
+        page_content = simple_page("Success", body, status="success")
+        return render_carbon_simple_page(page_content, title="Success")
+
+    return render_page("success", carbon, classic, shared_state=shared_state)
 
 
 def render_success_no_wait(message, optional_text=""):
-    button_html = render_button(
-        "Continue", "primary", {"onclick": "window.location.href='/'"}
-    )
-    content = f'''<h1 onclick="window.location.href='/'"><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+    def classic():
+        button_html = render_button(
+            "Continue", "primary", {"onclick": "window.location.href='/'"}
+        )
+        content = f'''<h1 onclick="window.location.href='/'"><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
     <h2>{message}</h2>
     {optional_text}
     {button_html}
     '''
-    return render_centered_html(content)
+        return render_centered_html(content)
+
+    def carbon():
+        from quasarr.providers.carbon_templates import (
+            render_carbon_simple_page,
+            simple_page,
+        )
+
+        button_html = '<a class="cds-btn cds-btn--primary" href="/">Continue</a>'
+        body = f"<p>{escape(str(message))}</p>{optional_text}{button_html}"
+        page_content = simple_page("Success", body, status="success")
+        return render_carbon_simple_page(page_content, title="Success")
+
+    return render_page("success-no-wait", carbon, classic, shared_state=shared_state)
+
+
+def _escape_message_preserving_br_breaks(message):
+    """Escape `message` for a Carbon `<p>`, honoring a renderer-owned `<br>`
+    line-break token a caller may have embedded in it (see
+    storage/setup/hostnames.py's `al` credential-failure message, which
+    Classic has always rendered as raw `<br><br>` HTML and shares unchanged
+    with the Carbon branch through the same `render_fail(message)` call).
+
+    Splits on the exact literal substring `<br>` BEFORE escaping, escapes
+    each segment independently, then rejoins with a real `<br>` element -
+    a fixed, attribute-free token. Anything that merely looks like a break
+    tag but isn't that exact 4-character substring (`<br/>`,
+    `<br class="x">`, a hostile `<br onload=x>`) stays inside a segment and
+    is escaped like any other text, never treated as a break.
+    """
+    segments = str(message).split("<br>")
+    return "<br>".join(escape(segment) for segment in segments)
 
 
 def render_fail(message):
-    button_html = render_button(
-        "Back", "secondary", {"onclick": "window.location.href='/'"}
-    )
-    return render_centered_html(f"""<h1 onclick="window.location.href='/'"><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+    def classic():
+        button_html = render_button(
+            "Back", "secondary", {"onclick": "window.location.href='/'"}
+        )
+        return render_centered_html(f"""<h1 onclick="window.location.href='/'"><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
         <h2>{message}</h2>
         {button_html}
     """)
+
+    def carbon():
+        from quasarr.providers.carbon_templates import (
+            render_carbon_simple_page,
+            simple_page,
+        )
+
+        button_html = '<a class="cds-btn cds-btn--secondary" href="/">Back</a>'
+        body = f"<p>{_escape_message_preserving_br_breaks(message)}</p>{button_html}"
+        page_content = simple_page("Error", body, status="error")
+        return render_carbon_simple_page(page_content, title="Error")
+
+    return render_page("fail", carbon, classic, shared_state=shared_state)
+
+
+_ERROR_PAGE_TITLES = {
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+}
+
+
+def render_error_page(status_code, message=None, *, title=None, back_href="/"):
+    """Carbon/Classic-aware page for a genuine HTTP 401/403/404 response.
+
+    Distinct from ``render_fail``, which is used for a 200-status form
+    re-display after a validation failure. This sets ``response.status`` to
+    ``status_code`` and is meant for real HTTP errors (e.g. a Basic-auth
+    challenge, a missing resource). Also covers the "package not found"
+    case: callers pass ``status_code=404`` with a specific ``message``.
+    ``back_href`` is forwarded to the Carbon primitive's "Back" link; the
+    Classic branch keeps its existing fixed ``/`` destination.
+    """
+    if status_code not in _ERROR_PAGE_TITLES:
+        raise ValueError("Unsupported error status code")
+
+    response.status = status_code
+    resolved_title = title if title is not None else _ERROR_PAGE_TITLES[status_code]
+    resolved_message = message if message is not None else ""
+
+    def classic():
+        button_html = render_button(
+            "Back", "secondary", {"onclick": "window.location.href='/'"}
+        )
+        return render_centered_html(f"""<h1 onclick="window.location.href='/'"><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+            <h2>{resolved_title}</h2>
+            <p>{resolved_message}</p>
+            {button_html}
+        """)
+
+    def carbon():
+        from quasarr.providers.carbon_templates import render_carbon_error_page
+
+        return render_carbon_error_page(
+            status_code,
+            resolved_message or None,
+            title=resolved_title,
+            back_href=back_href,
+        )
+
+    return render_page(
+        f"error-{status_code}", carbon, classic, shared_state=shared_state
+    )

@@ -368,6 +368,29 @@ def format_eta(seconds):
 # =============================================================================
 
 
+def get_packages_for_device(shared_state, device, *, auto_start=True):
+    """
+    Get all packages from protected DB, failed DB, linkgrabber, and downloader,
+    using exactly the supplied `device`.
+
+    Builds one request-scoped JDPackageCache from `device` and routes every
+    query and auto-start operation through that same device. Never calls
+    shared_state.get_device() - a caller that already resolved (or refused to
+    resolve) a device controls exactly what JDownloader connection is used,
+    with no device-retry loop hidden inside this call.
+
+    Args:
+        shared_state: The shared state object
+        device: The JDownloader device to use for this request
+        auto_start: Whether to auto-start Quasarr packages from linkgrabber
+                within a single request. External callers should never pass this.
+    """
+    trace("Starting package retrieval (device-scoped)")
+    cache = JDPackageCache(device)
+    trace("Created new JDPackageCache")
+    return _collect_packages(shared_state, cache, lambda: device, auto_start)
+
+
 def get_packages(shared_state, _cache=None, auto_start=True):
     """
     Get all packages from protected DB, failed DB, linkgrabber, and downloader.
@@ -379,15 +402,25 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                 within a single request. External callers should never pass this.
     """
     trace("Starting package retrieval")
-    packages = []
 
     # Create cache for this request - only valid for duration of this call
     if _cache is None:
-        cache = JDPackageCache(shared_state.get_device())
-        trace("Created new JDPackageCache")
-    else:
-        cache = _cache
-        trace("Using provided cache instance")
+        device = shared_state.get_device()
+        return get_packages_for_device(shared_state, device, auto_start=auto_start)
+
+    trace("Using provided cache instance")
+    return _collect_packages(shared_state, _cache, shared_state.get_device, auto_start)
+
+
+def _collect_packages(shared_state, cache, get_active_device, auto_start):
+    """Shared body for both get_packages() and get_packages_for_device().
+
+    `get_active_device` is a zero-arg callable resolving the device to use for
+    every query/auto-start operation below - a fixed closure for the
+    device-scoped path, or shared_state.get_device() itself for the legacy
+    path, which keeps its existing retry behavior.
+    """
+    packages = []
 
     # === PROTECTED PACKAGES (CAPTCHA required) ===
     protected_packages = shared_state.get_db("protected").retrieve_all_titles()
@@ -499,7 +532,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                     f"Cleaning up {len(offline_mirror_linkids)} offline links from '{package_name}'"
                 )
                 try:
-                    shared_state.get_device().linkgrabber.cleanup(
+                    get_active_device().linkgrabber.cleanup(
                         "DELETE_OFFLINE",
                         "REMOVE_LINKS_ONLY",
                         "SELECTED",
@@ -523,7 +556,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                 try:
                     # package_ids must be empty: passing the package id would
                     # remove the whole package, not just the unusable links.
-                    shared_state.get_device().linkgrabber.remove_links(
+                    get_active_device().linkgrabber.remove_links(
                         remove_by_id,
                         [],
                     )
@@ -599,7 +632,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                 try:
                     # package_ids must be empty: passing the package id would
                     # remove the whole package, not just the unusable links.
-                    shared_state.get_device().downloads.remove_links(
+                    get_active_device().downloads.remove_links(
                         removable_linkids,
                         [],
                     )
@@ -849,7 +882,7 @@ def get_packages(shared_state, _cache=None, auto_start=True):
                 f"Moving <g>{len(packages_to_start)}</g> packages with <g>{len(links_to_start)}</g> links to download list"
             )
             try:
-                shared_state.get_device().linkgrabber.move_to_downloadlist(
+                get_active_device().linkgrabber.move_to_downloadlist(
                     links_to_start, packages_to_start
                 )
                 debug(

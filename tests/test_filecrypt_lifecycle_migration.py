@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Task 6A: Filecrypt lifecycle migration — proven state, atomicity, route gate."""
+"""Filecrypt lifecycle migration — proven state, atomicity, route gate."""
 
 import json
 import unittest
@@ -166,7 +166,7 @@ class MigrationTestCase(unittest.TestCase):
 
 
 class TestMigrateLegacyStateMatrix(MigrationTestCase):
-    """Task 6A method 1: proven state migration and v2-defer-without-old-row."""
+    """Proven state migration and v2-defer-without-old-row."""
 
     def test_migrate_legacy_state_matrix(self):
         # fmt: off
@@ -245,7 +245,7 @@ class TestMigrateLegacyStateMatrix(MigrationTestCase):
 
 
 class TestMigrationFailClosedAndAtomic(MigrationTestCase):
-    """Task 6A method 2: fail-closed, malformed old decision, write failure."""
+    """Fail-closed, malformed old decision, write failure."""
 
     def test_migration_fail_closed_and_atomic(self):
         sid = "b" * 32
@@ -343,7 +343,7 @@ class TestMigrationFailClosedAndAtomic(MigrationTestCase):
 
 
 class TestMigrationIdempotenceAndRouteGate(MigrationTestCase):
-    """Task 6A method 3: idempotence, route 503 gate."""
+    """Idempotence, route 503 gate."""
 
     def test_migration_idempotence_and_route_gate(self):
         sid = "c" * 32

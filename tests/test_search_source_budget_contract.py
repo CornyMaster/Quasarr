@@ -15,9 +15,9 @@ SOURCES_DIR = (
     pathlib.Path(__file__).resolve().parents[1] / "quasarr" / "search" / "sources"
 )
 
-# Task 6 owns the direct-request sources: they call requests.get/post with a
-# timeout constant and own no session, browser, or nested pool. Task 7 extends
-# this tuple with the remaining sources instead of forking the contract.
+# Direct-request sources: they call requests.get/post with a
+# timeout constant and own no session, browser, or nested pool. Any source
+# added later should extend this tuple instead of forking the contract.
 BUDGETED_MODULES = (
     "al",
     "at",
@@ -50,7 +50,7 @@ BUDGET_HELPER_MODULE = "quasarr.search.sources.helpers.budget"
 # Local names that already carry a budget-derived timeout and may therefore be
 # passed straight to `timeout=`. Names assigned from `clamp_timeout(...)` inside
 # the module are detected automatically; this map is for expressions the parser
-# cannot follow (e.g. a timeout handed in as a parameter). Task 7 adds its own
+# cannot follow (e.g. a timeout handed in as a parameter). Add new
 # entries here rather than relaxing the rule.
 ALLOWED_TIMEOUT_NAMES: dict[str, set[str]] = {}
 

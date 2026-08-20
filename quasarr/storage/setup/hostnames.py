@@ -31,6 +31,7 @@ from quasarr.providers.html_templates import (
     render_success,
 )
 from quasarr.providers.log import info
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.shared_state import extract_valid_hostname
 from quasarr.providers.utils import extract_allowed_keys, extract_kv_pairs
 from quasarr.providers.web_server import Server
@@ -127,29 +128,23 @@ def _escape_js_for_html_attr(s):
     )
 
 
-def hostname_form_html(shared_state, message, show_skip_management=False):
-    hostname_fields = """
-    <div class="hostname-entry">
-        <button type="button" class="{btn_class}" onclick="showStatusDetail(\'{id}\', \'{label}\', \'{status}\', \'{error_details_for_modal}\', \'{timestamp}\', \'{operation}\', \'{url}\', \'{user}\', \'{password}\', {supports_login}, {requires_flaresolverr})" title="{status_title}">
-            <span class="status-indicator" id="status-{id}" data-status="{status}">{status_emoji}</span>
-            {label}
-        </button>
-        <input type="text" id="{id}" name="{id}" placeholder="example.com" autocorrect="off" autocomplete="off" value="{value}">
-        {caps_html}
-    </div>
-    """
+def build_hostname_rows(shared_state):
+    """Pure per-source hostname data: no HTML/JS, no credential values.
 
-    skip_indicator = """
-    <div class="skip-indicator" id="skip-indicator-{id}" style="margin-top:-0.5rem; margin-bottom:0.75rem; padding:0.5rem; background:var(--code-bg, #f8f9fa); border-radius:0.25rem; font-size:0.875rem;">
-        <span style="color:#dc3545;">⚠️ Login skipped. Please click header to enable!</span>
-    </div>
+    Returns a list of dicts, one per ``shared_state.values["sites"]`` entry,
+    in that same source order. Each row carries status/details/timestamp,
+    login/credential *support* (never the actual user/password), FlareSolverr
+    requirement, language, categories, invite/account flags, and skip state -
+    everything the Classic hostname editor and the ``GET /api/hostnames``
+    projection both need. Secrets never enter this structure: credential
+    values are looked up separately by callers that need them, keyed off the
+    row's ``credential_section``.
     """
-
-    field_html = []
     hostnames = Config("Hostnames")
     skip_login_db = DataBase("skip_login")
     hostname_issues = get_all_hostname_issues()
     source_metadata = get_source_metadata()
+    login_required_hostnames = get_login_required_hostnames()
 
     from quasarr.storage.setup.radarr import is_radarr_configured
     from quasarr.storage.setup.sonarr import is_sonarr_configured
@@ -159,13 +154,13 @@ def hostname_form_html(shared_state, message, show_skip_management=False):
     sonarr_required = set(get_sonarr_required_hostnames())
     sonarr_ok = is_sonarr_configured(shared_state)
 
+    rows = []
     for label in shared_state.values["sites"]:
         field_id = label.lower()
         current_value = hostnames.get(field_id) or ""
 
         is_login_skipped = (
-            field_id in get_login_required_hostnames()
-            and skip_login_db.retrieve(field_id)
+            field_id in login_required_hostnames and skip_login_db.retrieve(field_id)
         )
         missing_arr_client = missing_arr_client_requirement(
             field_id, radarr_required, sonarr_required, radarr_ok, sonarr_ok
@@ -205,21 +200,111 @@ def hostname_form_html(shared_state, message, show_skip_management=False):
             status_title = "Working normally"
             error_details_for_modal = "Configured and working normally."
 
+        supports_login = field_id in login_required_hostnames
+        credential_section = None
+        if supports_login:
+            credential_section = (
+                "JUNKIES" if field_id in ["dj", "sj"] else field_id.upper()
+            )
+
+        meta = source_metadata.get(field_id, {})
+
+        rows.append(
+            {
+                "id": field_id,
+                "label": label,
+                "hostname": current_value,
+                "status": status,
+                "status_emoji": status_emoji,
+                "status_title": status_title,
+                "details": error_details_for_modal,
+                "timestamp": timestamp,
+                "operation": operation,
+                "missing_arr_client": missing_arr_client,
+                "supports_login": supports_login,
+                "credential_section": credential_section,
+                "skip_login": bool(is_login_skipped),
+                "language": meta.get("language"),
+                "categories": list(meta.get("categories", [])),
+                "invite_only": bool(meta.get("invite_only", False)),
+                "requires_login": bool(meta.get("requires_login", False)),
+                "requires_account": bool(meta.get("requires_account", False)),
+                "requires_flaresolverr": bool(meta.get("requires_flaresolverr", False)),
+            }
+        )
+
+    return rows
+
+
+def get_hostnames_data(shared_state):
+    """Secret-free JSON projection of build_hostname_rows() for the API.
+
+    Drops ``status_emoji``: Carbon's Hostnames status modal (carbon.js) is
+    this endpoint's only consumer, and Carbon markup never renders emoji.
+    ``build_hostname_rows()`` itself still carries the field unchanged -
+    ``hostname_form_html()`` (Classic) renders it directly from that shared
+    row dict, in-process, never through this projection.
+    """
+    response.content_type = "application/json"
+    rows = [
+        {key: value for key, value in row.items() if key != "status_emoji"}
+        for row in build_hostname_rows(shared_state)
+    ]
+    return {"hostnames": rows}
+
+
+def hostname_form_html(shared_state, message, show_skip_management=False):
+    hostname_fields = """
+    <div class="hostname-entry">
+        <button type="button" class="{btn_class}" onclick="showStatusDetail(\'{id}\', \'{label}\', \'{status}\', \'{error_details_for_modal}\', \'{timestamp}\', \'{operation}\', \'{url}\', \'{user}\', \'{password}\', {supports_login}, {requires_flaresolverr})" title="{status_title}">
+            <span class="status-indicator" id="status-{id}" data-status="{status}">{status_emoji}</span>
+            {label}
+        </button>
+        <input type="text" id="{id}" name="{id}" placeholder="example.com" autocorrect="off" autocomplete="off" value="{value}">
+        {caps_html}
+    </div>
+    """
+
+    skip_indicator = """
+    <div class="skip-indicator" id="skip-indicator-{id}" style="margin-top:-0.5rem; margin-bottom:0.75rem; padding:0.5rem; background:var(--code-bg, #f8f9fa); border-radius:0.25rem; font-size:0.875rem;">
+        <span style="color:#dc3545;">⚠️ Login skipped. Please click header to enable!</span>
+    </div>
+    """
+
+    field_html = []
+    rows = build_hostname_rows(shared_state)
+
+    for row in rows:
+        field_id = row["id"]
+        label = row["label"]
+        current_value = row["hostname"]
+        status = row["status"]
+        status_emoji = row["status_emoji"]
+        status_title = row["status_title"]
+        error_details_for_modal = row["details"]
+        timestamp = row["timestamp"]
+        operation = row["operation"]
+
         user = ""
         password = ""
-        supports_login = "false"
-        if field_id in get_login_required_hostnames():
-            supports_login = "true"
-            section = "JUNKIES" if field_id in ["dj", "sj"] else field_id.upper()
-            site_config = Config(section)
+        supports_login = "true" if row["supports_login"] else "false"
+        if row["supports_login"]:
+            site_config = Config(row["credential_section"])
             user = site_config.get("user") or ""
             password = site_config.get("password") or ""
 
         btn_class = "btn-secondary" if status == "unset" else "btn-primary"
 
-        meta = source_metadata.get(field_id, {})
+        meta = {
+            "language": row["language"],
+            "categories": row["categories"],
+            "invite_only": row["invite_only"],
+            "requires_login": row["requires_login"],
+            "requires_account": row["requires_account"],
+            "requires_flaresolverr": row["requires_flaresolverr"],
+        }
         caps_html = _capabilities_html(meta)
-        requires_flaresolverr = "true" if meta.get("requires_flaresolverr") else "false"
+        requires_flaresolverr = "true" if row["requires_flaresolverr"] else "false"
 
         field_html.append(
             hostname_fields.format(
@@ -244,8 +329,8 @@ def hostname_form_html(shared_state, message, show_skip_management=False):
             )
         )
 
-        if show_skip_management and field_id in get_login_required_hostnames():
-            if current_value and skip_login_db.retrieve(field_id):
+        if show_skip_management and row["supports_login"]:
+            if current_value and row["skip_login"]:
                 field_html.append(skip_indicator.format(id=field_id))
 
     hostname_form_content = "".join(field_html)
@@ -945,8 +1030,7 @@ def hostnames_config(shared_state):
     add_no_cache_headers(app)
     setup_auth(app)
 
-    @app.get("/")
-    def hostname_form():
+    def _classic_hostname_form():
         message = """<p>
           If you're having trouble setting this up, take a closer look at 
           <a href="https://github.com/rix1337/Quasarr?tab=readme-ov-file#quasarr" target="_blank" rel="noopener noreferrer">
@@ -957,9 +1041,32 @@ def hostnames_config(shared_state):
             "Set at least one valid hostname", hostname_form_html(shared_state, message)
         )
 
+    @app.get("/")
+    def hostname_form():
+        def carbon():
+            from quasarr.storage.setup.carbon import render_setup_hostnames
+
+            return render_setup_hostnames(shared_state)
+
+        return render_page(
+            "setup-hostnames",
+            carbon,
+            _classic_hostname_form,
+            shared_state=shared_state,
+        )
+
     @app.post("/api/hostnames")
     def set_hostnames():
         return save_hostnames(shared_state)
+
+    @app.get("/api/hostnames")
+    def get_hostnames_route():
+        # Carbon's Details panel (bootstrapCarbonSetupFlows) fetches this to
+        # read a row's uncontrolled `details` text fresh, never rendering it
+        # into the initial page HTML - see the module docstring in
+        # quasarr/storage/setup/carbon.py. Mirrors the main app's identical
+        # GET /api/hostnames route (quasarr/api/config/__init__.py).
+        return get_hostnames_data(shared_state)
 
     @app.post("/api/hostnames/import-url")
     def import_hostnames_route():
@@ -998,8 +1105,7 @@ def hostname_credentials_config(shared_state, shorthand, domain):
     def set_flaresolverr_inline():
         return save_flaresolverr_url(shared_state, is_setup=False)
 
-    @app.get("/")
-    def credentials_form():
+    def _classic_credentials_form():
         flaresolverr_url = Config("FlareSolverr").get("url")
         source_meta = get_source_metadata().get(shorthand.lower(), {})
         is_missing_flaresolverr = (
@@ -1123,6 +1229,22 @@ def hostname_credentials_config(shared_state, shorthand, domain):
         """
 
         return render_form(f"Set User and Password for {shorthand}", form_html)
+
+    @app.get("/")
+    def credentials_form():
+        def carbon():
+            from quasarr.storage.setup.carbon import (
+                render_setup_hostname_credentials,
+            )
+
+            return render_setup_hostname_credentials(shared_state, shorthand, domain)
+
+        return render_page(
+            "setup-hostname-credentials",
+            carbon,
+            _classic_credentials_form,
+            shared_state=shared_state,
+        )
 
     @app.get("/skip-success")
     def skip_success():

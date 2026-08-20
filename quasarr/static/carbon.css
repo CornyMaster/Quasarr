@@ -1,0 +1,1373 @@
+@font-face {
+	font-family: "IBM Plex Sans";
+	src: url("/static/fonts/IBMPlexSans-Regular-Latin.woff2") format("woff2");
+	font-weight: 400;
+	font-style: normal;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: "IBM Plex Sans";
+	src: url("/static/fonts/IBMPlexSans-Medium-Latin.woff2") format("woff2");
+	font-weight: 500;
+	font-style: normal;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: "IBM Plex Sans";
+	src: url("/static/fonts/IBMPlexSans-SemiBold-Latin.woff2") format("woff2");
+	font-weight: 600;
+	font-style: normal;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: "IBM Plex Mono";
+	src: url("/static/fonts/IBMPlexMono-Regular-Latin.woff2") format("woff2");
+	font-weight: 400;
+	font-style: normal;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: "IBM Plex Mono";
+	src: url("/static/fonts/IBMPlexMono-Medium-Latin.woff2") format("woff2");
+	font-weight: 500;
+	font-style: normal;
+	font-display: swap;
+}
+
+:root,
+[data-carbon-theme="light"] {
+	--cds-bg: #f4f4f4;
+	--cds-layer: #ffffff;
+	--cds-field: #f4f4f4;
+	--cds-border-subtle: #e0e0e0;
+	--cds-border-strong: #8d8d8d;
+	--cds-text: #161616;
+	--cds-text-secondary: #525252;
+	--cds-helper: #6f6f6f;
+	--cds-link: #0f62fe;
+	--cds-interactive: #0f62fe;
+	--cds-hover: #e8e8e8;
+	--cds-table-header: #e0e0e0;
+	--cds-button-primary: #0f62fe;
+	--cds-button-primary-hover: #0353e9;
+	--cds-button-secondary: #393939;
+	--cds-button-secondary-hover: #4c4c4c;
+	--cds-danger-hover-bg: #fff1f1;
+	--cds-notification-info-bg: #edf5ff;
+	--cds-notification-warning-bg: #fff8e1;
+	--cds-notification-error-bg: #fff1f1;
+	--cds-notification-success-bg: #defbe6;
+
+	--cds-support-success: #24a148;
+	--cds-support-warning: #f1c21b;
+	--cds-support-error: #da1e28;
+	--cds-support-info: #0043ce;
+
+	--cds-tag-gray-bg: #e0e0e0;
+	--cds-tag-gray-text: #393939;
+	--cds-tag-blue-bg: #d0e2ff;
+	--cds-tag-blue-text: #0043ce;
+	--cds-tag-green-bg: #a7f0ba;
+	--cds-tag-green-text: #0e6027;
+	--cds-tag-red-bg: #ffd7d9;
+	--cds-tag-red-text: #a2191f;
+	--cds-tag-purple-bg: #e8daff;
+	--cds-tag-purple-text: #6929c4;
+	--cds-tag-teal-bg: #9ef0f0;
+	--cds-tag-teal-text: #005d5d;
+}
+
+[data-carbon-theme="dark"] {
+	--cds-bg: #161616;
+	--cds-layer: #262626;
+	--cds-field: #393939;
+	--cds-border-subtle: #393939;
+	--cds-border-strong: #6f6f6f;
+	--cds-text: #f4f4f4;
+	--cds-text-secondary: #c6c6c6;
+	--cds-helper: #8d8d8d;
+	--cds-link: #78a9ff;
+	--cds-interactive: #4589ff;
+	--cds-hover: #333333;
+	--cds-table-header: #393939;
+	--cds-button-primary: #0f62fe;
+	--cds-button-primary-hover: #0353e9;
+	--cds-button-secondary: #393939;
+	--cds-button-secondary-hover: #4c4c4c;
+	--cds-danger-hover-bg: #520408;
+	--cds-notification-info-bg: #001d6c;
+	--cds-notification-warning-bg: #3d3a00;
+	--cds-notification-error-bg: #520408;
+	--cds-notification-success-bg: #022d0d;
+
+	--cds-support-success: #42be65;
+	--cds-support-warning: #f1c21b;
+	--cds-support-error: #fa4d56;
+	--cds-support-info: #4589ff;
+
+	--cds-tag-gray-bg: #393939;
+	--cds-tag-gray-text: #e0e0e0;
+	--cds-tag-blue-bg: #0043ce;
+	--cds-tag-blue-text: #d0e2ff;
+	--cds-tag-green-bg: #0e6027;
+	--cds-tag-green-text: #a7f0ba;
+	--cds-tag-red-bg: #a2191f;
+	--cds-tag-red-text: #ffd7d9;
+	--cds-tag-purple-bg: #6929c4;
+	--cds-tag-purple-text: #e8daff;
+	--cds-tag-teal-bg: #005d5d;
+	--cds-tag-teal-text: #9ef0f0;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+/* Restore the UA-origin `[hidden] { display: none }` rule wherever an
+   author-origin `display` declaration (e.g. `.cds-btn { display:
+   inline-flex }`) would otherwise beat it regardless of selector
+   specificity. Toggling the `hidden` attribute via JS (`el.hidden =
+   true/false`) removes the attribute entirely when false, so this rule
+   never blocks a later reveal. */
+[hidden] {
+	display: none !important;
+}
+
+html,
+body {
+	margin: 0;
+	padding: 0;
+	min-height: 100%;
+	background: var(--cds-bg);
+	color: var(--cds-text);
+	font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+	font-size: 14px;
+	line-height: 1.43;
+}
+
+a {
+	color: var(--cds-link);
+}
+
+:focus-visible {
+	outline: 2px solid #0f62fe;
+	outline-offset: -2px;
+}
+
+.cds-skip-link {
+	position: fixed;
+	left: 8px;
+	top: -40px;
+	z-index: 2000;
+	padding: 8px 12px;
+	background: var(--cds-layer);
+	border: 1px solid var(--cds-border-strong);
+}
+
+.cds-skip-link:focus {
+	top: 8px;
+}
+
+.cds-shell {
+	min-height: 100vh;
+	padding-top: 48px;
+}
+
+.cds-header {
+	position: fixed;
+	top: 0;
+	left: 0;
+	right: 0;
+	height: 48px;
+	background: #161616;
+	color: #f4f4f4;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 0 12px;
+	z-index: 1100;
+	border-bottom: 1px solid #393939;
+}
+
+.cds-header__brand,
+.cds-header__controls {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.cds-header__status {
+	font-size: 12px;
+}
+
+.cds-captcha-count strong {
+	font-family: "IBM Plex Mono", monospace;
+}
+
+.cds-product {
+	font-weight: 600;
+	letter-spacing: 0.32px;
+}
+
+.cds-icon {
+	width: 20px;
+	height: 20px;
+	display: inline-block;
+}
+
+.cds-icon--sm {
+	width: 16px;
+	height: 16px;
+}
+
+.cds-icon-button {
+	position: relative;
+	min-width: 40px;
+	min-height: 40px;
+	padding: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border: 0;
+	background: transparent;
+	color: currentColor;
+	text-decoration: none;
+	cursor: pointer;
+}
+
+.cds-icon-button:hover {
+	background: rgba(255, 255, 255, 0.12);
+}
+
+.cds-header [data-action="nav-open"] {
+	display: none;
+}
+
+.cds-theme-icon {
+	display: inline-flex;
+}
+
+[data-carbon-theme="light"] .cds-theme-icon--light,
+[data-carbon-theme="dark"] .cds-theme-icon--dark {
+	display: none;
+}
+
+.cds-header__badge {
+	position: absolute;
+	top: 5px;
+	right: 4px;
+	min-width: 16px;
+	height: 16px;
+	padding: 0 4px;
+	border-radius: 8px;
+	background: #0f62fe;
+	color: #ffffff;
+	font-family: "IBM Plex Mono", monospace;
+	font-size: 10px;
+	line-height: 16px;
+	text-align: center;
+}
+
+.cds-nav {
+	position: fixed;
+	left: 0;
+	top: 48px;
+	bottom: 0;
+	width: 256px;
+	background: var(--cds-layer);
+	border-right: 1px solid var(--cds-border-subtle);
+	display: flex;
+	flex-direction: column;
+	z-index: 1000;
+}
+
+.cds-nav__header {
+	display: none;
+}
+
+.cds-nav__list {
+	list-style: none;
+	margin: 0;
+	padding: 12px 0;
+}
+
+.cds-nav__link {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	color: var(--cds-text);
+	text-decoration: none;
+	min-height: 44px;
+	padding: 0 16px;
+	border-left: 3px solid transparent;
+}
+
+.cds-nav__link[aria-current="page"] {
+	border-left-color: #0f62fe;
+	background: var(--cds-hover);
+	font-weight: 500;
+}
+
+.cds-nav__footer {
+	margin-top: auto;
+	padding: 16px;
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-classic-link {
+	display: inline-flex;
+	align-items: center;
+	min-height: 44px;
+}
+
+.cds-version {
+	margin: 8px 0 0;
+	color: var(--cds-helper);
+	font-family: "IBM Plex Mono", monospace;
+}
+
+.cds-main {
+	margin-left: 256px;
+	padding: 32px;
+}
+
+.cds-main__inner {
+	max-width: 1280px;
+}
+
+.cds-eyebrow,
+.cds-subtitle {
+	color: var(--cds-helper);
+	margin-bottom: 8px;
+}
+
+.cds-page-header__eyebrow {
+	font-size: 12px;
+	letter-spacing: 0.32px;
+	text-transform: uppercase;
+	margin: 0;
+	color: var(--cds-helper);
+}
+
+.cds-page-header__title {
+	margin: 4px 0 0;
+	font-size: 28px;
+	font-weight: 400;
+}
+
+.cds-page-header__subtitle {
+	margin: 8px 0 0;
+	color: var(--cds-text-secondary);
+}
+
+.cds-btn {
+	min-height: 40px;
+	padding: 0 16px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: flex-start;
+	gap: 8px;
+	border: 1px solid transparent;
+	border-radius: 0;
+	font: inherit;
+	font-weight: 500;
+	text-align: left;
+	text-decoration: none;
+	cursor: pointer;
+}
+
+.cds-btn--primary {
+	background: var(--cds-button-primary);
+	color: #ffffff;
+}
+
+.cds-btn--primary:hover {
+	background: var(--cds-button-primary-hover);
+}
+
+.cds-btn--secondary {
+	background: var(--cds-button-secondary);
+	color: #ffffff;
+}
+
+.cds-btn--secondary:hover {
+	background: var(--cds-button-secondary-hover);
+}
+
+.cds-btn--tertiary {
+	border-color: var(--cds-link);
+	background: transparent;
+	color: var(--cds-link);
+}
+
+.cds-btn--tertiary:hover {
+	background: var(--cds-interactive);
+	color: #ffffff;
+}
+
+.cds-btn--ghost {
+	background: transparent;
+	color: var(--cds-link);
+}
+
+.cds-btn--ghost:hover {
+	background: var(--cds-hover);
+}
+
+.cds-btn--danger-ghost {
+	background: transparent;
+	color: var(--cds-support-error);
+}
+
+.cds-btn--danger-ghost:hover {
+	background: var(--cds-danger-hover-bg);
+}
+
+.cds-btn:disabled,
+.cds-btn[aria-disabled="true"] {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.cds-tile {
+	background: var(--cds-layer);
+	border: 1px solid var(--cds-border-subtle);
+	padding: 16px;
+	margin-top: 16px;
+}
+
+.cds-tile__heading {
+	margin: 0 0 12px;
+	font-size: 16px;
+	font-weight: 500;
+}
+
+.cds-tile--is-compact {
+	padding: 12px;
+}
+
+.cds-tile--is-wide {
+	grid-column: 1 / -1;
+}
+
+.cds-tile--is-metric {
+	font-family: "IBM Plex Mono", monospace;
+}
+
+.cds-kpi-row {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 16px;
+	margin-top: 16px;
+}
+
+.cds-kpi-row .cds-tile {
+	margin-top: 0;
+}
+
+.cds-tag {
+	display: inline-flex;
+	align-items: center;
+	border-radius: 10px;
+	min-height: 20px;
+	padding: 0 8px;
+	font-size: 12px;
+	line-height: 20px;
+}
+
+.cds-tag--gray { background: var(--cds-tag-gray-bg); color: var(--cds-tag-gray-text); }
+.cds-tag--blue { background: var(--cds-tag-blue-bg); color: var(--cds-tag-blue-text); }
+.cds-tag--green { background: var(--cds-tag-green-bg); color: var(--cds-tag-green-text); }
+.cds-tag--red { background: var(--cds-tag-red-bg); color: var(--cds-tag-red-text); }
+.cds-tag--purple { background: var(--cds-tag-purple-bg); color: var(--cds-tag-purple-text); }
+.cds-tag--teal { background: var(--cds-tag-teal-bg); color: var(--cds-tag-teal-text); }
+
+.cds-field__label {
+	display: block;
+	font-size: 12px;
+	letter-spacing: 0.32px;
+	margin-bottom: 8px;
+}
+
+.cds-field {
+	margin-top: 16px;
+}
+
+.cds-field__input,
+.cds-field__select,
+.cds-field__textarea {
+	width: 100%;
+	min-height: 40px;
+	border: 0;
+	border-bottom: 1px solid var(--cds-border-strong);
+	background: var(--cds-field);
+	color: var(--cds-text);
+	font: inherit;
+	padding: 0 12px;
+}
+
+.cds-field__textarea {
+	padding-block: 10px;
+	resize: vertical;
+}
+
+.cds-field__help,
+.cds-toggle__help {
+	margin: 8px 0 0;
+	color: var(--cds-helper);
+}
+
+.cds-toggle {
+	position: relative;
+	margin-top: 16px;
+}
+
+.cds-toggle__input {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	overflow: hidden;
+	opacity: 0;
+}
+
+.cds-toggle__label {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	width: fit-content;
+	max-width: 100%;
+	min-height: 44px;
+	cursor: pointer;
+}
+
+.cds-toggle__label-text {
+	min-width: 0;
+}
+
+.cds-toggle__control {
+	flex: 0 0 48px;
+	width: 48px;
+	height: 24px;
+	border-radius: 12px;
+	background: var(--cds-border-strong);
+	position: relative;
+}
+
+.cds-toggle--compact .cds-toggle__control {
+	flex-basis: 32px;
+	width: 32px;
+	height: 16px;
+	border-radius: 8px;
+}
+
+.cds-toggle__control::after {
+	content: "";
+	width: 20px;
+	height: 20px;
+	border-radius: 50%;
+	background: #ffffff;
+	position: absolute;
+	left: 2px;
+	top: 2px;
+}
+
+.cds-toggle--compact .cds-toggle__control::after {
+	width: 12px;
+	height: 12px;
+}
+
+.cds-toggle__input:checked + .cds-toggle__label .cds-toggle__control {
+	background: var(--cds-support-success);
+}
+
+.cds-toggle__input:checked + .cds-toggle__label .cds-toggle__control::after {
+	transform: translateX(24px);
+}
+
+.cds-toggle--compact .cds-toggle__input:checked + .cds-toggle__label .cds-toggle__control::after {
+	transform: translateX(16px);
+}
+
+.cds-toggle__input:focus-visible + .cds-toggle__label .cds-toggle__control {
+	outline: 2px solid #0f62fe;
+	outline-offset: 2px;
+}
+
+/* Groups two or more related toggles on one row (e.g. a notification case's
+   "enabled" and "silent" switches) - each .cds-toggle's own top margin is
+   reset since the row wrapper already spaces itself from the field above. */
+.cds-toggle-row {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 16px;
+	margin-top: 12px;
+}
+
+.cds-toggle-row .cds-toggle {
+	margin-top: 0;
+}
+
+.cds-table-wrap {
+	overflow-x: auto;
+}
+
+.cds-table {
+	width: 100%;
+	border-collapse: collapse;
+	background: var(--cds-layer);
+}
+
+.cds-table caption {
+	text-align: left;
+	padding: 12px 0;
+	color: var(--cds-helper);
+}
+
+.cds-table thead th {
+	background: var(--cds-table-header);
+	height: 40px;
+	padding: 10px 12px;
+	text-align: left;
+}
+
+.cds-table tbody td {
+	height: 48px;
+	padding: 12px;
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-table tbody tr:hover {
+	background: var(--cds-hover);
+}
+
+.cds-table .is-num,
+.cds-table .is-right {
+	text-align: right;
+}
+
+.cds-table .is-center,
+.cds-table .is-status {
+	text-align: center;
+}
+
+.cds-table .is-mono {
+	font-family: "IBM Plex Mono", monospace;
+}
+
+.cds-captcha-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+	margin-top: 16px;
+}
+
+.cds-manual-submit-body {
+	margin-top: 16px;
+}
+
+[data-manual-submit] > summary {
+	cursor: pointer;
+}
+
+.cds-notification {
+	border-left: 3px solid transparent;
+	padding: 12px;
+	margin: 16px 0;
+}
+
+.cds-notification__title {
+	margin: 0;
+	font-size: 16px;
+	font-weight: 600;
+}
+
+.cds-notification__message {
+	margin: 4px 0 0;
+}
+
+.cds-notification__actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 12px;
+}
+
+.cds-notification--info {
+	border-left-color: var(--cds-support-info);
+	background: var(--cds-notification-info-bg);
+}
+
+.cds-notification--warning {
+	border-left-color: var(--cds-support-warning);
+	background: var(--cds-notification-warning-bg);
+}
+
+.cds-notification--error {
+	border-left-color: var(--cds-support-error);
+	background: var(--cds-notification-error-bg);
+}
+
+.cds-notification--success {
+	border-left-color: var(--cds-support-success);
+	background: var(--cds-notification-success-bg);
+}
+
+.cds-progress {
+	height: 4px;
+	width: 100%;
+	background: var(--cds-border-subtle);
+}
+
+.cds-progress > span {
+	display: block;
+	height: 4px;
+	background: var(--cds-interactive);
+}
+
+.cds-dot {
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+	display: inline-block;
+}
+
+.cds-segmented {
+	border: 0;
+	margin: 16px 0 0;
+	padding: 0;
+}
+
+.cds-segmented__legend {
+	display: block;
+	font-size: 12px;
+	letter-spacing: 0.32px;
+	margin-bottom: 8px;
+	padding: 0;
+	color: var(--cds-helper);
+}
+
+.cds-segmented__group {
+	display: inline-flex;
+	border: 1px solid var(--cds-border-strong);
+	max-width: 100%;
+	flex-wrap: wrap;
+}
+
+.cds-segmented__option {
+	position: relative;
+}
+
+.cds-segmented__input {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	overflow: hidden;
+	opacity: 0;
+}
+
+.cds-segmented__label {
+	display: flex;
+	align-items: center;
+	min-height: 40px;
+	padding: 0 16px;
+	cursor: pointer;
+	border-right: 1px solid var(--cds-border-strong);
+}
+
+.cds-segmented__option:last-child .cds-segmented__label {
+	border-right: 0;
+}
+
+.cds-segmented__input:checked + .cds-segmented__label {
+	background: var(--cds-button-primary);
+	color: #ffffff;
+}
+
+.cds-segmented__input:focus-visible + .cds-segmented__label {
+	outline: 2px solid #0f62fe;
+	outline-offset: -2px;
+}
+
+.cds-queue-preview {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+
+.cds-queue-preview li {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: 8px 0;
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-queue-preview li:first-child {
+	border-top: 0;
+}
+
+.cds-queue-preview__meta {
+	color: var(--cds-helper);
+	font-family: "IBM Plex Mono", monospace;
+	font-size: 12px;
+}
+
+.cds-modal {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.55);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	z-index: 1200;
+}
+
+.cds-modal[hidden] {
+	display: none;
+}
+
+.cds-modal__surface {
+	width: min(720px, calc(100vw - 32px));
+	/* calc(100vh - 32px) is the fallback for browsers without dvh support;
+	   the dvh line below overrides it where supported so a mobile
+	   browser's dynamic address-bar/toolbar chrome (which vh does not
+	   track) can never hide the surface's own Save/Cancel actions. */
+	max-height: calc(100vh - 32px);
+	max-height: calc(100dvh - 32px);
+	background: var(--cds-layer);
+	border: 1px solid var(--cds-border-subtle);
+	display: flex;
+	flex-direction: column;
+}
+
+.cds-modal__header,
+.cds-modal__actions {
+	flex: 0 0 auto;
+	padding: 16px;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.cds-modal__body {
+	padding: 0 16px 16px;
+	overflow-y: auto;
+	min-height: 0;
+	/* A scrolled-to-the-end mirror list must not hand the scroll gesture
+	   off to the page behind the backdrop. */
+	overscroll-behavior: contain;
+}
+
+.cds-toast-region {
+	position: fixed;
+	right: 16px;
+	bottom: 16px;
+	width: min(360px, calc(100vw - 32px));
+	z-index: 1300;
+}
+
+.cds-toast {
+	margin-top: 8px;
+	background: var(--cds-layer);
+	border: 1px solid var(--cds-border-subtle);
+	padding: 10px 12px;
+}
+
+.cds-nav-backdrop {
+	display: none;
+}
+
+.cds-nav-backdrop[hidden] {
+	display: none;
+}
+
+@media (max-width: 1056px) {
+	.cds-nav {
+		transform: translateX(-100%);
+		visibility: hidden;
+		transition:
+			transform 120ms ease-in-out,
+			visibility 0s linear 120ms;
+	}
+
+	.cds-nav.is-open {
+		transform: translateX(0);
+		visibility: visible;
+		transition-delay: 0s;
+	}
+
+	.cds-header [data-action="nav-open"] {
+		display: inline-flex;
+	}
+
+	.cds-nav__header {
+		display: flex;
+		justify-content: flex-end;
+		padding: 8px;
+	}
+
+	.cds-nav-backdrop {
+		display: block;
+		position: fixed;
+		inset: 48px 0 0 0;
+		background: rgba(0, 0, 0, 0.45);
+		z-index: 900;
+	}
+
+	.cds-main {
+		margin-left: 0;
+		padding: 24px;
+	}
+
+	.cds-kpi-row {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+
+@media (max-width: 672px) {
+	.cds-main {
+		padding: 16px;
+	}
+
+	.cds-kpi-row {
+		grid-template-columns: repeat(1, minmax(0, 1fr));
+	}
+
+	.cds-header {
+		padding-inline: 8px;
+	}
+
+	.cds-header__status {
+		display: none;
+	}
+
+	.cds-header__controls {
+		gap: 0;
+	}
+
+	.cds-icon-button {
+		min-width: 44px;
+		min-height: 44px;
+	}
+
+	.cds-btn,
+	.cds-field__input,
+	.cds-field__select {
+		min-height: 44px;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		transition: none !important;
+		animation: none !important;
+	}
+}
+
+/* ---- Hostnames ---- */
+
+.cds-hostname-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px;
+	align-items: flex-start;
+	padding: 16px 0;
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-hostname-row:first-child {
+	border-top: 0;
+	padding-top: 0;
+}
+
+.cds-hostname-row__status {
+	flex: 0 0 auto;
+	padding-top: 2px;
+}
+
+.cds-hostname-row__body {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.cds-hostname-row__heading {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 4px;
+}
+
+.cds-hostname-row__label {
+	font-weight: 600;
+}
+
+.cds-hostname-row__caps {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+}
+
+.cds-hostname-row__actions {
+	flex: 0 0 auto;
+}
+
+.cds-hostname-row__skip-banner {
+	margin: 8px 0 0;
+	color: var(--cds-text);
+	background: var(--cds-notification-warning-bg);
+	border-left: 3px solid var(--cds-support-warning);
+	padding: 4px 8px;
+	font-size: 12px;
+}
+
+.cds-hostname-credentials {
+	/* On the setup Hostnames page this is a flex sibling of
+	   .cds-hostname-row__status/__body/__actions inside .cds-hostname-row
+	   (display:flex) - without flex-basis:100% it competed for horizontal
+	   space like a fourth column and was squeezed to ~150-190px wide
+	   instead of spanning its own full-width line below the row. Harmless
+	   everywhere else this class appears (the main Hostnames page's
+	   equivalent panel lives inside #cds-modal-body, not a flex row, where
+	   flex-basis has no effect). */
+	flex-basis: 100%;
+	margin-top: 16px;
+	border-top: 1px solid var(--cds-border-subtle);
+	padding-top: 16px;
+}
+
+.cds-hostname-credentials__warning {
+	background: var(--cds-notification-warning-bg);
+	padding: 8px 12px;
+	font-size: 12px;
+	margin: 0 0 12px;
+}
+
+/* ---- Categories ---- */
+
+.cds-category-row {
+	display: flex;
+	gap: 12px;
+	align-items: center;
+	padding: 12px 0;
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-category-row:first-child {
+	border-top: 0;
+	padding-top: 0;
+}
+
+.cds-category-row__body {
+	flex: 1 1 auto;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.cds-category-row__name {
+	font-weight: 600;
+}
+
+.cds-category-row__detail {
+	color: var(--cds-helper);
+	font-size: 12px;
+}
+
+.cds-category-row__pills {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+}
+
+.cds-category-row__actions {
+	flex: 0 0 auto;
+	display: flex;
+	gap: 8px;
+}
+
+.cds-category-add-row {
+	display: flex;
+	gap: 12px;
+	align-items: flex-end;
+	margin-top: 16px;
+	flex-wrap: wrap;
+}
+
+.cds-category-add-row .cds-field {
+	flex: 1 1 220px;
+	margin-top: 0;
+}
+
+.cds-mirror-sortable {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin-top: 16px;
+}
+
+.cds-mirror-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 8px;
+	border: 1px solid var(--cds-border-subtle);
+	color: var(--cds-helper);
+}
+
+.cds-mirror-row.is-selected {
+	background: var(--cds-hover);
+	color: var(--cds-text);
+	border-color: var(--cds-border-strong);
+}
+
+.cds-mirror-row__rank {
+	flex: 0 0 auto;
+	width: 20px;
+	text-align: center;
+	font-family: "IBM Plex Mono", monospace;
+	font-size: 12px;
+}
+
+.cds-mirror-row__label {
+	flex: 1 1 auto;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-height: 40px;
+	cursor: pointer;
+}
+
+.cds-mirror-row__checkbox {
+	width: 16px;
+	height: 16px;
+	flex: 0 0 auto;
+}
+
+.cds-mirror-row__move {
+	flex: 0 0 auto;
+	display: flex;
+	gap: 4px;
+	visibility: hidden;
+}
+
+.cds-mirror-row.is-selected .cds-mirror-row__move {
+	visibility: visible;
+}
+
+/* Same wrong-surface mismatch .cds-row-actions fixes above: the header's
+   .cds-icon-button is sized/hover-tinted for the dark header bar, not a
+   light modal row - scope size/hover here instead of touching the header
+   rule itself. */
+.cds-mirror-row__move .cds-icon-button {
+	min-width: 32px;
+	min-height: 32px;
+}
+
+.cds-mirror-row__move .cds-icon-button:hover {
+	background: var(--cds-hover);
+}
+
+.cds-source-pills {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 12px;
+}
+
+.cds-source-pill {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 6px 12px;
+	border: 1px solid var(--cds-border-strong);
+	cursor: pointer;
+	font-size: 12px;
+}
+
+.cds-source-pill.is-selected {
+	background: var(--cds-button-primary);
+	color: #ffffff;
+	border-color: var(--cds-button-primary);
+}
+
+.cds-source-pill__checkbox {
+	width: 14px;
+	height: 14px;
+}
+
+@media (max-width: 672px) {
+	.cds-hostname-row,
+	.cds-category-row {
+		flex-direction: column;
+		align-items: stretch;
+	}
+
+	.cds-hostname-row__actions {
+		display: flex;
+	}
+}
+
+/* Standalone auth/system pages (login, success, failure, reconnect, JD
+   disconnected, HTTP errors): no side nav or header chrome, just a
+   centered card - these are shown to visitors before or outside an
+   authenticated dashboard session. */
+.cds-status-main {
+	min-height: 100vh;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 32px 16px;
+	box-sizing: border-box;
+}
+
+.cds-status-card {
+	width: 100%;
+	max-width: 440px;
+}
+
+/* render_carbon_simple_page(..., wide=True) - used only by the eight
+   setup-server pages, whose forms (the Hostnames page's per-row table with
+   inline Details/credentials panels in particular) need real width. Login
+   and the status/error pages keep the narrow 440px card unchanged. */
+.cds-status-card--wide {
+	max-width: 760px;
+}
+
+.cds-status-card .cds-page-header {
+	text-align: center;
+}
+
+.cds-status-card .cds-btn {
+	margin-top: 16px;
+}
+
+.cds-status-footer {
+	margin-top: 16px;
+	text-align: center;
+	color: var(--cds-helper);
+	font-size: 12px;
+}
+
+.cds-status-footer .cds-version {
+	margin: 0 0 4px;
+	font-family: "IBM Plex Mono", monospace;
+}
+
+.cds-status-footer .cds-classic-link {
+	color: var(--cds-helper);
+}
+
+/* Downloads page: search toolbar, bulk-selection header, and a
+   sticky first data column for the deferred table on narrow viewports. */
+
+.cds-toolbar {
+	margin-top: 16px;
+}
+
+.cds-field--search {
+	max-width: 320px;
+}
+
+.cds-section-header {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 12px;
+}
+
+.cds-section-header .cds-tile__heading {
+	margin: 0;
+}
+
+.cds-bulk-toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+}
+
+.cds-btn--compact {
+	min-height: 32px;
+	padding: 0 12px;
+}
+
+.cds-table--sticky-col th:first-child,
+.cds-table--sticky-col td:first-child {
+	width: 40px;
+}
+
+@media (max-width: 672px) {
+	/* Both pinned columns must scroll together: the checkbox column
+	   (first-child) is only SIZED at 40px above, at every viewport - it
+	   never gets pinned without this rule, so it used to scroll away while
+	   the release column stayed stuck at left: 40px, leaving that 40px gap
+	   unpinned underneath it. */
+	.cds-table--sticky-col th:first-child,
+	.cds-table--sticky-col td:first-child {
+		position: sticky;
+		left: 0;
+		background: var(--cds-layer);
+		z-index: 1;
+	}
+
+	.cds-table--sticky-col th:nth-child(2),
+	.cds-table--sticky-col td:nth-child(2) {
+		position: sticky;
+		left: 40px;
+		background: var(--cds-layer);
+		z-index: 1;
+	}
+}
+
+/* Row action icon buttons: compact inside a table cell (the header's
+   .cds-icon-button is sized/hover-tinted for the dark header bar, not a
+   light table row), with a danger color variant for destructive actions. */
+
+.cds-row-actions {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	flex-wrap: wrap;
+}
+
+.cds-row-actions .cds-icon-button {
+	min-width: 32px;
+	min-height: 32px;
+}
+
+.cds-row-actions .cds-icon-button:hover {
+	background: var(--cds-hover);
+}
+
+.cds-icon-button--danger {
+	color: var(--cds-support-error);
+}
+
+@media (max-width: 672px) {
+	.cds-row-actions .cds-icon-button {
+		min-width: 44px;
+		min-height: 44px;
+	}
+
+	.cds-mirror-row__move .cds-icon-button {
+		min-width: 44px;
+		min-height: 44px;
+	}
+}

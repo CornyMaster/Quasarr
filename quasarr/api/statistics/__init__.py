@@ -6,12 +6,12 @@ from html import escape
 
 import quasarr.providers.html_images as images
 from quasarr.providers.html_templates import render_button, render_centered_html
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.statistics import StatsHelper
 
 
 def setup_statistics(app, shared_state):
-    @app.get("/statistics")
-    def statistics():
+    def _classic_statistics():
         stats_helper = StatsHelper(shared_state)
         stats = stats_helper.get_stats()
         cohort_state = escape(str(stats["crypter_sweep_state"]))
@@ -297,3 +297,17 @@ def setup_statistics(app, shared_state):
         """
 
         return render_centered_html(stats_html)
+
+    @app.get("/statistics")
+    def statistics():
+        def carbon():
+            from quasarr.api.statistics.carbon import render_statistics
+
+            return render_statistics(shared_state)
+
+        return render_page(
+            "statistics",
+            carbon,
+            _classic_statistics,
+            shared_state=shared_state,
+        )

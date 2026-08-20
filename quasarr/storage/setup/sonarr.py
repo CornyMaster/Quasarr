@@ -7,6 +7,7 @@ from bottle import Bottle, request, response
 import quasarr.providers.web_server
 from quasarr.providers.html_templates import render_button, render_form
 from quasarr.providers.log import debug, info
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.sonarr_api import (
     SonarrAPIClient,
     get_client,
@@ -272,11 +273,24 @@ def sonarr_config(shared_state, required_sites):
     add_no_cache_headers(app)
     setup_auth(app)
 
-    @app.get("/")
-    def sonarr_form():
+    def _classic_sonarr_form():
         return render_form(
             "Set Sonarr URL and API Key",
             _sonarr_setup_form_html(required_sites),
+        )
+
+    @app.get("/")
+    def sonarr_form():
+        def carbon():
+            from quasarr.storage.setup.carbon import render_setup_sonarr
+
+            config = Config("Sonarr")
+            return render_setup_sonarr(
+                config.get("url") or "", config.get("api_key") or "", required_sites
+            )
+
+        return render_page(
+            "setup-sonarr", carbon, _classic_sonarr_form, shared_state=shared_state
         )
 
     @app.post("/api/sonarr/save")

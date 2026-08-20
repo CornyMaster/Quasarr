@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 
 import json
+import os
 import sys
 import unittest
 from base64 import urlsafe_b64encode
 from io import BytesIO
+from unittest import mock
 from unittest.mock import patch
 from urllib.parse import quote
 
@@ -56,6 +58,18 @@ def encode_data_param(package):
 
 
 class CaptchaUserscriptRoutingTests(unittest.TestCase):
+    """Legacy CAPTCHA userscript routing/HTML contract, predates Carbon UI.
+
+    Pin Classic explicitly: these tests assert the literal Classic-era
+    userscript page body, a contract independent of which UI mode
+    `DEFAULT_UI` happens to select.
+    """
+
+    def setUp(self):
+        env_patch = mock.patch.dict(os.environ, {"QUASARR_UI": "classic"})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+
     def _request(self, app, path, query=""):
         environ = {
             "REQUEST_METHOD": "GET",
@@ -220,6 +234,33 @@ class CaptchaUserscriptRoutingTests(unittest.TestCase):
         self.assertEqual("application/javascript", headers["Content-Type"])
         self.assertIn("*://source.invalid/*", body)
         self.assertNotIn("{he}", body)
+
+    def test_package_selector_with_two_packages_classifies_he_link_without_500(self):
+        """Regression: `render_package_selector`'s own is_he_link/
+        is_junkies_link call sites must stay arity-matched with the shared
+        module-level functions - a stale one-argument call here (left
+        behind when a second, independent duplicate of the classification
+        closures was hoisted) 500'd every Classic captcha page once 2+
+        packages were protected, since render_package_selector only renders
+        its dropdown (and calls these classifiers) at that point.
+        """
+        filecrypt_package = build_package(
+            "pkg-fc",
+            "https://filecrypt.example.invalid/Container/abc.html",
+            "filecrypt",
+        )
+        he_package = build_package(
+            "pkg-he", "https://source.invalid/releases/synthetic", "he"
+        )
+        app = self._serve([filecrypt_package, he_package])
+
+        status, _, body = self._request(
+            app, "/captcha/filecrypt", f"data={encode_data_param(filecrypt_package)}"
+        )
+
+        self.assertEqual("200 OK", status)
+        self.assertIn('<option value="filecrypt|', body)
+        self.assertIn('<option value="he|', body)
 
     def test_removed_server_side_filecrypt_routes_are_gone(self):
         package = build_package(

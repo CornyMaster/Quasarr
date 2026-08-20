@@ -11,6 +11,7 @@ from quasarr.providers.html_templates import (
     render_form,
 )
 from quasarr.providers.log import info
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.web_server import Server
 from quasarr.storage.config import Config
 from quasarr.storage.setup.common import (
@@ -93,8 +94,7 @@ def jdownloader_config(shared_state):
     add_no_cache_headers(app)
     setup_auth(app)
 
-    @app.get("/")
-    def jd_form():
+    def _classic_jd_form():
         verify_form_html = f"""
         <span>If required register account at: <a href="https://my.jdownloader.org/login.html#register" target="_blank">
         my.jdownloader.org</a>!</span><br>
@@ -187,6 +187,17 @@ def jdownloader_config(shared_state):
         """
         return render_form(
             "Set your credentials for My JDownloader", verify_form_html, verify_script
+        )
+
+    @app.get("/")
+    def jd_form():
+        def carbon():
+            from quasarr.storage.setup.carbon import render_setup_jdownloader
+
+            return render_setup_jdownloader()
+
+        return render_page(
+            "setup-jdownloader", carbon, _classic_jd_form, shared_state=shared_state
         )
 
     @app.post("/api/verify_jdownloader")

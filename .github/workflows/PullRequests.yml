@@ -168,7 +168,7 @@ jobs:
           path: |
             build
             .pyinstaller-cache
-          key: pyinstaller-analysis-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          key: pyinstaller-analysis-${{ runner.os }}-${{ hashFiles('uv.lock', 'quasarr/static/**') }}
           restore-keys: |
             pyinstaller-analysis-${{ runner.os }}-
       - shell: powershell
@@ -182,7 +182,7 @@ jobs:
           echo "🪟 Starting PyInstaller build..."
           uv run python -c "from PIL import Image; Image.open('Quasarr.png').save('Quasarr.ico')"
           uv run python quasarr/providers/version.py --create-version-file
-          uv run pyinstaller --collect-submodules quasarr.search.sources --collect-submodules quasarr.downloads.sources --collect-submodules charset_normalizer --onefile -y --version-file "file_version_info.txt" --workpath "build" --distpath "dist" --icon "Quasarr.ico" "Quasarr.py" -n "quasarr-${{ needs.version.outputs.version }}-standalone-win64"
+          uv run pyinstaller --collect-submodules quasarr.search.sources --collect-submodules quasarr.downloads.sources --collect-submodules charset_normalizer --collect-data quasarr --onefile -y --version-file "file_version_info.txt" --workpath "build" --distpath "dist" --icon "Quasarr.ico" "Quasarr.py" -n "quasarr-${{ needs.version.outputs.version }}-standalone-win64"
           echo "✅ EXE build finished."
       - uses: actions/upload-artifact@v4
         with:

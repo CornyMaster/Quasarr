@@ -7,6 +7,7 @@ from bottle import Bottle, request, response
 import quasarr.providers.web_server
 from quasarr.providers.html_templates import render_button, render_form
 from quasarr.providers.log import debug, info
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.radarr_api import (
     RadarrAPIClient,
     get_client,
@@ -272,11 +273,24 @@ def radarr_config(shared_state, required_sites):
     add_no_cache_headers(app)
     setup_auth(app)
 
-    @app.get("/")
-    def radarr_form():
+    def _classic_radarr_form():
         return render_form(
             "Set Radarr URL and API Key",
             _radarr_setup_form_html(required_sites),
+        )
+
+    @app.get("/")
+    def radarr_form():
+        def carbon():
+            from quasarr.storage.setup.carbon import render_setup_radarr
+
+            config = Config("Radarr")
+            return render_setup_radarr(
+                config.get("url") or "", config.get("api_key") or "", required_sites
+            )
+
+        return render_page(
+            "setup-radarr", carbon, _classic_radarr_form, shared_state=shared_state
         )
 
     @app.post("/api/radarr/save")

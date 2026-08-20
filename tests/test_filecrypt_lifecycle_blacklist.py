@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Task 6B: Filecrypt owner scrub and terminal orchestration."""
+"""Filecrypt owner scrub and terminal orchestration."""
 
 import json
 import time
@@ -119,7 +119,7 @@ class BlacklistTestCase(unittest.TestCase):
 
 
 class TestOwnersAndRemoveLink(BlacklistTestCase):
-    """Task 6B method 1: blacklisted_owners and remove_blacklisted_link service methods."""
+    """blacklisted_owners and remove_blacklisted_link service methods."""
 
     def test_owners_and_remove_link_table(self):
         # fmt: off
@@ -206,7 +206,7 @@ class TestOwnersAndRemoveLink(BlacklistTestCase):
 
 
 class TestScrubWithAndWithoutAlternatives(BlacklistTestCase):
-    """Task 6B method 2: packages with alternatives keep their row; without alternatives are terminally failed."""
+    """Packages with alternatives keep their row; without alternatives are terminally failed."""
 
     def test_scrub_with_and_without_alternatives(self):
         # pkg(1): single Filecrypt link -> must be terminally failed (exactly once)
@@ -319,7 +319,7 @@ class TestScrubWithAndWithoutAlternatives(BlacklistTestCase):
 
 
 class TestScrubTerminalOutcomeTable(BlacklistTestCase):
-    """Task 6B method 3: outcomes OPENED/RESUMED complete; CAPACITY/CONFLICT/UNREADABLE preserve the link; HTTP 409 is a per-owner skip; rerun causes no duplicate."""
+    """Outcomes OPENED/RESUMED complete; CAPACITY/CONFLICT/UNREADABLE preserve the link; HTTP 409 is a per-owner skip; rerun causes no duplicate."""
 
     def test_scrub_terminal_outcome_table(self):
         from contextlib import ExitStack
@@ -518,7 +518,7 @@ class TestScrubTerminalOutcomeTable(BlacklistTestCase):
 
 
 class TestScrubReportingPackageAbsent(BlacklistTestCase):
-    """Task 6B method 4: reporting package already absent/terminal -> idempotent scrub."""
+    """Reporting package already absent/terminal -> idempotent scrub."""
 
     def test_scrub_reporting_package_absent_idempotent(self):
         from quasarr.providers.filecrypt_lifecycle import (
@@ -580,7 +580,7 @@ class TestScrubReportingPackageAbsent(BlacklistTestCase):
 
 
 class TestScrubPartialFailureResumes(BlacklistTestCase):
-    """Task 6B method 5: one owner preserved (CONFLICT), another terminated (OPENED); rerun leaves counter unchanged."""
+    """One owner preserved (CONFLICT), another terminated (OPENED); rerun leaves counter unchanged."""
 
     def test_scrub_partial_failure_resumes(self):
         from quasarr.providers.filecrypt_lifecycle import (

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import os
 import re
 import unittest
 from html.parser import HTMLParser
@@ -172,6 +173,16 @@ def route_callback(app, method, rule):
 
 
 def render_packages_page(packages_content=""):
+    """Render the Classic `/packages` page and its inline-script contract.
+
+    Every caller of this helper pins Classic on purpose: they inspect
+    Classic's own inline `<script>` functions (`refreshContent`,
+    `restoreDeferredSelection`, `selectedDeferredPackageIds`, the countdown
+    epoch helper, the selector-injection audit) - contracts that only exist
+    in Classic's markup and are unrelated to which UI mode `DEFAULT_UI`
+    happens to select. The `QUASARR_UI` env override forces that
+    deterministically regardless of the default.
+    """
     app = Bottle()
     packages_api.setup_packages_routes(app)
     page_route = route_callback(app, "GET", "/packages")
@@ -184,6 +195,7 @@ def render_packages_page(packages_content=""):
             "_render_packages_content",
             return_value=packages_content,
         ),
+        mock.patch.dict(os.environ, {"QUASARR_UI": "classic"}),
     ):
         return page_route()
 
@@ -958,20 +970,7 @@ class DeferredPackagesRenderingTests(unittest.TestCase):
         self.assertIn("AJAX package", rendered)
 
     def test_packages_page_runs_individual_and_bulk_commands_through_api_fetch(self):
-        app = Bottle()
-        packages_api.setup_packages_routes(app)
-        page_route = route_callback(app, "GET", "/packages")
-
-        with (
-            mock.patch.dict(packages_api.shared_state.values, {"device": object()}),
-            mock.patch.object(packages_api, "request", SimpleNamespace(query={})),
-            mock.patch.object(
-                packages_api,
-                "_render_packages_content",
-                return_value='<div id="deferred-action-status"></div>',
-            ),
-        ):
-            rendered = page_route()
+        rendered = render_packages_page('<div id="deferred-action-status"></div>')
 
         self.assertIn("quasarrApiFetch(endpoint", rendered)
         self.assertIn("'/api/packages/deferred/probe'", rendered)

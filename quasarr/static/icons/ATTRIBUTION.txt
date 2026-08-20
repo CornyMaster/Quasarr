@@ -1,0 +1,4 @@
+Inline icon path data used by Quasarr is sourced from the official Carbon Design System `packages/icons` repository.
+Copyright IBM Corp.
+Licensed under Apache-2.0.
+Canonical source: https://github.com/carbon-design-system/carbon/tree/main/packages/icons

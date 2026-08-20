@@ -10,6 +10,7 @@ from bottle import Bottle, request
 import quasarr.providers.web_server
 from quasarr.providers.html_templates import render_button, render_form
 from quasarr.providers.log import info
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.web_server import Server
 from quasarr.storage.setup.common import (
     add_no_cache_headers,
@@ -25,8 +26,7 @@ def path_config(shared_state):
 
     current_path = os.path.dirname(os.path.abspath(sys.argv[0]))
 
-    @app.get("/")
-    def config_form():
+    def _classic_config_form():
         config_form_html = f'''
             <form action="/api/config" method="post" onsubmit="return handleSubmit(this)">
                 <label for="config_path">Path</label>
@@ -46,6 +46,17 @@ def path_config(shared_state):
             '''
         return render_form(
             "Press 'Save' to set desired path for configuration", config_form_html
+        )
+
+    @app.get("/")
+    def config_form():
+        def carbon():
+            from quasarr.storage.setup.carbon import render_setup_path
+
+            return render_setup_path(current_path)
+
+        return render_page(
+            "setup-path", carbon, _classic_config_form, shared_state=shared_state
         )
 
     def set_config_path(config_path):

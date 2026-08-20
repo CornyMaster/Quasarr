@@ -19,7 +19,7 @@ The only suite that runs Quasarr and a second repository in one process. It exis
 - Both repositories configure the one global `loguru` logger while importing; the harness bridges exactly that logger setup for the duration of the import.
 - The offer trace event now includes a `capability` field (`filecrypt_link_lifecycle_v1` or `filecrypt_cohort_sweep_v1`) so the oracle can distinguish lifecycle from legacy cohort semantics.
 
-## Test Coverage (Task 8)
+## Test Coverage
 
 Six new lifecycle workflow methods, three existing terminal-cleanup methods, and one updated oracle method:
 
@@ -43,7 +43,7 @@ Run inside the SponsorsHelper image with the Quasarr worktree mounted read-only:
 $helper='C:/Users/taalaco2/OneDrive - Swisscom/_git/_projects/sponsorhelper/clean_code_container_repo/.worktrees/filecrypt-link-lifecycle'
 $quasarr='C:/Users/taalaco2/OneDrive - Swisscom/_git/_projects/sponsorhelper/Quasarr/.worktrees/stable-newznab-pubdates'
 Set-Location $helper
-$tag='sponsor-helper-task8-'+(Get-Date -Format 'yyyyMMddHHmmss')
+$tag='sponsor-helper-run-'+(Get-Date -Format 'yyyyMMddHHmmss')
 podman build --no-cache -t $tag .
 podman run --rm --entrypoint sh -v "${quasarr}:/quasarr:ro" -w /quasarr -e PYTHONPATH=/quasarr:/app $tag -lc "pip install --no-cache-dir /quasarr >/dev/null && python3 -X utf8 -m unittest discover -s integration_tests -v"
 ```

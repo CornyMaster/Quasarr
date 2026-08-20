@@ -34,3 +34,11 @@ docs/superpowers/
 pr_check_report.md
 pr_number.txt
 AGENT_HANDOFF.md
+
+# PyInstaller local build artifacts (mirrors Release.yml's exe build steps)
+/build
+/dist
+/docker/dist
+/Quasarr.ico
+/file_version_info.txt
+*.spec

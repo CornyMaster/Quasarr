@@ -7,6 +7,7 @@ from bottle import Bottle, request
 import quasarr.providers.web_server
 from quasarr.providers.html_templates import render_fail, render_form
 from quasarr.providers.log import warn
+from quasarr.providers.page_dispatch import render_page
 from quasarr.providers.web_server import Server
 from quasarr.storage.setup.common import (
     add_no_cache_headers,
@@ -66,13 +67,26 @@ def select_arr_client_config(
     setup_auth(app)
     selected_client = None
 
-    @app.get("/")
-    def arr_client_form():
+    def _classic_arr_client_form():
         return render_form(
             "Choose your *arr client",
             _arr_client_selection_form_html(
                 radarr_required_sites, sonarr_required_sites
             ),
+        )
+
+    @app.get("/")
+    def arr_client_form():
+        def carbon():
+            from quasarr.storage.setup.carbon import render_setup_arr_client
+
+            return render_setup_arr_client(radarr_required_sites, sonarr_required_sites)
+
+        return render_page(
+            "setup-arr-client",
+            carbon,
+            _classic_arr_client_form,
+            shared_state=shared_state,
         )
 
     @app.post("/api/arr/client")

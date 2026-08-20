@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for FilecryptLifecycleService retest and probe outcomes (Task 3B2A)."""
+"""Tests for FilecryptLifecycleService retest and probe outcomes."""
 
 import json
 import unittest

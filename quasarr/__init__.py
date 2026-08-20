@@ -26,6 +26,7 @@ from quasarr.providers.log import (
 )
 from quasarr.providers.notifications import send_notification
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
+from quasarr.providers.ui_preference import load_ui_preference
 from quasarr.providers.utils import (
     Unbuffered,
     check_flaresolverr,
@@ -66,6 +67,25 @@ load_dotenv(override=True)
 
 
 def run():
+    # A non-UTF-8 console codepage (common on non-English Windows locales,
+    # and on the frozen PyInstaller standalone build, which does not
+    # inherit `-X utf8`) cannot encode the box-drawing startup banner or
+    # later emoji log output. Reconfigure before anything else in this
+    # function - including multiprocessing startup, which can itself raise
+    # and get logged - so a narrow console encoding never crashes startup.
+    # Scope: this reconfigures the main process's `sys.stdout` only. Spawn
+    # daemon children (flaresolverr_checker, jdownloader_connection,
+    # update_checker) get their own fresh interpreter and do not inherit
+    # this reconfigured stream; `sys.stderr` is also untouched here - loguru's
+    # sink writes to `sys.stdout` (see `providers/log.py`), so the actual
+    # log/print path is covered, and an unrelated write straight to stderr
+    # would only degrade (Python's default `traceback`/`warnings` machinery
+    # already tolerates encoding errors) rather than crash the process.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, TypeError, ValueError):
+        pass
+
     # Start the worker processes the same way on every platform. "fork" hands
     # children a copy of the parent's memory, including objects bound to the
     # parent process (file locks, open handles), and Python deprecates forking a
@@ -147,6 +167,7 @@ def run():
         Config.prune_unsupported_keys(shared_state.values["configfile"])
         shared_state.update("config", Config)
         shared_state.update("database", DataBase)
+        load_ui_preference(shared_state)
         supported_hostnames = extract_allowed_keys(Config._DEFAULT_CONFIG, "Hostnames")
         shared_state.update("sites", [key.upper() for key in supported_hostnames])
         # Set fallback user agent immediately so it's available while background check runs
