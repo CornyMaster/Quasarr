@@ -7,7 +7,7 @@ Authenticated `requests.Session` modules for login-required sources. Every new l
 ## Ownership
 
 - `al.py` - FlareSolverr-backed session with JSON-envelope expiry; `fetch_via_flaresolverr` / `fetch_via_requests_session` helpers, both re-persisting cookies after each call
-- `dd.py` / `nx.py` - simple login sessions; blank stored credentials on a rejected login
+- `dd.py` - CSRF-token + JSON login (`/api/csrf-token` then `/api/auth/login`); blank stored credentials on a rejected login. `nx.py` - simple login session; blank stored credentials on a rejected login
 - `dl.py` - CSRF login flow; its fetch helper re-persists cookies after each call
 
 ## Local Contracts

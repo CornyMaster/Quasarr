@@ -47,29 +47,38 @@ class Source(AbstractDownloadSource):
 
         try:
             release_list = []
-            for page in range(0, 100, 20):
-                api_url = f"https://{dd}/index/search/keyword/{title}/qualities/{','.join(qualities)}/from/{page}/search"
+            cursor = None
+            for _ in range(5):
+                params = {"keyword": title, "qualities": ",".join(qualities)}
+                if cursor:
+                    params["cursor"] = cursor
 
                 r = dd_session.get(
-                    api_url,
+                    f"https://{dd}/api/releases/search",
+                    params=params,
                     headers=headers,
                     timeout=DOWNLOAD_REQUEST_TIMEOUT_SECONDS,
                 )
                 r.raise_for_status()
-                releases_on_page = r.json()
+                data = r.json()
+                releases_on_page = data.get("results") or []
+                next_cursor = data.get("nextCursor")
                 if releases_on_page:
                     release_list.extend(releases_on_page)
+                if not next_cursor:
+                    break
+                cursor = next_cursor
 
             for release in release_list:
                 try:
                     if release.get("fake"):
                         debug(
-                            f"Release {release.get('release')} marked as fake. "
+                            f"Release {release.get('releaseName')} marked as fake. "
                             "Invalidating session..."
                         )
                         create_and_persist_session(shared_state)
                         return {"links": []}
-                    elif release.get("release") == title:
+                    elif release.get("releaseName") == title:
                         filtered_links = []
                         for link in release["links"]:
                             if mirrors and not any(

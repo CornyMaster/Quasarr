@@ -67,23 +67,24 @@ class DateSourceQueryTests(unittest.TestCase):
 
     def test_dd_default_search_preserves_duplicate_results(self):
         item = {
-            "release": "Synthetic.Show.S01E01.1080p.WEB.h264-GRP",
+            "releaseName": "Synthetic.Show.S01E01.1080p.WEB.h264-GRP",
             "size": 1024,
             "when": 0,
         }
 
-        class Response(EmptyResponse):
-            def __init__(self, items):
+        class Page(EmptyResponse):
+            def __init__(self, items, next_cursor):
                 self.items = items
+                self.next_cursor = next_cursor
 
             def json(self):
-                return self.items
+                return {"results": self.items, "nextCursor": self.next_cursor}
 
         class Session:
-            def get(self, url, **_kwargs):
-                if "/from/0/" in url or "/from/20/" in url:
-                    return Response([item])
-                return Response([])
+            def get(self, url, params=None, **_kwargs):
+                if not (params or {}).get("cursor"):
+                    return Page([item], "next")
+                return Page([item], None)
 
         with (
             patch.object(dd, "retrieve_and_validate_session", return_value=Session()),
@@ -180,12 +181,16 @@ class DateSourceQueryTests(unittest.TestCase):
         self.assertEqual(["https://by.invalid/?q=QZX"], urls)
 
     def test_dd_date_search_uses_acronym_root(self):
-        urls = []
+        calls = []
+
+        class Response(EmptyResponse):
+            def json(self):
+                return {"results": [], "nextCursor": None}
 
         class Session:
-            def get(self, url, **_kwargs):
-                urls.append(url)
-                return EmptyResponse()
+            def get(self, url, params=None, **_kwargs):
+                calls.append((url, params or {}))
+                return Response()
 
         with (
             patch.object(
@@ -202,8 +207,9 @@ class DateSourceQueryTests(unittest.TestCase):
             )
 
         self.assertEqual([], releases)
-        self.assertEqual(1, len(urls))
-        self.assertIn("/keyword/QZX/", urls[0])
+        self.assertEqual(1, len(calls))
+        self.assertEqual("https://dd.invalid/api/releases/search", calls[0][0])
+        self.assertEqual("QZX", calls[0][1]["keyword"])
 
     def test_he_searches_with_proven_space_date_query(self):
         requests = []
