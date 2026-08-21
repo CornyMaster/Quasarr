@@ -130,27 +130,45 @@ class Source(AbstractSearchSource):
         try:
             release_list = []
             release_by_title = {}
-            max_offset = 2000 if episode_date else 100
+            max_pages = 100 if episode_date else 5
             for query in search_strings:
-                for page in range(0, max_offset, 20):
+                cursor = None
+                for _ in range(max_pages):
+                    # The budget gate stays on every iteration: cursor
+                    # paging can walk as many pages as offset paging did,
+                    # so a long date search must still be able to give up.
                     checkpoint()
-                    url = f"https://{dd}/index/search/keyword/{query}/qualities/{','.join(qualities)}/from/{page}/search"
+                    params = {"qualities": ",".join(qualities)}
+                    if query:
+                        params["keyword"] = query
+                    if cursor:
+                        params["cursor"] = cursor
 
                     timeout = clamp_timeout(timeout_default)
-                    r = dd_session.get(url, headers=headers, timeout=timeout)
+                    r = dd_session.get(
+                        f"https://{dd}/api/releases/search",
+                        params=params,
+                        headers=headers,
+                        timeout=timeout,
+                    )
                     r.raise_for_status()
-                    releases_on_page = r.json()
+                    data = r.json()
+                    releases_on_page = data.get("results") or []
+                    next_cursor = data.get("nextCursor")
+
                     if not releases_on_page:
-                        if episode_date:
-                            break
-                        continue
+                        break
                     if episode_date is None:
                         release_list.extend(releases_on_page)
                     else:
                         for release in releases_on_page:
-                            title = release.get("release")
+                            title = release.get("releaseName")
                             if title:
                                 release_by_title[title] = release
+
+                    if not next_cursor:
+                        break
+                    cursor = next_cursor
 
             if episode_date is not None:
                 release_list = list(release_by_title.values())
@@ -159,7 +177,7 @@ class Source(AbstractSearchSource):
                 try:
                     if release.get("fake"):
                         debug(
-                            f"Release {release.get('release')} marked as fake. Invalidating session..."
+                            f"Release {release.get('releaseName')} marked as fake. Invalidating session..."
                         )
                         try:
                             checkpoint()
@@ -171,7 +189,7 @@ class Source(AbstractSearchSource):
                             pass
                         return []
                     else:
-                        title = release.get("release")
+                        title = release.get("releaseName")
 
                         if not is_valid_release(
                             title,

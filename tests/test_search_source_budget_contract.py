@@ -478,22 +478,31 @@ class SourceBudgetBehaviorTests(unittest.TestCase):
 class FakeReleaseBudgetTests(unittest.TestCase):
     """A response that serves fakes is never an answer, budget or no budget."""
 
+    # DD's API answers `{"results": [...], "nextCursor": ...}` and names the
+    # title field `releaseName`; the bare list and `release` key these
+    # fixtures used belong to the pre-4.6.17 endpoint. The budget contract
+    # itself is unchanged - only the transport shape moved.
     def _page_session(self, first_page):
         session = MagicMock()
-        session.get.side_effect = [first_page] + [FakeResponse([]) for _ in range(4)]
+        session.get.side_effect = [first_page] + [
+            FakeResponse({"results": [], "nextCursor": None}) for _ in range(4)
+        ]
         return session
 
     @staticmethod
     def _fake_serving_page():
         return FakeResponse(
-            [
-                {
-                    "release": "Synthetic.Movie.2031.1080p.WEB.h264-GROUP",
-                    "size": 1073741824,
-                    "when": 1700000000,
-                },
-                {"release": "Synthetic.Movie.2031.Fake", "fake": True},
-            ]
+            {
+                "results": [
+                    {
+                        "releaseName": "Synthetic.Movie.2031.1080p.WEB.h264-GROUP",
+                        "size": 1073741824,
+                        "when": 1700000000,
+                    },
+                    {"releaseName": "Synthetic.Movie.2031.Fake", "fake": True},
+                ],
+                "nextCursor": None,
+            }
         )
 
     def test_fake_release_answers_empty_when_the_budget_runs_out_first(self):
