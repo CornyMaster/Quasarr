@@ -1196,6 +1196,178 @@ class TerminalOperationServiceTests(unittest.TestCase):
         self.assertEqual(before, self.rows())
 
 
+class ReopenedTerminalOperationTests(unittest.TestCase):
+    """The one transition that retires a record instead of advancing it.
+
+    A package ID is derived from the release, so a package that is protected
+    again reuses the identity of every life of it that already closed. Only a
+    complete record may be retired, and the record that replaces it opens
+    strictly later, so the two lives never share the evidence their artifacts
+    carry.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.state = GuardedSharedState()
+        self.service = TerminalOperationService(self.state, clock=self.clock)
+        self.package_id = package(1)
+        self.operation_id = terminal_operation_id(self.package_id)
+
+    def rows(self):
+        return dict(self.state.operations.rows)
+
+    def store(self, **kwargs):
+        self.state.operations.rows[self.operation_id] = record(
+            self.package_id, **kwargs
+        )
+
+    def reopen(self, terminal_state="downloaded"):
+        return self.service.reopen_completed(
+            self.operation_id, self.package_id, terminal_state
+        )
+
+    def test_a_complete_record_is_replaced_by_a_freshly_prepared_one(self):
+        self.store(
+            state="complete", package_removed=True, package_terminal=True, created=NOW
+        )
+        self.clock.now = NOW + 500
+
+        result = self.reopen()
+
+        self.assertEqual("opened", result["outcome"])
+        self.assertEqual(
+            {
+                "state": "prepared",
+                "terminal_state": "downloaded",
+                "package_id": self.package_id,
+                "created_epoch": NOW + 500,
+                "updated_epoch": NOW + 500,
+                "package_removed": False,
+                "package_terminal": False,
+                "effect_state": "not_started",
+                "failure_persisted": False,
+                "notification_state": "not_started",
+            },
+            json.loads(self.rows()[self.operation_id]),
+        )
+
+    def test_the_retired_bookkeeping_is_never_carried_into_the_next_life(self):
+        self.store(
+            state="complete",
+            package_removed=True,
+            package_terminal=True,
+            failure_persisted=True,
+            notification_state=NOTIFICATION_RECORDED,
+        )
+
+        record_now = self.reopen()["record"]
+
+        self.assertFalse(record_now["failure_persisted"])
+        self.assertEqual(NOTIFICATION_NOT_STARTED, record_now["notification_state"])
+        self.assertFalse(record_now["package_removed"])
+        self.assertFalse(record_now["package_terminal"])
+
+    def test_the_next_life_never_shares_the_evidence_of_the_retired_one(self):
+        self.store(state="complete", package_removed=True, package_terminal=True)
+        retired = operation_evidence(
+            decode_operation_record(self.rows()[self.operation_id])
+        )
+
+        # The same second of the clock, which is when a package that comes back
+        # immediately would open its next life.
+        reopened = self.reopen()["record"]
+
+        self.assertGreater(reopened["created_epoch"], NOW)
+        self.assertNotEqual(retired, operation_evidence(reopened))
+
+    def test_a_record_that_is_not_complete_is_left_exactly_as_it_is(self):
+        for state, effect_state in OPERATION_PHASES[:-1]:
+            with self.subTest(state=state, effect_state=effect_state):
+                self.setUp()
+                self.store(state=state, effect_state=effect_state)
+                before = self.rows()
+                writes = self.state.operations.writes
+
+                result = self.reopen()
+
+                self.assertEqual("resumed", result["outcome"])
+                self.assertEqual(state, result["record"]["state"])
+                self.assertEqual(before, self.rows())
+                self.assertEqual(writes, self.state.operations.writes)
+
+    def test_a_missing_or_foreign_record_is_a_conflict_without_writes(self):
+        cases = (
+            ("missing", None, "downloaded"),
+            ("another package", record(package(2), state="complete"), "downloaded"),
+            ("another state", record(self.package_id, state="complete"), "failed"),
+            ("unreadable", "{not json", "downloaded"),
+        )
+
+        for name, stored, terminal_state in cases:
+            with self.subTest(case=name):
+                self.setUp()
+                if stored is not None:
+                    self.state.operations.rows[self.operation_id] = stored
+                before = self.rows()
+
+                result = self.reopen(terminal_state=terminal_state)
+
+                self.assertEqual("conflict", result["outcome"])
+                self.assertIsNone(result["record"])
+                self.assertEqual(before, self.rows())
+
+    def test_a_malformed_identity_is_refused_before_any_write(self):
+        self.store(state="complete")
+        before = self.rows()
+
+        for operation_id, package_id, terminal_state in (
+            (terminal_operation_id(package(2)), self.package_id, "downloaded"),
+            (self.operation_id, self.package_id, "solved"),
+            (self.operation_id, "", "downloaded"),
+        ):
+            with self.subTest(operation_id=str(operation_id)[:20]):
+                with self.assertRaises(ValueError):
+                    self.service.reopen_completed(
+                        operation_id, package_id, terminal_state
+                    )
+
+        self.assertEqual(before, self.rows())
+
+    def test_a_reopened_record_runs_the_ordinary_progression_again(self):
+        self.store(state="complete", package_removed=True, package_terminal=True)
+        self.reopen()
+
+        attempting = self.service.mark_effect_attempting(
+            self.operation_id, self.package_id, "downloaded"
+        )
+        submitted = self.service.mark_submitted(
+            self.operation_id, self.package_id, "downloaded"
+        )
+        completed = self.service.mark_complete(
+            self.operation_id,
+            self.package_id,
+            "downloaded",
+            package_removed=True,
+            package_terminal=True,
+        )
+
+        self.assertEqual("applied", attempting["outcome"])
+        self.assertEqual("applied", submitted["outcome"])
+        self.assertEqual("applied", completed["outcome"])
+        self.assertEqual("complete", completed["record"]["state"])
+
+    def test_a_reopened_record_stays_one_row_of_the_same_identity(self):
+        self.store(state="complete", package_removed=True, package_terminal=True)
+
+        self.reopen()
+
+        self.assertEqual([self.operation_id], list(self.rows()))
+        self.assertEqual(
+            {"prepared": 1, "submitted": 0, "complete": 0},
+            self.service.count_by_state(),
+        )
+
+
 class TerminalFailureBookkeepingTests(unittest.TestCase):
     """The durable ledger behind one terminal failure.
 

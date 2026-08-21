@@ -122,8 +122,9 @@ def operation_evidence(record):
     A package ID is derived from the release, so every life of one release
     reuses one operation ID, and so do the failed rows, disabled packages and
     JDownloader packages those lives leave behind. The epoch the record opened
-    at is what separates them: another operation for the same package can only
-    open once the previous one was pruned, a whole retention window later.
+    at is what separates them: a record is only ever replaced by one that
+    opened strictly later, whether the package came back inside the retention
+    window or the record was pruned a whole one after it.
     """
     material = (
         f"{TERMINAL_OPERATION_DOMAIN}\n"
@@ -242,6 +243,23 @@ def _incremented(value):
     except (TypeError, ValueError):
         current = 0
     return str(current + 1)
+
+
+def _opened(package_id, terminal_state, epoch):
+    """The record one life of a package opens with, at the epoch it opened."""
+    return {
+        "state": "prepared",
+        "terminal_state": terminal_state,
+        "package_id": package_id,
+        "created_epoch": epoch,
+        "updated_epoch": epoch,
+        "package_removed": False,
+        "package_terminal": False,
+        "effect_state": EFFECT_NOT_STARTED,
+        "failure_persisted": False,
+        "notification_state": NOTIFICATION_NOT_STARTED,
+        LEGACY_PROVENANCE_KEY: False,
+    }
 
 
 def _advanced(record, **updates):
@@ -402,19 +420,7 @@ class TerminalOperationService:
                     decided.update(outcome=UNREADABLE, record=None)
                     return current_value
                 if record is None:
-                    opened = {
-                        "state": "prepared",
-                        "terminal_state": terminal_state,
-                        "package_id": package_id,
-                        "created_epoch": now,
-                        "updated_epoch": now,
-                        "package_removed": False,
-                        "package_terminal": False,
-                        "effect_state": EFFECT_NOT_STARTED,
-                        "failure_persisted": False,
-                        "notification_state": NOTIFICATION_NOT_STARTED,
-                        LEGACY_PROVENANCE_KEY: False,
-                    }
+                    opened = _opened(package_id, terminal_state, now)
                     decided.update(outcome=OPENED, record=opened)
                     return _encode(opened)
                 if (
@@ -630,6 +636,54 @@ class TerminalOperationService:
                 "package_terminal": bool(package_terminal),
             },
         )
+
+    def reopen_completed(self, operation_id, package_id, terminal_state):
+        """Retire a complete record whose package exists again, and open the next.
+
+        The one transition that exists because a complete record is not
+        evidence forever. A package ID is derived from the release, so one
+        identity is reused by every life of that release, and a complete record
+        describes only the life it closed:
+        once that package is protected again, replaying the record would
+        confirm a handoff the life in front of it never got, and it would do so
+        for the whole retention window. Deciding that needs the protected
+        package, which no mutation callback of this table may resolve, so the
+        caller reads it and this owns the transition.
+
+        The retirement is one transaction that replaces the row rather than a
+        delete followed by an open, so a single identity can never hold two
+        records or none, and the caller holds `operation_lock` around both the
+        decision and the operation that follows it, so no second request can
+        act on the record being replaced. The new record opens strictly after
+        the retired one, so two lives of one package can never share the
+        `operation_evidence` that separates the artifacts they leave behind,
+        even when both open inside the same second of the clock.
+
+        Only a complete record is retired. Any other phase may still own an
+        unfinished side effect, and replacing it would authorize a second one.
+        """
+        self._validate(operation_id, package_id, terminal_state)
+        now = int(self._clock())
+        decided = {}
+
+        def decide(current_value):
+            record = self._own(current_value, package_id, terminal_state)
+            if record is None:
+                decided.update(outcome=CONFLICT, record=None)
+                return current_value
+            if record["state"] != "complete":
+                decided.update(outcome=RESUMED, record=record)
+                return current_value
+            opened = _opened(
+                package_id,
+                terminal_state,
+                max(now, record["created_epoch"] + 1),
+            )
+            decided.update(outcome=OPENED, record=opened)
+            return _encode(opened)
+
+        self._table().mutate_value(operation_id, decide)
+        return self._result(decided["outcome"], decided["record"])
 
     def snapshot(self, operation_id):
         """The current record of one operation, or None. Never writes."""

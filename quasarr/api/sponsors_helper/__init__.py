@@ -916,7 +916,11 @@ def setup_sponsors_helper_routes(app):
         nothing about it - and neither does their absence. The only thing still
         worth reading is whether the protected package is gone, which is
         terminal on its own and invents no outcome. Anything else waits for the
-        operator, or for retention to allow a fresh lifecycle.
+        operator, or for retention to allow a fresh lifecycle. A complete
+        record of that shape is refused here too, before it is replayed: it
+        cannot show that the life it closed is the one its package is in now,
+        so while the package is protected it may not answer at all, and it may
+        not authorize a fresh operation either.
         """
         present, _package_data = read_protected_package(package_id)
         if present is False:
@@ -925,16 +929,58 @@ def setup_sponsors_helper_routes(app):
             )
         return unconfirmed_terminal_response(context)
 
+    def completed_terminal_answer(context, package_id):
+        """The answer this operation's complete record still authorizes, or None.
+
+        A package ID is derived from the release, so one identity is reused by
+        every life of that release, and a complete record describes only the
+        life it closed. The protected package is what tells the two apart. A
+        record that removed the package answers for as long as the package is
+        gone, which is exactly the retry of an answer that was lost on the way
+        to the helper, and a record that only disabled it answers for as long
+        as its own disable is still on the package.
+
+        Once the package is protected again under neither, the record belongs
+        to a life that ended: replaying it would tell the helper its links were
+        taken while nothing was submitted and the package stayed protected, and
+        it would keep doing that for the whole retention window. The record is
+        retired instead, and `None` asks the caller to run the fresh operation
+        that opened in its place. A protected package that cannot be read
+        proves neither case and is answered as unconfirmed rather than decided
+        from.
+        """
+        record = context["record"]
+        present, package_data = read_protected_package(package_id)
+        if present is None:
+            return unconfirmed_terminal_response(context)
+        if present is False:
+            return terminal_response(record)
+        if not record["package_removed"] and disabled_by_operation(
+            package_data, operation_evidence(record)
+        ):
+            return terminal_response(record)
+        result = context["service"].reopen_completed(
+            context["operation_id"],
+            package_id,
+            record["terminal_state"],
+        )
+        if result["outcome"] == CONFLICT:
+            return abort(409, "Terminal operation identity conflict")
+        context["record"] = result["record"]
+        return None
+
     def projected_final_download_links(download_links, package_id):
         return project_final_download_urls(download_links, package_id)[2]["urls"]
 
     def confirm_terminal_download(
         context, title, package_id, download_links, password, notification
     ):
-        if context["record"]["state"] == "complete":
-            return terminal_response(context["record"])
         if context["record"]["legacy_unproven"]:
             return unprovable_legacy_terminal(context, package_id)
+        if context["record"]["state"] == "complete":
+            replay = completed_terminal_answer(context, package_id)
+            if replay is not None:
+                return replay
 
         evidence = operation_evidence(context["record"])
         final_links = None
@@ -1045,10 +1091,12 @@ def setup_sponsors_helper_routes(app):
         return complete_terminal(context, package_removed=True, package_terminal=True)
 
     def confirm_terminal_failure(context, package_id, title, reason):
-        if context["record"]["state"] == "complete":
-            return terminal_response(context["record"])
         if context["record"]["legacy_unproven"]:
             return unprovable_legacy_terminal(context, package_id)
+        if context["record"]["state"] == "complete":
+            replay = completed_terminal_answer(context, package_id)
+            if replay is not None:
+                return replay
 
         if context["record"]["state"] == "prepared":
             if not record_helper_terminal_failure(context, package_id, title, reason):
@@ -1089,10 +1137,12 @@ def setup_sponsors_helper_routes(app):
         )
 
     def confirm_terminal_disable(context, package_id, reason):
-        if context["record"]["state"] == "complete":
-            return terminal_response(context["record"])
         if context["record"]["legacy_unproven"]:
             return unprovable_legacy_terminal(context, package_id)
+        if context["record"]["state"] == "complete":
+            replay = completed_terminal_answer(context, package_id)
+            if replay is not None:
+                return replay
 
         if context["record"]["state"] == "prepared":
             evidence = operation_evidence(context["record"])

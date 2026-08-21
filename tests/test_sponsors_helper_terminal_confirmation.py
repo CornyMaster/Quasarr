@@ -1703,6 +1703,175 @@ class TerminalFailurePersistenceTests(TerminalConfirmationTestCase):
         self.assertEqual(0, len(self.state.device.add_links_calls))
 
 
+class ReGrabbedPackageTerminalTests(TerminalConfirmationTestCase):
+    """A complete record answers for the life it closed, and for no other.
+
+    A package ID is derived from the release, so Radarr or Sonarr grabbing the
+    same release again protects a package under the operation identity of every
+    earlier life of it. While the package stays gone the record is still what
+    happened and every retry replays it; once the package is back it describes
+    a life that ended and the request in front of it needs an operation of its
+    own.
+    """
+
+    def complete_download(self):
+        payload = self.version_two(self.download_payload())
+        first = self.call(DOWNLOAD_RULE, payload)
+        self.assertTrue(first["success"])
+        return payload, first
+
+    def test_a_complete_download_replays_for_as_long_as_the_package_is_gone(self):
+        payload, first = self.complete_download()
+        self.notifications.reset_mock()
+
+        for _attempt in range(3):
+            replay = self.call(DOWNLOAD_RULE, payload)
+            self.assertEqual(first, replay)
+
+        self.assertEqual(1, len(self.state.device.add_links_calls))
+        self.assertEqual(1, self.statistic("packages_downloaded"))
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_a_re_grabbed_package_submits_and_is_removed_again(self):
+        payload, _first = self.complete_download()
+        retired = self.current_evidence()
+        self.notifications.reset_mock()
+        self.store_protected()
+
+        result = self.call(DOWNLOAD_RULE, payload)
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["package_removed"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(2, len(self.state.device.add_links_calls))
+        self.assertEqual(["solved"], self.notification_cases())
+        self.assertEqual(2, self.statistic("packages_downloaded"))
+        self.assertEqual(2, self.statistic("captcha_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+        self.assertNotEqual(retired, self.current_evidence())
+        self.assertEqual(
+            [
+                submission_comment(package(), retired),
+                submission_comment(package(), self.current_evidence()),
+            ],
+            self.submitted_comments(),
+        )
+
+    def test_the_next_life_opens_strictly_after_the_one_it_retired(self):
+        payload, _first = self.complete_download()
+        retired = self.operation_row()["created_epoch"]
+        self.store_protected()
+
+        self.call(DOWNLOAD_RULE, payload)
+
+        self.assertGreater(self.operation_row()["created_epoch"], retired)
+
+    def test_the_second_life_replays_on_its_own_terms(self):
+        payload, _first = self.complete_download()
+        self.store_protected()
+        second = self.call(DOWNLOAD_RULE, payload)
+        self.notifications.reset_mock()
+
+        replay = self.call(DOWNLOAD_RULE, payload)
+
+        self.assertEqual(second, replay)
+        self.assertEqual(2, len(self.state.device.add_links_calls))
+        self.assertEqual(2, self.statistic("packages_downloaded"))
+        self.assertEqual([], self.notification_cases())
+
+    def test_a_re_grabbed_package_records_a_second_failure(self):
+        payload = self.version_two({"package_id": package()})
+        self.call(FAIL_RULE, payload)
+        retired = self.current_evidence()
+        self.notifications.reset_mock()
+        self.store_protected()
+
+        result = self.call(FAIL_RULE, payload)
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(2, self.statistic("failed_downloads"))
+        self.assertEqual(2, self.statistic("failed_decryptions_automatic"))
+        self.assertNotEqual(retired, self.failed_blob()["terminal_operation"])
+        self.assertEqual(
+            self.current_evidence(), self.failed_blob()["terminal_operation"]
+        )
+
+    def test_a_re_grabbed_package_is_disabled_again(self):
+        payload = self.version_two({"package_id": package()})
+        self.call(DISABLE_RULE, payload)
+        retired = self.current_evidence()
+        self.assertEqual(retired, self.protected_row()["terminal_operation"])
+        self.notifications.reset_mock()
+        # The re-grab writes the release again, without the disable of the life
+        # that ended.
+        self.store_protected()
+
+        result = self.call(DISABLE_RULE, payload)
+
+        self.assertTrue(result["success"])
+        self.assertTrue(self.protected_row()["disabled"])
+        self.assertEqual(["disabled"], self.notification_cases())
+        self.assertEqual(2, self.statistic("captcha_decryptions_automatic"))
+        self.assertEqual(2, self.statistic("failed_decryptions_automatic"))
+        self.assertNotEqual(retired, self.protected_row()["terminal_operation"])
+        self.assertEqual(
+            self.current_evidence(), self.protected_row()["terminal_operation"]
+        )
+
+    def test_a_still_disabled_package_replays_instead_of_being_disabled_twice(self):
+        """The one complete record whose package is present on purpose."""
+        payload = self.version_two({"package_id": package()})
+        first = self.call(DISABLE_RULE, payload)
+        self.notifications.reset_mock()
+
+        for _attempt in range(3):
+            replay = self.call(DISABLE_RULE, payload)
+            self.assertEqual(first, replay)
+
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(1, self.statistic("captcha_decryptions_automatic"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertEqual("complete", self.operation_row()["state"])
+
+    def test_a_protected_package_that_cannot_be_read_decides_nothing(self):
+        payload, _first = self.complete_download()
+        stored = dict(self.operation_row())
+        self.state.get_db("protected").unavailable = True
+
+        result = self.call(DOWNLOAD_RULE, payload)
+
+        self.assertEqual(
+            {
+                "success": False,
+                "terminal_state": "downloaded",
+                "package_removed": False,
+                "package_terminal": False,
+                "package_id": package(),
+            },
+            result,
+        )
+        self.assertEqual(stored, self.operation_row())
+        self.assertEqual(1, len(self.state.device.add_links_calls))
+
+    def test_two_concurrent_requests_submit_the_next_life_exactly_once(self):
+        payload, _first = self.complete_download()
+        self.store_protected()
+        gate = SideEffectGate()
+        self.state.device.before_add_links = gate.arrive
+
+        first, second = self.concurrently(DOWNLOAD_RULE, payload, gate)
+
+        self.assertFalse(gate.second.is_set())
+        self.assertEqual(2, len(self.state.device.add_links_calls))
+        self.assertEqual(first, second)
+        self.assertTrue(first["success"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(2, self.statistic("packages_downloaded"))
+
+
 class MigratedTerminalRecordTests(TerminalConfirmationTestCase):
     """A seven-key row past `prepared` can never show what it applied.
 
@@ -1811,7 +1980,7 @@ class MigratedTerminalRecordTests(TerminalConfirmationTestCase):
         self.assertEqual([], self.notification_cases())
         self.assertEqual(0, self.statistic("captcha_decryptions_automatic"))
 
-    def test_a_migrated_complete_row_replays_its_stored_outcome_only(self):
+    def test_a_migrated_complete_row_replays_while_its_package_stays_gone(self):
         for terminal_state in ("downloaded", "failed", "disabled"):
             with self.subTest(terminal_state=terminal_state):
                 self.setUp()
@@ -1825,6 +1994,7 @@ class MigratedTerminalRecordTests(TerminalConfirmationTestCase):
                     package_removed=True,
                     package_terminal=True,
                 )
+                self.state.get_db("protected").delete(package())
                 rule, payload = self.request(terminal_state)
 
                 first = self.call(rule, payload)
@@ -1836,8 +2006,28 @@ class MigratedTerminalRecordTests(TerminalConfirmationTestCase):
                 self.assertEqual([], self.notification_cases())
                 self.assertEqual([], self.submitted_comments())
                 self.assertEqual(0, self.state.device.queries)
-                # The protected row is the one thing a replay must not touch.
-                self.assertIsNotNone(self.protected_row())
+                self.assertIsNone(self.protected_row())
+                self.assertIsNone(self.failed_row())
+
+    def test_a_migrated_complete_row_answers_nothing_once_its_package_is_back(self):
+        """It can show neither its own outcome nor the life the package is in."""
+        for terminal_state in ("downloaded", "failed", "disabled"):
+            with self.subTest(terminal_state=terminal_state):
+                self.setUp()
+                self.seed_operation(
+                    terminal_state,
+                    state="complete",
+                    legacy=True,
+                    created=int(time.time()),
+                    package_removed=True,
+                    package_terminal=True,
+                )
+                rule, payload = self.request(terminal_state)
+
+                result = self.call(rule, payload)
+
+                self.assert_untouched(result, terminal_state)
+                self.assertNotIn("disabled", self.protected_row())
                 self.assertIsNone(self.failed_row())
 
     def test_a_migrated_prepared_row_still_performs_its_own_transition(self):
