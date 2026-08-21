@@ -486,6 +486,25 @@ class HostnamesRenderTests(_HostnamesTestCase):
             html,
         )
 
+    def test_top_level_sections_share_the_stack_rhythm(self):
+        """Regression pin: the import tile, the hostnames form (table plus
+        save/cancel row), and the Maintenance tile used to be concatenated
+        with nothing between them - .cds-tile carries no margin of its own,
+        so Maintenance started flush against the button row above it. All
+        three now live inside one .cds-stack wrapper (the same 16px rhythm
+        every other Carbon page uses between tiles).
+        """
+        html = _page_content_only(self._render())
+        stack_start = html.index('<div class="cds-stack">')
+        import_heading = html.index("Import from URL")
+        form_start = html.index('<form id="hostnames-form"')
+        maintenance_heading = html.index(">Maintenance<")
+        stack_end = html.rindex("</div>")
+        self.assertLess(stack_start, import_heading)
+        self.assertLess(import_heading, form_start)
+        self.assertLess(form_start, maintenance_heading)
+        self.assertLess(maintenance_heading, stack_end)
+
     def test_page_renders_the_modal_host_the_submit_interceptor_requires(self):
         """The other half of the first-run regression pin
         (test_hostnames_form_interceptor_never_fires_on_the_setup_wizards_form
@@ -993,6 +1012,18 @@ class CarbonConfigJsContractTests(unittest.TestCase):
         self.assertLess(
             body.index("body.appendChild(openLink)"), body.index("var actions = ")
         )
+
+    def test_status_modal_open_link_is_a_quiet_text_link_not_a_chip_button(self):
+        """A filled tertiary button next to a one-line status was too heavy
+        for a secondary action - the link is now styled as a plain
+        underlined text link, while staying a real anchor with target=_blank
+        and rel=noopener noreferrer.
+        """
+        body = self._function_body("openHostnameStatusModal")
+        self.assertIn("openLink.className = 'cds-text-link';", body)
+        self.assertNotIn("cds-btn cds-btn--tertiary", body)
+        self.assertIn("openLink.target = '_blank';", body)
+        self.assertIn("openLink.rel = 'noopener noreferrer';", body)
 
     def test_status_modal_footer_is_close_and_check_and_save_session_only(self):
         """design spec §3 Hostnames: footer is exactly "Close" (secondary) +
@@ -1536,6 +1567,87 @@ class CarbonConfigCssContractTests(unittest.TestCase):
                 "--cds-warning-text: #f1c21b", ""
             ),
         )
+
+    def test_cta_row_gap_matches_the_16px_rhythm(self):
+        """Regression pin: the CTA row's original 2px gap (a leftover from
+        the design plan) was the direct cause of Save and Cancel touching
+        each other. It is now the same 16px used everywhere else, and the
+        help text's own redundant margin-left is gone - the row's gap alone
+        now spaces every child (both buttons and the help text) evenly.
+        """
+        css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
+        rule_match = re.search(r"\.cds-cta-row \{([^}]*)\}", css)
+        self.assertIsNotNone(rule_match, "cds-cta-row rule not found")
+        rule_body = rule_match.group(1)
+        self.assertIn("gap: 16px", rule_body)
+        self.assertNotIn("gap: 2px", rule_body)
+        self.assertNotIn(".cds-cta-row .cds-field__help", css)
+
+    def test_modal_body_has_a_shared_vertical_rhythm(self):
+        """Regression pin: the hostname status modal's quick link used to
+        sit flush against the status line above it. Every modal body child
+        now starts with no margin of its own and gets a uniform 16px gap
+        from whatever sibling precedes it, instead of a one-off margin on
+        any single element.
+        """
+        css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
+        reset_match = re.search(r"\.cds-modal__body > \* \{([^}]*)\}", css)
+        self.assertIsNotNone(reset_match, "cds-modal__body > * rule not found")
+        reset_body = reset_match.group(1)
+        self.assertIn("margin-top: 0", reset_body)
+        self.assertIn("margin-bottom: 0", reset_body)
+        rhythm_match = re.search(r"\.cds-modal__body > \* \+ \* \{([^}]*)\}", css)
+        self.assertIsNotNone(rhythm_match, "cds-modal__body > * + * rule not found")
+        self.assertIn("margin-top: 16px", rhythm_match.group(1))
+
+    def test_modal_body_status_line_is_forced_block_level(self):
+        """Regression pin: .cds-status is inline-flex everywhere else (a
+        row/table-cell badge sitting beside other inline content), but as a
+        bare modal-body child that inline-level box let a following sibling
+        render on the very same line instead of the row below it - the
+        "Open <ID>" link still touched the status text even with the
+        vertical-rhythm margin above in place, since vertical margin on an
+        inline box has no visual effect. Scoped to modal bodies only, so
+        every other .cds-status usage (queue rows, the hostname table's
+        dot-only status) keeps its inline-flex layout.
+        """
+        css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
+        rule_match = re.search(r"\.cds-modal__body > \.cds-status \{([^}]*)\}", css)
+        self.assertIsNotNone(rule_match, "cds-modal__body > .cds-status rule not found")
+        self.assertIn("display: flex", rule_match.group(1))
+
+    def test_text_link_is_inline_block_so_vertical_margin_applies(self):
+        """Regression pin: a plain `inline` box (the default for an <a>,
+        unlike a <button>'s own inline-block default) ignores vertical
+        margin entirely, which is what let the hostname status modal's
+        quiet "Open <ID>" link render on the very same line as the status
+        text above it even after both the vertical-rhythm margin and the
+        status-line block-level fix were in place. inline-block keeps this
+        class usable inline within a sentence (the CAPTCHA helper line's
+        "First time? <button>...") while making vertical margin work.
+        """
+        css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
+        rule_match = re.search(r"\.cds-text-link \{([^}]*)\}", css)
+        self.assertIsNotNone(rule_match, "cds-text-link rule not found")
+        self.assertIn("display: inline-block", rule_match.group(1))
+
+    def test_modal_title_mono_suffix_is_smaller_and_never_breaks_mid_hostname(self):
+        """design spec §2.4: the title's Mono hostname suffix renders at
+        16px (smaller than the 20px title) on its own line under it.
+        Regression pin: at the title's own 20px size, a long hostname
+        competed with the title for width and - since default line
+        breaking treats a hyphen as a break opportunity - could wrap
+        mid-hostname (e.g. "release-source-fixture.invalid" breaking after
+        a hyphen) instead of at a sensible boundary. nowrap keeps the whole
+        suffix on its own single line regardless.
+        """
+        css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
+        rule_match = re.search(r"\.cds-modal__title \.cds-mono \{([^}]*)\}", css)
+        self.assertIsNotNone(rule_match, "cds-modal__title .cds-mono rule not found")
+        rule_body = rule_match.group(1)
+        self.assertIn("font-size: 16px", rule_body)
+        self.assertIn("display: block", rule_body)
+        self.assertIn("white-space: nowrap", rule_body)
 
 
 if __name__ == "__main__":

@@ -462,6 +462,14 @@ a {
 }
 
 .cds-text-link {
+	/* inline-block (not the plain "inline" a <button> defaults to and an
+	   <a> reset to this class does not override) so a caller stacking this
+	   alongside sibling elements via the modal body's vertical-rhythm rule
+	   above actually gets that margin - vertical margin on a plain inline
+	   box is not rendered at all. Still flows inline with surrounding text
+	   (e.g. the CAPTCHA helper line's "First time? <button>...") since
+	   inline-block boxes still sit on the same line as their neighbours. */
+	display: inline-block;
 	background: none;
 	border: 0;
 	padding: 0;
@@ -1155,6 +1163,19 @@ a {
 	font-weight: 400;
 }
 
+/* design spec §2.4: the title's Mono hostname suffix (see showModal's
+   titleMonoSuffix option) renders smaller than the 20px title and on its
+   own line under it - at the title's own size a long hostname competes
+   with the title for width and, since default line breaking treats a
+   hyphen as a break opportunity, can wrap mid-hostname instead of at a
+   sensible boundary. nowrap keeps the whole suffix on that one line. */
+.cds-modal__title .cds-mono {
+	display: block;
+	margin-top: 4px;
+	font-size: 16px;
+	white-space: nowrap;
+}
+
 .cds-modal__actions {
 	flex: 0 0 auto;
 	display: flex;
@@ -1175,6 +1196,34 @@ a {
 	/* A scrolled-to-the-end mirror list must not hand the scroll gesture
 	   off to the page behind the backdrop. */
 	overscroll-behavior: contain;
+}
+
+/* One shared vertical rhythm for every modal body, instead of a one-off
+   margin on whichever child happens to need it: every direct child (a
+   status line, a link, a paragraph, a field, a whole section) starts flush
+   with no margin of its own, then gets the same 16px gap from the sibling
+   above it. This is what keeps e.g. the hostname status modal's quick link
+   from sitting flush against the status line above it, regardless of what
+   element type either one is. */
+.cds-modal__body > * {
+	margin-top: 0;
+	margin-bottom: 0;
+}
+
+/* .cds-status is inline-flex everywhere else on purpose (a row/table-cell
+   badge that sits beside other inline content) - but as a bare modal-body
+   child (the hostname status modal's own status line, buildStatusLine()'s
+   only caller) that inline-level box lets a following sibling render on
+   the very same line instead of the row below it, which is what let the
+   "Open <ID>" link sit flush against the status text even with the
+   vertical-rhythm margin above already in place. flex keeps the same
+   internal dot+text alignment while making the box itself block-level. */
+.cds-modal__body > .cds-status {
+	display: flex;
+}
+
+.cds-modal__body > * + * {
+	margin-top: 16px;
 }
 
 .cds-toast-region {
@@ -1351,8 +1400,7 @@ a {
 .cds-hostname-table__caps { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .cds-hostname-table__note { margin: 4px 0 0; font-size: 12px; color: var(--cds-warning-text); }
 
-.cds-cta-row { display: flex; align-items: center; gap: 2px; margin-top: 16px; }
-.cds-cta-row .cds-field__help { margin-left: 16px; }
+.cds-cta-row { display: flex; align-items: center; gap: 16px; margin-top: 16px; }
 
 @media (max-width: 1056px) {
 	.cds-hostname-table {

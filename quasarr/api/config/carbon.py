@@ -297,25 +297,34 @@ def render_hostnames(shared_state) -> str:
         "</div>"
     )
 
-    content = "".join(
-        [
-            _hostnames_import_section(model),
-            '<span id="hostnames-flaresolverr-skipped" hidden '
-            f'data-skipped="{flaresolverr_flag}"></span>',
-            '<form id="hostnames-form" action="/api/hostnames" method="post">',
-            '<input type="hidden" id="hostnames-url-hidden" name="hostnames_url" '
-            f'value="{stored_url}">',
-            table_tile,
-            cta_row,
-            "</form>",
-            tile(
-                "<p>Restarting Quasarr applies configuration changes that need a "
-                "full reload.</p>"
-                '<button class="cds-btn cds-btn--danger-ghost" type="button" '
-                'data-action="hostnames-restart-open">Restart Quasarr</button>',
-                heading="Maintenance",
-            ),
-        ]
+    # The import tile, the hostnames form (table + save/cancel row), and the
+    # Maintenance tile are top-level page sections with no grid of their own
+    # to carry a gap - wrapped in the shared .cds-stack helper (16px, the
+    # same rhythm every other Carbon page uses between tiles) so Maintenance
+    # never starts flush against the button row above it.
+    content = (
+        '<div class="cds-stack">'
+        + "".join(
+            [
+                _hostnames_import_section(model),
+                '<span id="hostnames-flaresolverr-skipped" hidden '
+                f'data-skipped="{flaresolverr_flag}"></span>',
+                '<form id="hostnames-form" action="/api/hostnames" method="post">',
+                '<input type="hidden" id="hostnames-url-hidden" name="hostnames_url" '
+                f'value="{stored_url}">',
+                table_tile,
+                cta_row,
+                "</form>",
+                tile(
+                    "<p>Restarting Quasarr applies configuration changes that need a "
+                    "full reload.</p>"
+                    '<button class="cds-btn cds-btn--danger-ghost" type="button" '
+                    'data-action="hostnames-restart-open">Restart Quasarr</button>',
+                    heading="Maintenance",
+                ),
+            ]
+        )
+        + "</div>"
     )
 
     return render_carbon_html(

@@ -457,7 +457,7 @@ def _deferred_table_skeleton():
         '<div id="deferred-action-status" class="cds-field__help" aria-live="polite"></div>'
         '<div class="cds-table-wrap">'
         '<table class="cds-table cds-table--sticky-col" id="deferred-table">'
-        "<caption>Deferred linkcrypter checks</caption>"
+        '<caption class="cds-visually-hidden">Deferred linkcrypter checks</caption>'
         "<thead><tr>"
         '<th scope="col"><input type="checkbox" id="deferred-select-all" '
         'aria-label="Select all deferred packages"></th>'
@@ -531,7 +531,7 @@ def _queue_table_skeleton():
         "</div>"
         '<div class="cds-table-wrap">'
         '<table class="cds-table" id="queue-table">'
-        "<caption>Active downloads</caption>"
+        '<caption class="cds-visually-hidden">Active downloads</caption>'
         f"{_queue_table_head()}"
         '<tbody id="queue-table-body"></tbody>'
         "</table></div>"
@@ -546,7 +546,7 @@ def _history_table_skeleton():
         '<h2 class="cds-tile__heading">History</h2>'
         '<div class="cds-table-wrap">'
         '<table class="cds-table" id="history-table">'
-        "<caption>Recent history</caption>"
+        '<caption class="cds-visually-hidden">Recent history</caption>'
         f"{_history_table_head()}"
         '<tbody id="history-table-body"></tbody>'
         "</table></div>"
@@ -614,10 +614,16 @@ def render_downloads(shared_state) -> str:
     of that for a JS-disabled visitor, since none of it ever renders without
     JS.
     """
+    # cds-stack (the same 16px rhythm every other Carbon page uses between
+    # tiles) separates the deferred/queue/history/other sections - without
+    # it they run together as one undifferentiated block, since .cds-tile
+    # itself carries no margin. carbon.js only ever swaps <tbody> rows or
+    # toggles `hidden`/`data-state` here, never this class, so it survives
+    # every poll.
     content = (
         _downloads_noscript_notice()
         + _downloads_notices()
-        + '<div id="downloads-content" data-state="loading">'
+        + '<div id="downloads-content" class="cds-stack" data-state="loading">'
         + _deferred_table_skeleton()
         + _queue_table_skeleton()
         + _history_table_skeleton()

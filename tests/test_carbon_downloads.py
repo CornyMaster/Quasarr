@@ -377,6 +377,46 @@ class DownloadsSkeletonRenderTests(unittest.TestCase):
             with self.subTest(element_id=element_id):
                 self.assertIn(f'id="{element_id}"', html)
 
+    def test_sections_share_the_stack_rhythm(self):
+        """Regression pin: the deferred/queue/history/other sections used
+        to be concatenated with nothing between them - .cds-tile carries no
+        margin of its own, so the three sections ran together as one
+        undifferentiated block. #downloads-content now carries the shared
+        .cds-stack class (the same 16px rhythm every other Carbon page uses
+        between tiles).
+        """
+        html = self._render()
+        self.assertIn('id="downloads-content" class="cds-stack"', html)
+
+    def test_table_captions_are_visually_hidden_not_deleted(self):
+        """Regression pin: each of the deferred/queue/history sections
+        rendered a visible <h2> heading AND a <caption> saying nearly the
+        same thing ("Deferred linkcrypter checks" appeared verbatim twice,
+        "Queue (n)" was followed by "Active downloads", "History" by
+        "Recent history"), reading as a duplicated label. The captions
+        exist for assistive technology and must survive - they are now
+        visually hidden via the existing .cds-visually-hidden utility
+        instead of deleted, so a screen reader still gets a table caption
+        while sighted users stop seeing the label twice.
+        """
+        html = self._render()
+        for caption_text in (
+            "Deferred linkcrypter checks",
+            "Active downloads",
+            "Recent history",
+        ):
+            with self.subTest(caption=caption_text):
+                self.assertIn(
+                    f'<caption class="cds-visually-hidden">{caption_text}</caption>',
+                    html,
+                )
+        # The visible section headings are untouched - the fix hides the
+        # caption, not the heading.
+        self.assertIn(
+            '<h2 class="cds-tile__heading">Deferred linkcrypter checks</h2>', html
+        )
+        self.assertIn('<h2 class="cds-tile__heading">History</h2>', html)
+
     def test_deferred_table_columns_match_a1(self):
         html = self._render()
         table_start = html.index('id="deferred-table"')

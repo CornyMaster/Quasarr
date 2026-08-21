@@ -1747,14 +1747,19 @@
 				// footer: design spec §3's footer is defined as exactly
 				// Close + "Check & save session", but this link is real
 				// function this page offered before and must keep
-				// offering (no loss of function).
+				// offering (no loss of function). Styled as a plain text
+				// link (cds-text-link), not a chip button - a filled
+				// tertiary button next to a one-line status was too heavy
+				// for a secondary action; the modal body's own vertical
+				// rhythm (see carbon.css) keeps it from touching the
+				// status line above it.
 				if (row.hostname) {
 					var openHref = row.hostname;
 					if (!/^https?:\/\//i.test(openHref)) {
 						openHref = 'https:' + '//' + openHref;
 					}
 					var openLink = document.createElement('a');
-					openLink.className = 'cds-btn cds-btn--tertiary';
+					openLink.className = 'cds-text-link';
 					openLink.href = openHref;
 					openLink.target = '_blank';
 					openLink.rel = 'noopener noreferrer';
