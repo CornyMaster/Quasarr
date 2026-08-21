@@ -14,6 +14,7 @@ from quasarr.providers.filecrypt_lifecycle import (
     FILECRYPT_SWEEP_KEY,
     FILECRYPT_SWEEP_MEMBERS_TABLE,
     FILECRYPT_SWEEP_STATE_TABLE,
+    MINIMUM_GLOBAL_COOLDOWN_SIZE,
     decode_link_state,
     decode_offer_receipt,
     decode_sweep_header,
@@ -24,6 +25,7 @@ from quasarr.providers.filecrypt_lifecycle_decisions import (
     validate_defer_response,
 )
 from quasarr.providers.filecrypt_lifecycle_service import (
+    DEFAULT_SWEEP_BLOCK_THRESHOLD,
     OFFER_LEASE_SECONDS,
     FilecryptLifecycleService,
 )
@@ -420,6 +422,10 @@ class TestMixedSweepNoCooldown(OutcomeTestCase):
 
     def test_mixed_no_cooldown(self):
         svc = self.service()
+        # This case is about the 100% trigger refusing a cohort with one CLEAR,
+        # so the block-count trigger is lifted above the cohort size; at the
+        # default threshold the sweep would pause long before member 499.
+        self.state.values["filecrypt_sweep_block_threshold"] = 500
         # Need at least 500 fps: use range(500)
         rows = self.protected_rows(range(500))
         # Open sweep and accept all blocked except last
@@ -646,6 +652,10 @@ class TestLargeSequence(OutcomeTestCase):
 
     def test_101_members_all_blocked(self):
         svc = self.service()
+        # This case is about the absence of a cohort cap, so the block-count
+        # trigger is lifted above the cohort size; at the default threshold the
+        # sweep would pause after the fifth block and stop handing out members.
+        self.state.values["filecrypt_sweep_block_threshold"] = 101
         rows = self.protected_rows(range(101))
         offers = []
         for i in range(101):
@@ -1070,6 +1080,189 @@ class TestResponseMatrix(OutcomeTestCase):
         self.assertEqual(resp["sweep_tested"], 0)
         self.assertEqual(resp["sweep_total"], 0)
         self.assertGreater(resp["sweep_deadline_epoch"], 0)
+
+
+# -- threshold-based site-wide pause ------------------------------------------
+
+
+class TestBlockThresholdPausesTheCrypter(OutcomeTestCase):
+    """Enough blocks inside a live sweep window pause Filecrypt on their own.
+
+    The complete-cohort trigger next to this one needs a complete, fully
+    blocked, still-globally-possible cohort, which a real IP block never
+    produces: it answers a mix of BLOCKED and UNKNOWN, every UNKNOWN clears
+    `global_possible`, and the cohort is far too large to walk inside one
+    window.  This trigger exists so the pause is reachable in exactly that
+    situation, which is why none of those three conditions may be required.
+    """
+
+    def test_threshold_pauses_despite_unknown_and_incomplete_sweep(self):
+        svc = self.service()
+        rows = self.protected_rows(range(10))
+
+        # One UNKNOWN member first - a FlareSolverr timeout looks like this -
+        # which permanently clears `global_possible` for the whole sweep.
+        unknown_offer = svc.prepare_offer(rows)
+        svc.record_access(_report_access(unknown_offer, access="unknown"), rows)
+        self.assertFalse(self.header()["global_possible"])
+
+        result = None
+        for i in range(DEFAULT_SWEEP_BLOCK_THRESHOLD):
+            offer = svc.prepare_offer(rows)
+            self.assertIsNotNone(offer, f"offer {i} was None")
+            result = svc.record_blocked(_report_blocked(offer), rows)
+            self.assertIsNotNone(result, f"report {i} was stale")
+
+        # The sweep is deliberately still incomplete when it concludes.
+        self.assertLess(result["sweep_tested"], result["sweep_total"])
+
+        validate_defer_response(_response_of(result))
+        self.assertEqual(result["instruction"], "cooldown")
+        self.assertEqual(result["state"], "cooldown")
+        self.assertEqual(result["hold_type"], "crypter_cooldown")
+
+        hdr = self.header()
+        self.assertEqual(hdr["state"], "cooldown")
+        self.assertEqual(hdr["retry_after_epoch"], NOW + COOLDOWN_SECONDS)
+        self.assertEqual(svc.decision()["state"], "cooldown")
+
+        events = self.pending_events()
+        self.assertEqual(events["observations"], DEFAULT_SWEEP_BLOCK_THRESHOLD)
+        self.assertEqual(events["cooldowns"], 1)
+
+    def test_paused_crypter_hands_out_no_ordinary_work(self):
+        svc = self.service()
+        rows = self.protected_rows(range(10))
+        for _ in range(DEFAULT_SWEEP_BLOCK_THRESHOLD):
+            offer = svc.prepare_offer(rows)
+            svc.record_blocked(_report_blocked(offer), rows)
+
+        self.assertEqual(self.header()["state"], "cooldown")
+        # Nothing but a probe may be handed out while the crypter is paused,
+        # and no probe was requested, so there is no work at all.
+        self.assertIsNone(svc.prepare_offer(rows))
+
+    def test_handouts_resume_after_retry_after_epoch(self):
+        svc = self.service()
+        rows = self.protected_rows(range(10))
+        for _ in range(DEFAULT_SWEEP_BLOCK_THRESHOLD):
+            offer = svc.prepare_offer(rows)
+            svc.record_blocked(_report_blocked(offer), rows)
+
+        retry_after = self.header()["retry_after_epoch"]
+        self.clock.now = retry_after - 1
+        self.assertIsNone(svc.prepare_offer(rows))
+
+        # The pause is a deadline, not a dead end: once it passes the service
+        # hands out ordinary work again, exactly as after the complete-cohort
+        # cooldown.
+        self.clock.now = retry_after
+        resumed = svc.prepare_offer(rows)
+        self.assertIsNotNone(resumed)
+        self.assertNotEqual(resumed["mode"], "probe")
+
+    def test_one_block_below_the_threshold_pauses_nothing(self):
+        svc = self.service()
+        rows = self.protected_rows(range(10))
+        result = None
+        for _ in range(DEFAULT_SWEEP_BLOCK_THRESHOLD - 1):
+            offer = svc.prepare_offer(rows)
+            result = svc.record_blocked(_report_blocked(offer), rows)
+
+        self.assertEqual(result["instruction"], "hold")
+        self.assertEqual(result["state"], "sweeping")
+        self.assertEqual(self.header()["state"], "sweeping")
+        self.assertEqual(self.pending_events()["cooldowns"], 0)
+        # Ordinary sweep work continues.
+        self.assertEqual(svc.prepare_offer(rows)["mode"], "sweep")
+
+    def test_expired_window_pauses_nothing(self):
+        svc = self.service()
+        # A one-minute window expires well inside the 300 s offer lease, so the
+        # last report below still arrives on a live lease but into a dead sweep.
+        self.state.values["filecrypt_sweep_window_minutes"] = 1
+        rows = self.protected_rows(range(10))
+
+        offers = [svc.prepare_offer(rows) for _ in range(DEFAULT_SWEEP_BLOCK_THRESHOLD)]
+        for offer in offers[:-1]:
+            self.assertIsNotNone(svc.record_blocked(_report_blocked(offer), rows))
+
+        deadline = self.header()["deadline_epoch"]
+        self.clock.now = deadline
+        result = svc.record_blocked(_report_blocked(offers[-1]), rows)
+
+        self.assertIsNotNone(result)
+        self.assertNotEqual(result["instruction"], "cooldown")
+        self.assertNotEqual(self.header()["state"], "cooldown")
+        self.assertEqual(self.pending_events()["cooldowns"], 0)
+
+    def test_configured_threshold_is_read_from_settings(self):
+        svc = self.service()
+        self.state.values["filecrypt_sweep_block_threshold"] = 8
+        rows = self.protected_rows(range(10))
+
+        result = None
+        for i in range(8):
+            offer = svc.prepare_offer(rows)
+            self.assertIsNotNone(offer, f"offer {i} was None")
+            result = svc.record_blocked(_report_blocked(offer), rows)
+            if i < 7:
+                self.assertEqual(result["instruction"], "hold", f"paused at {i}")
+
+        self.assertEqual(result["instruction"], "cooldown")
+        self.assertEqual(self.header()["state"], "cooldown")
+
+    def test_threshold_below_the_floor_is_clamped_up(self):
+        svc = self.service()
+        # A configured 2 would pause the crypter on evidence too thin for a
+        # site-wide conclusion, so the established floor still applies.
+        self.state.values["filecrypt_sweep_block_threshold"] = 2
+        rows = self.protected_rows(range(10))
+
+        result = None
+        for _ in range(MINIMUM_GLOBAL_COOLDOWN_SIZE - 1):
+            offer = svc.prepare_offer(rows)
+            result = svc.record_blocked(_report_blocked(offer), rows)
+        self.assertEqual(result["instruction"], "hold")
+
+        offer = svc.prepare_offer(rows)
+        result = svc.record_blocked(_report_blocked(offer), rows)
+        self.assertEqual(result["instruction"], "cooldown")
+
+    def test_unreadable_threshold_falls_back_to_the_default(self):
+        svc = self.service()
+        self.state.values["filecrypt_sweep_block_threshold"] = "not a number"
+        rows = self.protected_rows(range(10))
+
+        result = None
+        for _ in range(DEFAULT_SWEEP_BLOCK_THRESHOLD):
+            offer = svc.prepare_offer(rows)
+            result = svc.record_blocked(_report_blocked(offer), rows)
+
+        self.assertEqual(result["instruction"], "cooldown")
+
+
+class TestCompleteCohortTriggerSurvives(OutcomeTestCase):
+    """The original complete-cohort trigger still concludes a sweep by itself."""
+
+    def test_complete_all_blocked_cohort_cools_below_the_threshold(self):
+        svc = self.service()
+        # Lifted far above the cohort size, so only the complete-cohort trigger
+        # can possibly fire here.
+        self.state.values["filecrypt_sweep_block_threshold"] = 1000
+        rows = self.protected_rows(range(MINIMUM_GLOBAL_COOLDOWN_SIZE))
+
+        result = None
+        for _ in range(MINIMUM_GLOBAL_COOLDOWN_SIZE):
+            offer = svc.prepare_offer(rows)
+            result = svc.record_blocked(_report_blocked(offer), rows)
+
+        validate_defer_response(_response_of(result))
+        self.assertEqual(result["instruction"], "cooldown")
+        self.assertEqual(result["state"], "cooldown")
+        self.assertEqual(result["hold_type"], "crypter_cooldown")
+        self.assertEqual(self.header()["state"], "cooldown")
+        self.assertEqual(self.pending_events()["cooldowns"], 1)
 
 
 if __name__ == "__main__":

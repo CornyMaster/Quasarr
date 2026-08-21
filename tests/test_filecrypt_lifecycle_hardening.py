@@ -560,6 +560,10 @@ class LifecycleHardeningFakeTests(unittest.TestCase):
     def test_1000_member_all_blocked_scale(self):
         """1,000 members all BLOCKED before deadline: cooldown, exact counters."""
         n = 1000
+        # This case measures scale, so the block-count trigger is lifted above
+        # the cohort size; at the default threshold the sweep would pause after
+        # the fifth block instead of walking all 1,000 members.
+        self.state.values["filecrypt_sweep_block_threshold"] = n
         rows = rows_for(range(1, n + 1))
         self._store_packages(rows)
         svc = self.service()

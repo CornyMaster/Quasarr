@@ -79,6 +79,18 @@ RECEIPT_ADVISORY_THRESHOLD = 4096
 # which bounds the retest offers one dead link can consume at roughly this
 # value divided by the configured cooldown period (8 at the 24-hour default).
 MAXIMUM_HELD_SECONDS_BEFORE_BLACKLIST = 7 * 24 * 3600
+# How many distinct cohort members must be reported BLOCKED inside one live
+# sweep window before Filecrypt is paused as a linkcrypter, without waiting for
+# the rest of the cohort. This bounds how many packages one IP block may push
+# onto the deferred list before handouts stop: at most this many per sweep
+# window, instead of the whole inventory. The default equals
+# MINIMUM_GLOBAL_COOLDOWN_SIZE, the established floor for "a cohort big enough
+# for a site-wide conclusion" - below it a couple of unrelated per-link failures
+# could pause the whole linkcrypter, and above it every further member spends a
+# helper solve on a link the block has already doomed. Read from settings as
+# `filecrypt_sweep_block_threshold`; a configured value below the floor is
+# clamped up to it.
+DEFAULT_SWEEP_BLOCK_THRESHOLD = MINIMUM_GLOBAL_COOLDOWN_SIZE
 
 _SCHEMA_VERSION = 1
 _WINDOW_MIN = 1
@@ -1047,6 +1059,16 @@ class FilecryptLifecycleService:
             hours = MINIMUM_COOLDOWN_HOURS
         return max(MINIMUM_COOLDOWN_HOURS, hours) * 3600
 
+    def _sweep_block_threshold(self):
+        configured = self._shared_state.values.get(
+            "filecrypt_sweep_block_threshold", DEFAULT_SWEEP_BLOCK_THRESHOLD
+        )
+        try:
+            threshold = int(configured)
+        except (TypeError, ValueError):
+            threshold = DEFAULT_SWEEP_BLOCK_THRESHOLD
+        return max(MINIMUM_GLOBAL_COOLDOWN_SIZE, threshold)
+
     def record_blocked(self, report, protected_rows):
         """Accept a first-time BLOCKED report, or return None if stale."""
         try:
@@ -1071,6 +1093,7 @@ class FilecryptLifecycleService:
         now = int(self._clock())
         cooldown_secs = self._cooldown_seconds()
         window_secs = self._sweep_window_seconds()
+        block_threshold = self._sweep_block_threshold()
 
         _now = now
         _fp = fingerprint
@@ -1081,6 +1104,7 @@ class FilecryptLifecycleService:
         _raw_package = raw_package
         _cooldown = cooldown_secs
         _window = window_secs
+        _threshold = block_threshold
         result = [None]
 
         targets = [
@@ -1433,6 +1457,20 @@ class FilecryptLifecycleService:
                     and total >= MINIMUM_GLOBAL_COOLDOWN_SIZE
                     and _now < hdr["deadline_epoch"]
                 )
+                # Second trigger: enough distinct members have already landed on
+                # the deferred list inside this still-live window. It requires
+                # none of the three conjuncts above, on purpose. Completeness is
+                # the very thing being avoided - the point is to stop early
+                # rather than walk the rest of the cohort. `blocked == total`
+                # demands a perfect cohort, while a real IP block reads as a mix
+                # of BLOCKED and UNKNOWN. And `global_possible` is cleared by any
+                # UNKNOWN member (see record_access), which is exactly what a
+                # transport hiccup such as a FlareSolverr timeout produces, so
+                # depending on it would disqualify the sweep that needs this most.
+                # A live window is still required, so a stale header can never
+                # pause anything.
+                if blocked >= _threshold and _now < hdr["deadline_epoch"]:
+                    is_global_cooldown = True
 
                 if is_global_cooldown:
                     cooldown_hdr = {
