@@ -254,9 +254,9 @@ class TestRetestClear(RetestTestCase):
 
 
 class TestRetestUnknown(RetestTestCase):
-    """RED: retest UNKNOWN clears lease, preserves held, no header/counters."""
+    """RED: retest UNKNOWN clears lease, backs off hold, no header/counters."""
 
-    def test_retest_unknown_clears_lease_preserves_held(self):
+    def test_retest_unknown_clears_lease_backs_off_hold(self):
         offer, rows = self.prepare_first_time_blocked()
         retest_offer = self.advance_to_retest(offer, rows)
 
@@ -278,9 +278,13 @@ class TestRetestUnknown(RetestTestCase):
         self.assertIsNotNone(ls)
         self.assertEqual(ls["state"], "held")
         self.assertIsNone(ls["lease"])
-        # Original epochs preserved
+        # The anchor the eventual terminal decision measures from is never
+        # rewritten by a report that proves nothing.
         self.assertEqual(ls["first_blocked_epoch"], NOW)
-        self.assertEqual(ls["retry_after_epoch"], NOW + COOLDOWN_SECONDS)
+        # The already-expired hold is not preserved as-is: it is backed off
+        # from report time, so the link cannot be re-offered immediately.
+        retest_now = NOW + COOLDOWN_SECONDS + 1
+        self.assertEqual(ls["retry_after_epoch"], retest_now + COOLDOWN_SECONDS)
 
     def test_retest_unknown_no_header_change(self):
         offer, rows = self.prepare_first_time_blocked()
@@ -320,7 +324,27 @@ class TestRetestUnknown(RetestTestCase):
         self.assertEqual(events["cooldowns"], 0)
         self.assertEqual(events["probes"], 0)
 
-    def test_retest_unknown_then_next_prepare_gets_retest(self):
+    def test_retest_unknown_then_link_is_not_immediately_reofferable(self):
+        rows = self.protected_rows(range(1))
+        svc = self.service()
+        offer = svc.prepare_offer(rows)
+        self.assertEqual(offer["mode"], "individual")
+        svc.record_blocked(_report_blocked(offer), rows)
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = svc.prepare_offer(rows)
+        self.assertEqual(retest_offer["mode"], "retest")
+
+        report = _report_access(retest_offer, access="unknown")
+        svc.record_access(report, rows)
+
+        # The lease was cleared, but retry_after_epoch was backed off from
+        # report time, so the very next prepare_offer() - however soon it
+        # arrives - must not re-lease the same link that just proved nothing.
+        self.assertIsNone(svc.prepare_offer(rows))
+        ls = self.link_state(offer["link_fingerprint"])
+        self.assertEqual(ls["state"], "held")
+
+    def test_retest_unknown_then_retest_offered_again_after_backoff(self):
         offer, rows = self.prepare_first_time_blocked()
         retest_offer = self.advance_to_retest(offer, rows)
 
@@ -328,8 +352,10 @@ class TestRetestUnknown(RetestTestCase):
         report = _report_access(retest_offer, access="unknown")
         svc.record_access(report, rows)
 
-        # retry_after is in the past (NOW + COOLDOWN), clock is NOW + COOLDOWN + 1
-        # Lease was cleared, so next prepare should issue a new retest
+        # Once the backed-off hold itself expires, the link becomes an
+        # ordinary retest candidate again - the backoff throttles the rate,
+        # it does not strand the link forever.
+        self.clock.now += COOLDOWN_SECONDS + 1
         next_offer = svc.prepare_offer(rows)
         self.assertIsNotNone(next_offer)
         self.assertEqual(next_offer["mode"], "retest")
@@ -347,6 +373,152 @@ class TestRetestUnknown(RetestTestCase):
         self.state.get_db("protected").rows.clear()
         result2 = svc.record_access(report, [])
         self.assertEqual(result1, result2)
+
+
+# -- retest UNKNOWN offers are bounded ----------------------------------------
+
+
+class TestRetestUnknownLoopIsBounded(RetestTestCase):
+    """A link whose retests keep proving nothing cannot be offered without bound.
+
+    This is the exact production incident: the helper reaches a container
+    through FlareSolverr, the browser request times out, so access can never
+    be proven either way, and the helper reports `unknown` every single time.
+    Before the fix the branch preserved the already-expired retry_after_epoch,
+    so the very next prepare_offer() - called again immediately, with no time
+    elapsed - reissued another retest lease for the same link, forever.
+    """
+
+    def _held_link(self):
+        """One Filecrypt link, blocked once, so it is held for one cooldown."""
+        svc = self.service()
+        rows = self.protected_rows(range(1))
+        offer = svc.prepare_offer(rows)
+        self.assertEqual(offer["mode"], "individual")
+        self.assertIsNotNone(svc.record_blocked(_report_blocked(offer), rows))
+        return offer["link_fingerprint"], rows
+
+    def test_offers_without_advancing_the_clock_are_bounded(self):
+        fingerprint, rows = self._held_link()
+        svc = self.service()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = svc.prepare_offer(rows)
+        self.assertEqual(retest_offer["mode"], "retest")
+
+        report = _report_access(retest_offer, access="unknown")
+        first = svc.record_access(report, rows)
+        self.assertIsNotNone(first, "an UNKNOWN report must change state")
+
+        offers_consumed = 0
+        for _ in range(20):
+            next_offer = svc.prepare_offer(rows)
+            if next_offer is None:
+                break
+            offers_consumed += 1
+            self.assertIsNotNone(
+                svc.record_access(_report_access(next_offer, access="unknown"), rows)
+            )
+
+        self.assertEqual(
+            offers_consumed,
+            0,
+            "a link that keeps proving nothing must not be re-offered "
+            "before its own hold expires",
+        )
+
+    def test_offers_are_bounded_by_the_cooldown_period(self):
+        fingerprint, rows = self._held_link()
+        svc = self.service()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = svc.prepare_offer(rows)
+        self.assertEqual(retest_offer["mode"], "retest")
+
+        rounds = 10
+        for _ in range(rounds):
+            self.assertIsNotNone(
+                svc.record_access(_report_access(retest_offer, access="unknown"), rows)
+            )
+            # A tight loop with no time elapsed gets nothing.
+            self.assertIsNone(svc.prepare_offer(rows))
+            self.clock.now += COOLDOWN_SECONDS + 1
+            retest_offer = svc.prepare_offer(rows)
+            self.assertIsNotNone(retest_offer)
+            self.assertEqual(retest_offer["mode"], "retest")
+
+        ls = self.link_state(fingerprint)
+        # Every UNKNOWN retest left the terminal-decision anchor untouched.
+        self.assertEqual(ls["first_blocked_epoch"], NOW)
+        # rounds+1 offers (the initial one plus one per round) required at
+        # least rounds full cooldown periods to elapse - never zero, which is
+        # what the unbounded loop looked like.
+        self.assertGreaterEqual(
+            self.clock.now, NOW + COOLDOWN_SECONDS + 1 + rounds * (COOLDOWN_SECONDS + 1)
+        )
+
+
+class TestRetestUnknownDoesNotResetTheRetirementClock(RetestTestCase):
+    """UNKNOWN retests must not let a permanently blocked link outrun its bound.
+
+    The retirement bound in `record_blocked`'s live-cooldown backoff measures
+    `now - first_blocked_epoch`. If an intervening UNKNOWN retest ever reset
+    that anchor, a link alternating UNKNOWN and BLOCKED retests could stay
+    held forever - two paths each individually bounded, but only because each
+    assumed the other was not resetting the clock.
+    """
+
+    def _arm_global_cooldown(self, now):
+        self.sweep_db().store(
+            FILECRYPT_SWEEP_KEY,
+            encode_sweep_header(
+                {
+                    "schema_version": 1,
+                    "state": "cooldown",
+                    "generation_id": "c" * 32,
+                    "sweep_deadline_epoch": now + WINDOW_SECONDS,
+                    "retry_after_epoch": now + COOLDOWN_SECONDS,
+                }
+            ),
+        )
+
+    def test_alternating_unknown_and_blocked_retests_still_retire(self):
+        rows = self.protected_rows(range(1))
+        svc = self.service()
+        offer = svc.prepare_offer(rows)
+        self.assertEqual(offer["mode"], "individual")
+        svc.record_blocked(_report_blocked(offer), rows)
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+
+        # One UNKNOWN retest first: backs off the hold but must not touch
+        # first_blocked_epoch.
+        retest_offer = svc.prepare_offer(rows)
+        self.assertIsNotNone(retest_offer)
+        self.assertIsNotNone(
+            svc.record_access(_report_access(retest_offer, access="unknown"), rows)
+        )
+        self.assertEqual(
+            self.link_state(offer["link_fingerprint"])["first_blocked_epoch"], NOW
+        )
+
+        # From here on, alternate BLOCKED-during-a-live-cooldown-race reports
+        # (record_blocked's own backoff path) until the link retires. The
+        # bound must still be measured from the original first_blocked_epoch.
+        terminal = None
+        for _ in range(20):
+            self.clock.now += COOLDOWN_SECONDS + 1
+            retest_offer = svc.prepare_offer(rows)
+            self.assertIsNotNone(retest_offer)
+            self.assertEqual(retest_offer["mode"], "retest")
+            self._arm_global_cooldown(self.clock.now)
+            result = svc.record_blocked(_report_blocked(retest_offer), rows)
+            self.assertIsNotNone(result)
+            if result.get("terminal_required"):
+                terminal = result
+                break
+
+        self.assertIsNotNone(terminal, "a permanently dead link must be retired")
+        ls = self.link_state(offer["link_fingerprint"])
+        self.assertEqual(ls["state"], "blacklisting")
+        self.assertEqual(ls["first_blocked_epoch"], NOW)
 
 
 # ── retest BLOCKED ────────────────────────────────────────────────────────────

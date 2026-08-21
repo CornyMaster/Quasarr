@@ -1471,6 +1471,7 @@ class FilecryptLifecycleService:
                     break
 
         now = int(self._clock())
+        cooldown_secs = self._cooldown_seconds()
         window_secs = self._sweep_window_seconds()
 
         _now = now
@@ -1481,6 +1482,7 @@ class FilecryptLifecycleService:
         _access = access
         _top_id = top_id
         _raw_package = raw_package
+        _cooldown = cooldown_secs
         _window = window_secs
         result = [None]
 
@@ -1589,9 +1591,22 @@ class FilecryptLifecycleService:
                                 events_raw,
                             )
                         else:
-                            # Retest UNKNOWN: clear lease, preserve epochs
+                            # Retest UNKNOWN: the report proves nothing about
+                            # this link, so it is not retired - but the
+                            # already-expired retry_after_epoch cannot be
+                            # preserved as-is: that would leave the link
+                            # immediately eligible for another retest lease,
+                            # so a helper that can never determine access
+                            # (e.g. a browser timeout) would be re-offered
+                            # the same dead link without bound. Back the
+                            # link's own hold off by one cooldown period
+                            # instead. first_blocked_epoch is left untouched
+                            # so a later BLOCKED retest's own held-too-long
+                            # bound still measures from the original block,
+                            # not from this report.
                             new_ls = dict(ls)
                             new_ls["lease"] = None
+                            new_ls["retry_after_epoch"] = _now + _cooldown
                             response = build_lifecycle_access_decision(
                                 state="individual",
                                 cleared=False,
