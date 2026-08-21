@@ -40,17 +40,12 @@ from quasarr.providers.carbon_templates import (
     notification,
     page_header,
     render_carbon_simple_page,
-    tag,
     tile,
 )
 from quasarr.search.sources.helpers import get_source_metadata
 from quasarr.storage.config import Config
 from quasarr.storage.setup.hostnames import build_hostname_rows
 from quasarr.storage.sqlite_database import DataBase
-
-_STATUS_TONE = {"ok": "green", "error": "red", "unset": "gray", "skipped": "blue"}
-
-_LANGUAGE_LABELS = {"en": "English", "de": "German", "fr": "French"}
 
 
 def _h(value: object) -> str:
@@ -131,44 +126,31 @@ def render_setup_path(current_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _hostname_capability_chips(row: Mapping[str, Any]) -> str:
-    chips = []
-
-    language = row.get("language")
-    if language in _LANGUAGE_LABELS:
-        chips.append(tag(_LANGUAGE_LABELS[language], tone="blue"))
-    if row.get("invite_only"):
-        chips.append(tag("Invite Only", tone="red"))
-    if row.get("requires_login"):
-        chips.append(tag("Login Required", tone="purple"))
-    elif row.get("requires_account"):
-        chips.append(tag("Account Required", tone="purple"))
-    if row.get("requires_flaresolverr"):
-        chips.append(tag("FlareSolverr Required", tone="teal"))
-
-    if not chips:
-        return ""
-    return '<div class="cds-hostname-row__caps">' + "".join(chips) + "</div>"
-
-
 def _setup_hostname_row_html(
     row: Mapping[str, Any], *, flaresolverr_skipped: bool
 ) -> str:
+    """Renders through the SAME dense-row builder the main Hostnames page
+    uses (``quasarr.api.config.carbon._hostname_row_html``) - imported
+    lazily, matching the project's no-module-scope-``.carbon``-import
+    convention (see that module's own docstring) - rather than keeping a
+    second copy of the row markup. What genuinely differs here stays a
+    parameter on that shared call: the status is not independently
+    clickable (a separate "Details" button - now living inside the
+    capabilities cell, there being no room for a fifth grid column - toggles
+    the inline credentials panel below the row instead of a JS-fetched
+    modal); the status tag keeps its ``hostname-status-tag-*`` id so
+    ``checkSetupHostnameCredentials()`` can still flip it green in place
+    after a successful check; the skip-login note keeps its own id/wording
+    ("Open Details", since Details still exists here); and the hostname
+    input needs an explicit ``form="hostnames-form"`` association, because
+    ``render_setup_hostnames`` deliberately leaves that ``<form>`` element
+    empty (see its own docstring) so a typed-then-hidden credential value
+    can never ride along in the save POST.
+    """
+    from quasarr.api.config.carbon import _hostname_row_html
+
     field_id = row["id"]
     safe_id = _h(field_id)
-    input_id = f"hostname-{safe_id}"
-    tone = _STATUS_TONE.get(row["status"], "gray")
-    status_html = tag(row["status_title"], tone=tone)
-    caps_html = _hostname_capability_chips(row)
-
-    skip_html = ""
-    if row.get("skip_login"):
-        skip_html = (
-            f'<p class="cds-hostname-row__skip-banner" id="hostname-skip-banner-{safe_id}">'
-            "Login was skipped for this site. Open Details to check credentials again."
-            "</p>"
-        )
-
     details_id = f"hostname-details-{safe_id}"
 
     detail_panel_parts = [
@@ -207,31 +189,33 @@ def _setup_hostname_row_html(
                 f'data-hostname-id="{safe_id}">Check &amp; Save Session</button>'
             )
 
-    return (
-        f'<div class="cds-hostname-row" data-hostname-id="{safe_id}">'
-        f'<div class="cds-hostname-row__status" id="hostname-status-tag-{safe_id}">{status_html}</div>'
-        '<div class="cds-hostname-row__body">'
-        '<div class="cds-hostname-row__heading">'
-        f'<span class="cds-hostname-row__label">{_h(row["label"])}</span>'
-        f"{caps_html}"
-        "</div>"
-        '<div class="cds-field">'
-        f'<label class="cds-field__label" for="{input_id}">Hostname</label>'
-        f'<input class="cds-field__input" id="{input_id}" name="{safe_id}" '
-        f'type="text" value="{_h(row["hostname"])}" placeholder="example.com" '
-        f'form="hostnames-form" autocomplete="off" autocorrect="off">'
-        "</div>"
-        f"{skip_html}"
-        "</div>"
-        '<div class="cds-hostname-row__actions">'
+    details_button = (
         '<button class="cds-btn cds-btn--ghost" type="button" '
         f'data-action="setup-hostname-toggle-details" data-hostname-id="{safe_id}" '
         f'aria-expanded="false" aria-controls="{details_id}">Details</button>'
-        "</div>"
-        f'<div id="{details_id}" class="cds-hostname-credentials" hidden>'
-        f"{''.join(detail_panel_parts)}"
-        "</div>"
-        "</div>"
+    )
+    skip_note_html = ""
+    if row.get("skip_login"):
+        skip_note_html = (
+            f'<p class="cds-hostname-table__note" id="hostname-skip-banner-{safe_id}">'
+            "Login was skipped for this site. Open Details to check credentials "
+            "again.</p>"
+        )
+
+    row_html = _hostname_row_html(
+        row,
+        status_action="",
+        status_wrapper_id=f"hostname-status-tag-{safe_id}",
+        trailing_caps_html=details_button,
+        skip_note_html=skip_note_html,
+        input_form="hostnames-form",
+    )
+
+    return (
+        row_html
+        + f'<div id="{details_id}" class="cds-hostname-credentials" hidden>'
+        + "".join(detail_panel_parts)
+        + "</div>"
     )
 
 
@@ -245,6 +229,13 @@ def render_setup_hostnames(shared_state) -> str:
         _setup_hostname_row_html(row, flaresolverr_skipped=flaresolverr_skipped)
         for row in rows
     )
+    # Same wrapper the main Hostnames page uses around its rows: without it,
+    # carbon.css's narrow-viewport rule (.cds-hostname-table__row's forced
+    # 760px min-width) still applies - the rows carry that class from the
+    # shared row builder regardless - but with no .cds-hostname-table
+    # ancestor to become a horizontal scroll container, so the rows simply
+    # overflowed this page's narrower (760px-max) card instead of scrolling.
+    table_html = f'<div class="cds-hostname-table">{rows_html}</div>'
 
     instructions = tile(
         "<p>If you're having trouble setting this up, take a closer look at "
@@ -282,7 +273,7 @@ def render_setup_hostnames(shared_state) -> str:
     sources_section = (
         '<form id="hostnames-form" action="/api/hostnames" method="post" '
         "data-guard-submit></form>"
-        + tile(rows_html, heading="Configured sources")
+        + tile(table_html, heading="Configured sources")
         + '<button class="cds-btn cds-btn--primary" type="submit" '
         'form="hostnames-form">Save</button>'
     )

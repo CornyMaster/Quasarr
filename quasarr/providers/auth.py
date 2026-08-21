@@ -290,11 +290,13 @@ def _render_login_page(error=None):
 
     def carbon():
         from quasarr.providers.carbon_templates import (
+            _assert_structural_guards,
+            _h,
             notification,
             page_header,
-            render_carbon_simple_page,
             tile,
         )
+        from quasarr.providers.static_assets import asset_url
 
         error_html = notification("error", "Login failed", str(error)) if error else ""
         form_html = (
@@ -310,13 +312,59 @@ def _render_login_page(error=None):
             '<input class="cds-field__input" id="carbon-login-password" name="password" '
             'type="password" autocomplete="current-password" required>'
             "</div>"
-            '<button class="cds-btn cds-btn--primary" type="submit">Login</button>'
+            '<button class="cds-btn cds-btn--primary cds-btn--cta cds-btn--block" '
+            'type="submit">Log in</button>'
             "</form>"
+            '<p class="cds-field__help">Sessions last 30 days on this device.</p>'
         )
-        content = page_header("Access", "Login") + error_html + tile(form_html)
-        return render_carbon_simple_page(
-            content, title="Login", show_classic_switch=False
+        card_html = tile(
+            page_header("Sign in", "Welcome back") + error_html + form_html
         )
+        version = _h(get_version())
+        brand_html = (
+            '<div class="cds-auth__brand">'
+            f'<img src="{images.logo}" width="24" height="24" alt="">'
+            "<span><strong>Quasarr</strong> Web UI</span>"
+            "</div>"
+        )
+        footer_html = (
+            '<footer class="cds-status-footer">'
+            f'<p class="cds-version">Quasarr v{version}</p>'
+            '<a class="cds-classic-link" href="/ui/classic">Classic UI</a>'
+            "</footer>"
+        )
+
+        # Standalone document, not render_carbon_simple_page(): the centred
+        # 400px sign-in card needs a brand mark above it and a footer below
+        # it, both outside the cds-tile the eyebrow/H1/fields/button/helper
+        # live in - the shared shell's single content-plus-footer card
+        # cannot place content outside itself.
+        html_doc = (
+            "<!doctype html>"
+            '<html lang="en" data-carbon-theme="light">'
+            "<head>"
+            '<meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            "<title>Login</title>"
+            '<meta name="description" content="Quasarr - Login">'
+            '<meta name="quasarr-api-key" content="">'
+            '<link rel="icon" href="data:,">'
+            f'<link rel="stylesheet" href="{asset_url("carbon.css")}">'
+            f'<script src="{asset_url("carbon.js")}"></script>'
+            "</head>"
+            "<body>"
+            '<a class="cds-skip-link" href="#main-content">Skip to main content</a>'
+            '<main id="main-content" aria-label="Main">'
+            '<div class="cds-auth">'
+            '<div class="cds-auth__card">'
+            f"{brand_html}{card_html}{footer_html}"
+            "</div>"
+            "</div>"
+            "</main>"
+            "</body></html>"
+        )
+        _assert_structural_guards(html_doc)
+        return html_doc
 
     from quasarr.providers import shared_state
     from quasarr.providers.page_dispatch import render_page

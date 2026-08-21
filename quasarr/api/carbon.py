@@ -28,14 +28,21 @@ from html import escape
 from typing import Any, Mapping
 
 from quasarr.api.jdownloader import get_jdownloader_status
-from quasarr.constants import TIMEOUT_SLOW_MODE_DEFINITIONS
+from quasarr.constants import (
+    TIMEOUT_SLOW_MODE_DEFINITIONS,
+    TIMEOUT_SLOW_MODE_MULTIPLIER,
+)
 from quasarr.providers.auth import show_logout_link
+from quasarr.providers.carbon_icons import render_icon
 from quasarr.providers.carbon_templates import (
-    TableColumn,
-    data_table,
+    field,
+    grid,
+    icon_button,
+    kv_rows,
     notification,
     protected_captcha_count,
     render_carbon_html,
+    status,
     tag,
     tile,
     toggle,
@@ -46,6 +53,7 @@ from quasarr.providers.notifications.helpers.notification_types import (
     get_user_configurable_notification_types,
 )
 from quasarr.providers.statistics import StatsHelper
+from quasarr.providers.version import get_version
 from quasarr.search.sources.helpers import (
     get_login_required_hostnames,
     get_radarr_required_hostnames,
@@ -64,7 +72,12 @@ def _h(value: object) -> str:
 
 def _hostname_status(shared_state) -> dict[str, Any]:
     """Reuse the existing hostname-counting / skip-login / missing-*arr
-    logic (mirrors ``quasarr.api._classic_dashboard``).
+    logic (mirrors ``quasarr.api._classic_dashboard``), and build a short,
+    sanitized issue summary line from the same pass. The line never carries
+    the raw stored error text (``hostname_issues[...]["error"]``) - only the
+    shorthand and the sanitized ``operation`` label, matching the
+    ``f"Error in {operation}"`` convention ``storage/setup/hostnames.py``
+    already uses for the same data.
     """
     hostnames_config = Config("Hostnames")
     skip_login_db = DataBase("skip_login")
@@ -78,6 +91,7 @@ def _hostname_status(shared_state) -> dict[str, Any]:
 
     working_count = 0
     total_count = 0
+    issue_entries: list[str] = []
     for site_key in shared_state.values.get("sites", []) or []:
         shorthand = site_key.lower()
         current_value = hostnames_config.get(shorthand)
@@ -88,7 +102,10 @@ def _hostname_status(shared_state) -> dict[str, Any]:
             if skip_val and str(skip_val).lower() == "true":
                 continue
         total_count += 1
-        if shorthand in hostname_issues:
+        issue = hostname_issues.get(shorthand)
+        if issue:
+            operation = issue.get("operation") or "unknown"
+            issue_entries.append(f"{shorthand.upper()} error in {operation}")
             continue
         if missing_arr_client_requirement(
             shorthand, radarr_required, sonarr_required, radarr_ok, sonarr_ok
@@ -96,7 +113,16 @@ def _hostname_status(shared_state) -> dict[str, Any]:
             continue
         working_count += 1
 
-    return {"working": working_count, "total": total_count}
+    if not issue_entries:
+        issue_line = ""
+    elif len(issue_entries) <= 2:
+        issue_line = " · ".join(issue_entries)
+    else:
+        issue_line = (
+            " · ".join(issue_entries[:2]) + f" · +{len(issue_entries) - 2} more"
+        )
+
+    return {"working": working_count, "total": total_count, "issue_line": issue_line}
 
 
 def build_dashboard_model(shared_state) -> dict[str, Any]:
@@ -124,6 +150,7 @@ def build_dashboard_model(shared_state) -> dict[str, Any]:
         "jd_device_name": jd_status["device_name"],
         "hostnames_working": hostnames["working"],
         "hostnames_total": hostnames["total"],
+        "hostnames_issue_line": hostnames["issue_line"],
         "captcha_count": captcha_count,
         "helper_active": helper_active,
         "flaresolverr_url": flaresolverr_url,
@@ -136,68 +163,103 @@ def build_dashboard_model(shared_state) -> dict[str, Any]:
     }
 
 
-def _status_tile(heading: str, tag_text: str, tone: str, detail: str = "") -> str:
-    detail_html = f"<p>{_h(detail)}</p>" if detail else ""
-    body = f"{tag(tag_text, tone=tone)}{detail_html}"
-    return tile(body, heading=heading, classes="is-compact")
+def _status_tile(
+    heading: str, text: str, tone: str, detail: str = "", *, detail_mono: bool = False
+) -> str:
+    detail_class = ' class="cds-mono"' if detail_mono else ""
+    detail_html = f"<p{detail_class}>{_h(detail)}</p>" if detail else ""
+    return tile(
+        f"{status(text, tone, strong=True)}{detail_html}",
+        heading=heading,
+        classes="is-status",
+    )
 
 
 def _dashboard_status_tiles(model: Mapping[str, Any]) -> str:
     if model["jd_connected"]:
-        jd_tone, jd_text = "green", "Connected"
+        jd_tile = _status_tile(
+            "JDownloader",
+            "Connected",
+            "success",
+            model["jd_device_name"] or "",
+            detail_mono=True,
+        )
     else:
-        jd_tone, jd_text = "red", "Disconnected"
-    jd_detail = model["jd_device_name"] or ""
-    jd_tile = _status_tile("JDownloader", jd_text, jd_tone, jd_detail)
+        jd_tile = _status_tile(
+            "JDownloader", "Disconnected", "error", "Check My JDownloader credentials"
+        )
 
-    working = model["hostnames_working"]
-    total = model["hostnames_total"]
+    working, total = model["hostnames_working"], model["hostnames_total"]
     if total == 0:
-        host_tone, host_text = "red", "None configured"
+        hostnames_tile = _status_tile(
+            "Hostnames",
+            "None configured",
+            "neutral",
+            "Add a hostname to start searching",
+        )
+    elif working == total:
+        hostnames_tile = _status_tile(
+            "Hostnames", f"{working} of {total} operational", "success"
+        )
     elif working == 0:
-        host_tone, host_text = "red", f"0 / {total} operational"
-    elif working < total:
-        host_tone, host_text = "blue", f"{working} / {total} operational"
+        hostnames_tile = _status_tile(
+            "Hostnames",
+            f"0 of {total} operational",
+            "error",
+            model.get("hostnames_issue_line", ""),
+        )
     else:
-        host_tone, host_text = "green", f"{working} / {total} operational"
-    hostnames_tile = _status_tile("Hostnames", host_text, host_tone)
-
-    captcha_count = model["captcha_count"]
-    if captcha_count > 0:
-        captcha_tone, captcha_text = "red", f"{captcha_count} waiting"
-    else:
-        captcha_tone, captcha_text = "green", "Clear"
-    captcha_tile = _status_tile("CAPTCHA queue", captcha_text, captcha_tone)
+        hostnames_tile = _status_tile(
+            "Hostnames",
+            f"{working} of {total} operational",
+            "warning",
+            model.get("hostnames_issue_line", ""),
+        )
 
     if model["flaresolverr_configured"]:
-        fs_tone, fs_text = "green", "Configured"
+        fs_tile = _status_tile(
+            "FlareSolverr",
+            "Reachable",
+            "success",
+            model.get("flaresolverr_url", ""),
+            detail_mono=True,
+        )
     elif model["flaresolverr_skipped"]:
-        fs_tone, fs_text = "gray", "Skipped"
+        fs_tile = _status_tile(
+            "FlareSolverr", "Skipped", "neutral", "Some sites need flaresolverr-next"
+        )
     else:
-        fs_tone, fs_text = "red", "Not configured"
-    flaresolverr_tile = _status_tile("FlareSolverr", fs_text, fs_tone)
+        fs_tile = _status_tile(
+            "FlareSolverr", "Not configured", "error", "Configure it in Settings"
+        )
 
-    return (
-        '<div class="cds-kpi-row">'
-        f"{jd_tile}{hostnames_tile}{captcha_tile}{flaresolverr_tile}"
-        "</div>"
-    )
+    if model["helper_active"]:
+        helper_tile = _status_tile(
+            "SponsorsHelper", "Active", "success", "Solving CAPTCHAs automatically"
+        )
+    else:
+        helper_tile = _status_tile(
+            "SponsorsHelper",
+            "Inactive",
+            "neutral",
+            "Automated CAPTCHA solving for sponsors",
+        )
+
+    return f'<div class="cds-kpi-row">{jd_tile}{hostnames_tile}{fs_tile}{helper_tile}</div>'
 
 
 def _dashboard_captcha_banner(model: Mapping[str, Any]) -> str:
-    captcha_count = model["captcha_count"]
-    if captcha_count <= 0:
+    count = model["captcha_count"]
+    if count <= 0:
         return ""
-
-    plural = "s" if captcha_count != 1 else ""
-    message = f"{captcha_count} link{plural} waiting for a CAPTCHA solution."
-    if not model["helper_active"]:
-        message += " SponsorsHelper can solve these automatically."
-
-    actions = (
-        f'<a class="cds-btn cds-btn--primary" href="/captcha">Solve CAPTCHA{plural}</a>'
+    plural = "s" if count != 1 else ""
+    verb = "is" if count == 1 else "are"
+    return (
+        '<section class="cds-notification cds-notification--warning cds-notification--inline" role="alert">'
+        f'<p class="cds-notification__message"><strong>Action required.</strong> {count} link{plural} {verb} waiting for a CAPTCHA solution.</p>'
+        f'<a class="cds-btn cds-btn--ghost" href="/captcha">Solve CAPTCHA{plural} →</a>'
+        "</section>"
     )
-    return notification("warning", "CAPTCHA required", message, actions=actions)
 
 
 def _dashboard_queue_tile() -> str:
@@ -217,76 +279,91 @@ def _dashboard_queue_tile() -> str:
 def _dashboard_api_tile(model: Mapping[str, Any]) -> str:
     url = _h(model["internal_address"])
     api_key = _h(model["api_key"])
+    body = (
+        "<p>Use these settings for Newznab Indexer and SABnzbd Download Client "
+        "in Radarr/Sonarr.</p>"
+        '<div class="cds-field-row">'
+        f'<span class="cds-field-row__value cds-mono" id="dashboard-api-url">{url}</span>'
+        + icon_button(
+            "copy",
+            "Copy URL",
+            action="copy",
+            data={"copy-target": "dashboard-api-url"},
+        )
+        + "</div>"
+        '<div class="cds-field-row">'
+        f'<input class="cds-field-row__input" id="dashboard-api-key" type="password" '
+        f'value="{api_key}" readonly>'
+        + icon_button(
+            "view",
+            "Show API key",
+            action="reveal",
+            data={"reveal-target": "dashboard-api-key"},
+        )
+        + icon_button(
+            "copy",
+            "Copy Key",
+            action="copy",
+            data={"copy-target": "dashboard-api-key"},
+        )
+        + "</div>"
+    )
     return (
         '<section class="cds-tile" id="dashboard-api-tile">'
         '<h2 class="cds-tile__heading">API access</h2>'
-        '<div class="cds-tile__content">'
-        "<p>Use these settings for Newznab Indexer and SABnzbd Download Client "
-        "in Radarr/Sonarr.</p>"
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="dashboard-api-url">URL</label>'
-        f'<input class="cds-field__input" id="dashboard-api-url" type="text" value="{url}" readonly>'
-        "</div>"
-        '<button class="cds-btn cds-btn--ghost" type="button" data-action="copy" '
-        'data-copy-target="dashboard-api-url">Copy URL</button>'
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="dashboard-api-key">API Key</label>'
-        f'<input class="cds-field__input" id="dashboard-api-key" type="password" value="{api_key}" readonly>'
-        "</div>"
-        '<button class="cds-btn cds-btn--ghost" type="button" data-action="reveal" '
-        'data-reveal-target="dashboard-api-key">Show</button> '
-        '<button class="cds-btn cds-btn--ghost" type="button" data-action="copy" '
-        'data-copy-target="dashboard-api-key">Copy Key</button>'
-        "</div></section>"
+        f'<div class="cds-tile__content">{body}</div>'
+        "</section>"
     )
 
 
 def _dashboard_summary_tile(model: Mapping[str, Any]) -> str:
     stats = model["stats"]
-    columns = (
-        TableColumn("metric", "Metric"),
-        TableColumn("value", "Value", classes="is-num is-mono"),
+    rows = (
+        (
+            "Download attempts",
+            f"{int(stats.get('total_download_attempts', 0)):,}",
+        ),
+        (
+            "Download success rate",
+            f"{float(stats.get('download_success_rate', 0)):.1f}%",
+        ),
+        (
+            "CAPTCHA decryptions",
+            f"{int(stats.get('total_captcha_decryptions', 0)):,}",
+        ),
     )
-    rows = [
-        {
-            "metric": "Packages downloaded",
-            "value": f"{int(stats.get('packages_downloaded', 0)):,}",
-        },
-        {
-            "metric": "Failed downloads",
-            "value": f"{int(stats.get('failed_downloads', 0)):,}",
-        },
-        {
-            "metric": "Total CAPTCHA decryptions",
-            "value": f"{int(stats.get('total_captcha_decryptions', 0)):,}",
-        },
-        {
-            "metric": "Decryption success rate",
-            "value": f"{float(stats.get('decryption_success_rate', 0)):.1f}%",
-        },
-    ]
-    return data_table(columns, rows, caption="All-time summary")
+    head_row = (
+        '<div class="cds-tile__head-row">'
+        '<h2 class="cds-tile__heading">All time</h2>'
+        '<a class="cds-btn cds-btn--ghost" href="/statistics">Statistics →</a>'
+        "</div>"
+    )
+    return tile(head_row + kv_rows(rows))
 
 
 def render_dashboard(shared_state) -> str:
     model = build_dashboard_model(shared_state)
 
-    content = "".join(
-        [
-            _dashboard_captcha_banner(model),
-            _dashboard_status_tiles(model),
-            _dashboard_queue_tile(),
-            _dashboard_api_tile(model),
-            _dashboard_summary_tile(model),
-        ]
+    content = (
+        _dashboard_captcha_banner(model)
+        + _dashboard_status_tiles(model)
+        + grid(
+            [
+                _dashboard_queue_tile(),
+                grid(
+                    [_dashboard_api_tile(model), _dashboard_summary_tile(model)],
+                    "stack",
+                ),
+            ],
+            "dashboard",
+        )
     )
 
     return render_carbon_html(
         "dashboard",
         content,
         title="Dashboard",
-        eyebrow="Overview",
-        subtitle="JDownloader, hostnames, and download activity at a glance",
+        eyebrow=f"Quasarr v{get_version()}",
         captcha_count=model["captcha_count"],
         show_user=model["show_user"],
     )
@@ -417,48 +494,158 @@ def build_settings_model(shared_state) -> dict[str, Any]:
     }
 
 
+def _setting_row(label: str, help_text: str, control: str) -> str:
+    """One label/description line with its control on the right.
+
+    The design's Appearance tile is built from these rows; the control is
+    renderer-owned markup (a switcher, a link button), never user input.
+    """
+    return (
+        '<div class="cds-setting-row">'
+        '<div class="cds-setting-row__text">'
+        f'<span class="cds-setting-row__label">{_h(label)}</span>'
+        f'<span class="cds-setting-row__help">{_h(help_text)}</span>'
+        "</div>"
+        f'<div class="cds-setting-row__control">{control}</div>'
+        "</div>"
+    )
+
+
+def _switcher(
+    items: tuple[tuple[str, str, bool], ...],
+    *,
+    legend: str,
+    name: str,
+    action: str = "",
+    id_prefix: str = "",
+) -> str:
+    """The design's content switcher: a radio group rendered as one
+    segmented control. Used for the theme preference and for the
+    linkcrypter block policy, so both look and behave identically.
+
+    ``legend`` names the group for assistive technology and is visually
+    hidden; the visible caption is the surrounding row label or subheading.
+    """
+    options = []
+    for value, label, checked in items:
+        element_id = f' id="{_h(id_prefix)}{_h(value)}"' if id_prefix else ""
+        options.append(
+            '<label class="cds-switcher__item">'
+            f'<input type="radio" name="{_h(name)}"{element_id} value="{_h(value)}"'
+            f"{' checked' if checked else ''}>"
+            f"<span>{_h(label)}</span></label>"
+        )
+    action_attr = f' data-action="{_h(action)}"' if action else ""
+    return (
+        f'<fieldset class="cds-switcher"{action_attr}>'
+        f'<legend class="cds-visually-hidden">{_h(legend)}</legend>'
+        + "".join(options)
+        + "</fieldset>"
+    )
+
+
 def _appearance_section() -> str:
+    """Theme preference plus the escape hatch back to the Classic UI.
+
+    The theme lives in ``localStorage``, which the server cannot read, so
+    "System" always ships pre-selected and ``carbon.js``'s
+    ``updateThemeSwitcher()`` corrects the selection on DOMContentLoaded.
+    """
+    theme_switcher = _switcher(
+        (
+            ("light", "Light", False),
+            ("dark", "Dark", False),
+            ("system", "System", True),
+        ),
+        legend="Theme",
+        name="theme",
+        action="theme-switch",
+    )
+    classic_link = (
+        '<a class="cds-btn cds-btn--tertiary" href="/ui/classic">Open Classic UI'
+        f"{render_icon('launch', class_name='cds-icon cds-icon--sm')}</a>"
+    )
     return tile(
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="settings-theme">Theme</label>'
-        '<select class="cds-field__select" id="settings-theme" data-action="theme-select">'
-        '<option value="light">Light</option>'
-        '<option value="dark">Dark</option>'
-        "</select>"
-        '<p class="cds-field__help">Applies immediately and is remembered on this device.</p>'
-        "</div>",
+        _setting_row(
+            "Theme",
+            "Applies immediately and is remembered on this device.",
+            theme_switcher,
+        )
+        + _setting_row(
+            "Interface design",
+            "Carbon (new) is active",
+            classic_link,
+        ),
         heading="Appearance",
     )
 
 
 def _jdownloader_section(model: Mapping[str, Any]) -> str:
     jd = model["jdownloader"]
-    status_tone = "green" if jd["connected"] else "red"
-    status_text = "Connected" if jd["connected"] else "Disconnected"
+    connected = bool(jd["connected"])
+    device = jd["device"]
+
+    if device:
+        options = f'<option value="{_h(device)}" selected>{_h(device)}</option>'
+    else:
+        options = '<option value="">Verify credentials to list instances</option>'
+
+    head_row = (
+        '<div class="cds-tile__head-row">'
+        '<h2 class="cds-tile__heading">JDownloader</h2>'
+        + status(
+            "Connected" if connected else "Disconnected",
+            "success" if connected else "error",
+        )
+        + "</div>"
+    )
 
     return tile(
-        f"{tag(status_text, tone=status_tone)}"
-        "<p>JDownloader must be running and connected to My JDownloader.</p>"
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="settings-jd-user">E-Mail</label>'
-        f'<input class="cds-field__input" id="settings-jd-user" type="text" value="{_h(jd["user"])}">'
-        "</div>"
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="settings-jd-pass">Password</label>'
-        f'<input class="cds-field__input" id="settings-jd-pass" type="password" value="{_h(jd["password"])}">'
-        "</div>"
-        '<button class="cds-btn cds-btn--secondary" type="button" data-action="jd-verify">'
-        "Verify Credentials</button>"
-        '<p id="settings-jd-status" class="cds-field__help" aria-live="polite"></p>'
-        '<div id="settings-jd-device-section" hidden>'
-        '<div class="cds-field">'
+        head_row
+        + '<p class="cds-tile__help">JDownloader must be running and connected to '
+        "My JDownloader.</p>"
+        + field("settings-jd-user", "E-mail", value=jd["user"])
+        + field(
+            "settings-jd-pass", "Password", value=jd["password"], input_type="password"
+        )
+        + '<div class="cds-field">'
         '<label class="cds-field__label" for="settings-jd-device">Instance</label>'
-        f'<select class="cds-field__select" id="settings-jd-device" data-current="{_h(jd["device"])}"></select>'
+        f'<select class="cds-field__select" id="settings-jd-device" '
+        f'data-current="{_h(device)}">{options}</select>'
         "</div>"
-        '<button class="cds-btn cds-btn--primary" type="button" data-action="jd-save">Save</button>'
-        '<p id="settings-jd-save-status" class="cds-field__help" aria-live="polite"></p>'
-        "</div>",
-        heading="JDownloader",
+        '<div class="cds-btn-row">'
+        '<button class="cds-btn cds-btn--primary" type="button" data-action="jd-save">'
+        "Save</button>"
+        '<button class="cds-btn cds-btn--tertiary" type="button" data-action="jd-verify">'
+        "Verify credentials</button>"
+        "</div>"
+        '<p id="settings-jd-status" class="cds-field__help" aria-live="polite"></p>'
+    )
+
+
+def _timeout_row(timeout_key: str, definition: Mapping[str, Any], enabled: bool) -> str:
+    """One slow-mode switch plus the timeout it currently produces.
+
+    Both help strings are rendered as data attributes so ``carbon.js`` can
+    swap the visible one the moment the switch is flipped (the value saves
+    on change) without re-deriving seconds client-side - the multiplier
+    stays owned by ``quasarr/constants``.
+    """
+    base_seconds = int(definition["base_seconds"])
+    slow_seconds = base_seconds * TIMEOUT_SLOW_MODE_MULTIPLIER
+    normal_help = f"Current: {base_seconds} s (normal)"
+    slow_help = f"Current: {slow_seconds} s (slow)"
+    return (
+        '<div class="cds-timeout-row" '
+        f'data-timeout-help-normal="{_h(normal_help)}" '
+        f'data-timeout-help-slow="{_h(slow_help)}">'
+        + toggle(
+            f"settings-timeout-{timeout_key}",
+            f"{definition['label']} (slow mode)",
+            checked=enabled,
+            help_text=slow_help if enabled else normal_help,
+        )
+        + "</div>"
     )
 
 
@@ -467,39 +654,57 @@ def _api_timeouts_section(model: Mapping[str, Any]) -> str:
     url = _h(model["internal_address"])
     timeout_settings = model["timeout_slow_mode"]
 
-    rows = []
-    for timeout_key, definition in TIMEOUT_SLOW_MODE_DEFINITIONS.items():
-        rows.append(
-            toggle(
-                f"settings-timeout-{timeout_key}",
-                f"{definition['label']} (slow mode)",
-                checked=bool(timeout_settings.get(timeout_key)),
-                compact=True,
-            )
+    rows = "".join(
+        _timeout_row(timeout_key, definition, bool(timeout_settings.get(timeout_key)))
+        for timeout_key, definition in TIMEOUT_SLOW_MODE_DEFINITIONS.items()
+    )
+
+    api_rows = (
+        '<div class="cds-field-row">'
+        '<span class="cds-field-row__label">URL</span>'
+        f'<span class="cds-field-row__value cds-mono" id="settings-api-url">{url}</span>'
+        + icon_button(
+            "copy",
+            "Copy URL",
+            action="copy",
+            data={"copy-target": "settings-api-url"},
         )
+        + "</div>"
+        '<div class="cds-field-row">'
+        '<label class="cds-field-row__label" for="settings-api-key">API key</label>'
+        f'<input class="cds-field-row__input" id="settings-api-key" type="password" '
+        f'value="{api_key}" readonly>'
+        + icon_button(
+            "view",
+            "Show API key",
+            action="reveal",
+            data={"reveal-target": "settings-api-key"},
+        )
+        + icon_button(
+            "copy",
+            "Copy API key",
+            action="copy",
+            data={"copy-target": "settings-api-key"},
+        )
+        + "</div>"
+    )
 
     return tile(
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="settings-api-url">URL</label>'
-        f'<input class="cds-field__input" id="settings-api-url" type="text" value="{url}" readonly>'
-        "</div>"
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="settings-api-key">API Key</label>'
-        f'<input class="cds-field__input" id="settings-api-key" type="password" value="{api_key}" readonly>'
-        "</div>"
-        '<button class="cds-btn cds-btn--ghost" type="button" data-action="reveal" '
-        'data-reveal-target="settings-api-key">Show</button> '
-        '<button class="cds-btn cds-btn--ghost" type="button" data-action="copy" '
-        'data-copy-target="settings-api-key">Copy Key</button> '
-        '<button class="cds-btn cds-btn--danger-ghost" type="button" data-action="regenerate-api-key">'
-        "Regenerate API Key</button>"
-        "<h3>Timeouts</h3>"
-        "<p>Enable slow mode only if you are willing to wait longer on slow sites.</p>"
-        + "".join(rows)
-        + '<button class="cds-btn cds-btn--primary" type="button" data-action="timeouts-save">'
-        "Save Timeout Settings</button>"
-        '<p id="settings-timeouts-status" class="cds-field__help" aria-live="polite"></p>',
-        heading="API & Timeouts",
+        rows
+        + '<p id="settings-timeouts-status" class="cds-field__help" aria-live="polite"></p>'
+        '<h3 class="cds-subheading">API access</h3>'
+        '<p class="cds-field__help">Use this URL and key for Newznab Indexer and '
+        "SABnzbd Download Client in Radarr/Sonarr.</p>"
+        + api_rows
+        + '<div class="cds-btn-row">'
+        '<button class="cds-btn cds-btn--tertiary" type="button" '
+        'data-action="regenerate-api-key">Regenerate API key</button>'
+        "</div>",
+        heading="API & timeouts",
+        help_text=(
+            "Slow mode triples the request timeout for that operation. "
+            "Each switch saves as soon as you flip it."
+        ),
     )
 
 
@@ -512,8 +717,6 @@ _SWEEP_SOURCE_LABELS = {
 
 def _link_protection_section(model: Mapping[str, Any]) -> str:
     crypter = model["crypter_block"]
-    defer_checked = " checked" if crypter["mode"] == "defer" else ""
-    fail_checked = " checked" if crypter["mode"] == "fail" else ""
 
     source_text, source_tone = _SWEEP_SOURCE_LABELS.get(
         crypter["sweep_window_source"], _SWEEP_SOURCE_LABELS["default"]
@@ -521,63 +724,77 @@ def _link_protection_section(model: Mapping[str, Any]) -> str:
     override_is_none = crypter["sweep_window_override"] is None
     sweep_disabled = " disabled" if override_is_none else ""
 
+    mode_switcher = _switcher(
+        (
+            ("defer", "Hold and retest", crypter["mode"] == "defer"),
+            ("fail", "Fail immediately", crypter["mode"] == "fail"),
+        ),
+        legend="When a linkcrypter blocks Quasarr",
+        name="settings-crypter-block-mode",
+        id_prefix="settings-crypter-block-mode-",
+    )
+
+    number_fields = grid(
+        [
+            '<div class="cds-field">'
+            '<label class="cds-field__label" for="settings-crypter-cooldown-hours">'
+            "Cooldown (hours)</label>"
+            f'<input class="cds-field__input" id="settings-crypter-cooldown-hours" '
+            f'type="number" min="24" step="1" value="{crypter["cooldown_hours"]}">'
+            "</div>",
+            '<div class="cds-field">'
+            '<label class="cds-field__label" for="settings-filecrypt-sweep-window">'
+            f"Filecrypt sweep window (minutes) {tag(source_text, tone=source_tone)}</label>"
+            f'<input class="cds-field__input" id="settings-filecrypt-sweep-window" '
+            f'type="number" min="1" max="1440" step="1" '
+            f'value="{crypter["sweep_window_minutes"]}"{sweep_disabled}>'
+            "</div>",
+        ],
+        "2",
+    )
+
     return tile(
         toggle(
             "settings-filecrypt-enabled",
             "Decrypt CAPTCHA-protected Filecrypt links",
             checked=crypter["filecrypt_enabled"],
+            help_text=(
+                "Disable while Filecrypt CAPTCHAs are unsolvable. Affected releases "
+                "fail so *arr grabs an alternative. Applies to new grabs only."
+            ),
         )
-        + "<p>Disable while Filecrypt CAPTCHAs are unsolvable. Affected releases fail so "
-        "*arr grabs an alternative. Applies to new grabs only.</p>"
-        '<button class="cds-btn cds-btn--primary" type="button" data-action="filecrypt-save">'
-        "Save Filecrypt Setting</button>"
-        '<p id="settings-filecrypt-status" class="cds-field__help" aria-live="polite"></p>'
-        "<h3>Linkcrypter-wide access blocks</h3>"
-        '<fieldset class="cds-segmented">'
-        '<legend class="cds-segmented__legend">When a linkcrypter blocks Quasarr</legend>'
-        '<div class="cds-segmented__group" role="radiogroup" '
-        'aria-label="Linkcrypter-wide access blocks">'
-        '<label class="cds-segmented__option">'
-        '<input class="cds-segmented__input" type="radio" name="settings-crypter-block-mode" '
-        f'id="settings-crypter-block-mode-defer" value="defer"{defer_checked}>'
-        '<span class="cds-segmented__label">Hold and retest</span>'
-        "</label>"
-        '<label class="cds-segmented__option">'
-        '<input class="cds-segmented__input" type="radio" name="settings-crypter-block-mode" '
-        f'id="settings-crypter-block-mode-fail" value="fail"{fail_checked}>'
-        '<span class="cds-segmented__label">Fail immediately</span>'
-        "</label>"
-        "</div></fieldset>"
-        "<p>Hold and retest keeps affected releases waiting in the queue until the cooldown "
-        "expires. Fail immediately restores the legacy behavior at once: releases fail again "
-        "so *arr grabs an alternative, and recorded blocks are kept but ignored until you "
-        "switch back.</p>"
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="settings-crypter-cooldown-hours">Cooldown (hours)</label>'
-        f'<input class="cds-field__input" id="settings-crypter-cooldown-hours" type="number" '
-        f'min="24" step="1" value="{crypter["cooldown_hours"]}">'
-        "</div>"
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="settings-filecrypt-sweep-window">'
-        f"Filecrypt sweep window (minutes) {tag(source_text, tone=source_tone)}</label>"
-        f'<input class="cds-field__input" id="settings-filecrypt-sweep-window" type="number" '
-        f'min="1" max="1440" step="1" value="{crypter["sweep_window_minutes"]}"{sweep_disabled}>'
-        "</div>"
+        + '<h3 class="cds-subheading">Linkcrypter access blocks</h3>'
+        + mode_switcher
+        + "<p>Hold and retest keeps affected releases waiting in the queue until the "
+        "cooldown expires. Fail immediately restores the legacy behavior at once: "
+        "releases fail again so *arr grabs an alternative, and recorded blocks are "
+        "kept but ignored until you switch back.</p>"
+        + number_fields
         + toggle(
             "settings-filecrypt-sweep-window-default",
-            "Use Docker/default value",
+            "Use Docker default",
             checked=override_is_none,
             compact=True,
         )
-        + '<button class="cds-btn cds-btn--primary" type="button" data-action="crypter-block-save">'
-        "Save Block Settings</button>"
-        '<p id="settings-crypter-block-status" class="cds-field__help" aria-live="polite"></p>',
-        heading="Link Protection",
+        + '<div class="cds-btn-row">'
+        '<button class="cds-btn cds-btn--primary" type="button" '
+        'data-action="link-protection-save">Save</button>'
+        "</div>"
+        '<p id="settings-link-protection-status" class="cds-field__help" '
+        'aria-live="polite"></p>',
+        heading="Link protection",
     )
 
 
 def _flaresolverr_section(model: Mapping[str, Any]) -> str:
     fs = model["flaresolverr"]
+    if fs["url"] and not fs["skipped"]:
+        state = status("Reachable", "success")
+    elif fs["skipped"]:
+        state = status("Skipped", "neutral")
+    else:
+        state = status("Not configured", "error")
+
     warning = ""
     if fs["skipped"]:
         warning = notification(
@@ -586,142 +803,181 @@ def _flaresolverr_section(model: Mapping[str, Any]) -> str:
             "Some sites may not work until flaresolverr-next is configured.",
         )
 
+    head_row = (
+        '<div class="cds-tile__head-row">'
+        '<h2 class="cds-tile__heading">FlareSolverr</h2>'
+        f"{state}</div>"
+    )
+
     return tile(
-        warning + "<p>"
+        head_row + '<p class="cds-tile__help">'
         '<a href="https://github.com/rix1337/flaresolverr-next" target="_blank" '
         'rel="noopener noreferrer">flaresolverr-next</a> must be running and reachable '
         "to Quasarr for some sites to work.</p>"
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="settings-flaresolverr-url">URL</label>'
-        f'<input class="cds-field__input" id="settings-flaresolverr-url" type="text" value="{_h(fs["url"])}">'
+        + warning
+        + field("settings-flaresolverr-url", "URL", value=fs["url"])
+        + '<div class="cds-btn-row">'
+        '<button class="cds-btn cds-btn--primary" type="button" '
+        'data-action="flaresolverr-save">Save</button>'
         "</div>"
-        '<button class="cds-btn cds-btn--primary" type="button" data-action="flaresolverr-save">'
-        "Save</button>"
-        '<p id="settings-flaresolverr-status" class="cds-field__help" aria-live="polite"></p>',
-        heading="FlareSolverr",
+        '<p id="settings-flaresolverr-status" class="cds-field__help" '
+        'aria-live="polite"></p>'
     )
 
 
-def _notification_provider_card(
-    provider: str, label: str, model: Mapping[str, Any]
+def _notification_matrix(
+    provider: str,
+    cases: Any,
+    provider_toggles: Mapping[str, Any],
+    provider_silent: Mapping[str, Any],
 ) -> str:
-    notifications = model["notifications"]
-    settings = notifications["settings"]
-    cases = notifications["cases"]
+    """The design's EVENT / ENABLED / SILENT matrix.
 
-    provider_toggles = settings.get("toggles", {}).get(provider, {})
-    provider_silent = settings.get("silent", {}).get(provider, {})
-
-    if provider == "discord":
-        credential_fields = (
-            '<div class="cds-field">'
-            '<label class="cds-field__label" for="settings-notification-discord-webhook">'
-            "Webhook URL</label>"
-            '<input class="cds-field__input" id="settings-notification-discord-webhook" '
-            f'type="text" value="{_h(settings.get("discord_webhook", ""))}">'
-            "</div>"
-        )
-    else:
-        credential_fields = (
-            '<div class="cds-field">'
-            '<label class="cds-field__label" for="settings-notification-telegram-token">'
-            "Bot Token</label>"
-            '<input class="cds-field__input" id="settings-notification-telegram-token" '
-            f'type="text" value="{_h(settings.get("telegram_bot_token", ""))}">'
-            "</div>"
-            '<div class="cds-field">'
-            '<label class="cds-field__label" for="settings-notification-telegram-chat-id">'
-            "Chat ID</label>"
-            '<input class="cds-field__input" id="settings-notification-telegram-chat-id" '
-            f'type="text" value="{_h(settings.get("telegram_chat_id", ""))}">'
-            "</div>"
-        )
-
-    case_rows = []
+    Each switch keeps the exact id ``carbon.js``'s ``readCheckboxValue()``
+    reads. Their own label text is visually hidden by ``.cds-matrix`` (the
+    visible caption is the row's EVENT cell) but stays in the accessible
+    name, so a screen reader still hears which event and which column a
+    switch belongs to.
+    """
+    rows = []
     for case_key, case_label in cases:
-        case_rows.append(
-            '<div class="cds-toggle-row">'
+        rows.append(
+            '<div class="cds-matrix__row">'
+            f'<span class="cds-matrix__label">{_h(case_label)}</span>'
             + toggle(
                 f"settings-notif-{provider}-{case_key}",
-                case_label,
+                f"{case_label} enabled",
                 checked=provider_toggles.get(case_key, True),
                 compact=True,
             )
             + toggle(
                 f"settings-notif-{provider}-{case_key}-silent",
-                "Silent",
+                f"{case_label} silent",
                 checked=provider_silent.get(case_key, False),
                 compact=True,
             )
             + "</div>"
         )
-
-    cases_json = _h(json.dumps([case_key for case_key, _label in cases]))
-
     return (
-        '<div class="cds-tile__content">'
-        f"<h3>{_h(label)}</h3>"
-        f"{credential_fields}"
-        f'<span id="settings-notification-{provider}-cases" hidden data-cases="{cases_json}"></span>'
-        + "".join(case_rows)
-        + f'<button class="cds-btn cds-btn--secondary" type="button" '
-        f'data-action="notifications-test" data-provider="{provider}">Send Test</button>'
-        f'<p id="settings-notification-{provider}-status" class="cds-field__help" aria-live="polite"></p>'
-        "</div>"
+        '<div class="cds-matrix">'
+        '<div class="cds-matrix__head"><span>Event</span><span>Enabled</span>'
+        "<span>Silent</span></div>" + "".join(rows) + "</div>"
     )
 
 
 def _notifications_section(model: Mapping[str, Any]) -> str:
-    body = (
-        "<p>It is recommended to configure at least one provider below for an optimal "
-        "user experience. One Save covers both providers below, so a typed edit "
-        "anywhere in this section is never silently discarded.</p>"
-        + _notification_provider_card("discord", "Discord", model)
-        + _notification_provider_card("telegram", "Telegram", model)
-        + '<button class="cds-btn cds-btn--primary" type="button" '
-        'data-action="notifications-save">Save Notifications</button>'
-        '<p id="settings-notifications-status" class="cds-field__help" aria-live="polite"></p>'
+    notifications = model["notifications"]
+    settings = notifications["settings"]
+    cases = notifications["cases"]
+    cases_json = _h(json.dumps([case_key for case_key, _label in cases]))
+    cases_marker = (
+        '<span id="settings-notification-{provider}-cases" hidden '
+        f'data-cases="{cases_json}"></span>'
     )
-    return f'<section class="cds-tile"><h2 class="cds-tile__heading">Notifications</h2>{body}</section>'
+
+    discord = (
+        '<h3 class="cds-subheading">Discord</h3>'
+        + field(
+            "settings-notification-discord-webhook",
+            "Webhook URL",
+            value=settings.get("discord_webhook", ""),
+        )
+        + cases_marker.format(provider="discord")
+        + _notification_matrix(
+            "discord",
+            cases,
+            settings.get("toggles", {}).get("discord", {}),
+            settings.get("silent", {}).get("discord", {}),
+        )
+    )
+
+    telegram_configured = bool(settings.get("telegram_bot_token")) and bool(
+        settings.get("telegram_chat_id")
+    )
+    telegram = (
+        '<details class="cds-details"><summary>Telegram '
+        '<span class="cds-tile__count">'
+        f"({'configured' if telegram_configured else 'not configured'})"
+        "</span></summary>"
+        + field(
+            "settings-notification-telegram-token",
+            "Bot token",
+            value=settings.get("telegram_bot_token", ""),
+        )
+        + field(
+            "settings-notification-telegram-chat-id",
+            "Chat ID",
+            value=settings.get("telegram_chat_id", ""),
+        )
+        + cases_marker.format(provider="telegram")
+        + _notification_matrix(
+            "telegram",
+            cases,
+            settings.get("toggles", {}).get("telegram", {}),
+            settings.get("silent", {}).get("telegram", {}),
+        )
+        + "</details>"
+    )
+
+    return tile(
+        discord + telegram + '<div class="cds-btn-row">'
+        '<button class="cds-btn cds-btn--primary" type="button" '
+        'data-action="notifications-save">Save</button>'
+        '<button class="cds-btn cds-btn--tertiary" type="button" '
+        'data-action="notifications-test">Send test</button>'
+        "</div>"
+        '<p id="settings-notifications-status" class="cds-field__help" '
+        'aria-live="polite"></p>',
+        heading="Notifications",
+        help_text=(
+            "Configure at least one provider for an optimal user experience. One "
+            "Save covers both providers, so a typed edit anywhere in this tile is "
+            "never silently discarded; Send test reaches every provider you have "
+            "configured."
+        ),
+    )
 
 
-def _arr_service_card(service: str, label: str, model: Mapping[str, Any]) -> str:
+def _arr_service_block(service: str, label: str, model: Mapping[str, Any]) -> str:
+    """One *arr client's fields plus its own Clear.
+
+    Clearing stays per service on purpose: blanking the API key field and
+    saving cannot clear a stored key, because ``saveArrSettings()`` falls
+    back to the fetched key so a URL-only edit never wipes it.
+    """
     settings = model[service]
     return (
-        '<div class="cds-tile__content">'
-        f"<h3>{_h(label)}</h3>"
-        '<div class="cds-field">'
-        f'<label class="cds-field__label" for="settings-{service}-url">URL</label>'
-        f'<input class="cds-field__input" id="settings-{service}-url" type="text" '
-        f'value="{_h(settings["url"])}">'
-        "</div>"
-        '<div class="cds-field">'
-        f'<label class="cds-field__label" for="settings-{service}-api-key">API Key</label>'
-        f'<input class="cds-field__input" id="settings-{service}-api-key" type="text" '
-        f'value="{_h(settings["api_key"])}">'
-        "</div>"
-        f'<button class="cds-btn cds-btn--primary" type="button" '
-        f'data-action="{service}-save">Save {_h(label)} Settings</button> '
+        f'<h3 class="cds-subheading">{_h(label)}</h3>'
+        + field(f"settings-{service}-url", "URL", value=settings["url"])
+        + field(f"settings-{service}-api-key", "API key", value=settings["api_key"])
+        + '<div class="cds-btn-row">'
         f'<button class="cds-btn cds-btn--danger-ghost" type="button" '
-        f'data-action="{service}-clear">Clear</button>'
-        f'<p id="settings-{service}-status" class="cds-field__help" aria-live="polite"></p>'
+        f'data-action="{service}-clear-open">Clear</button>'
         "</div>"
     )
 
 
 def _arr_section(model: Mapping[str, Any]) -> str:
-    body = (
-        "<p>Required for configured movie or TV sources. Configure the client(s) you use.</p>"
-        + _arr_service_card("radarr", "Radarr", model)
-        + _arr_service_card("sonarr", "Sonarr", model)
+    return tile(
+        _arr_service_block("radarr", "Radarr", model)
+        + _arr_service_block("sonarr", "Sonarr", model)
+        + '<div class="cds-btn-row">'
+        '<button class="cds-btn cds-btn--primary" type="button" '
+        'data-action="arr-save">Save</button>'
+        "</div>"
+        '<p id="settings-arr-status" class="cds-field__help" aria-live="polite"></p>',
+        heading="*arr clients",
+        help_text=(
+            "Required for configured movie or TV sources. Configure the client(s) "
+            "you use."
+        ),
     )
-    return f'<section class="cds-tile"><h2 class="cds-tile__heading">*arr</h2>{body}</section>'
 
 
 def render_settings(shared_state) -> str:
     model = build_settings_model(shared_state)
 
-    content = "".join(
+    content = grid(
         [
             _appearance_section(),
             _jdownloader_section(model),
@@ -730,7 +986,8 @@ def render_settings(shared_state) -> str:
             _flaresolverr_section(model),
             _notifications_section(model),
             _arr_section(model),
-        ]
+        ],
+        "settings",
     )
 
     return render_carbon_html(
@@ -738,7 +995,6 @@ def render_settings(shared_state) -> str:
         content,
         title="Settings",
         eyebrow="Configuration",
-        subtitle="JDownloader, notifications, link protection, and *arr clients",
         captcha_count=model["captcha_count"],
         show_user=model["show_user"],
     )

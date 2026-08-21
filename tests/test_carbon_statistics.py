@@ -3,11 +3,12 @@
 """Contracts for the Carbon statistics view.
 
 Pins the 37-value coverage of ``StatsHelper.get_stats()`` against the Carbon
-renderer, the two pinned headings ("Filecrypt cohort", "Terminal
-operations"), lifecycle text states rendered as tags, the tested/total
-fraction, the ``<time data-epoch>`` deadline contract, and the structural/
-privacy guards (no emoji, no identifier-shaped lifecycle data, no remote
-resources, no inline handlers/scripts).
+renderer's four top KPI metric tiles plus its 2-column and 3-column detail
+tile grids, the two pinned headings ("Filecrypt cohort", "Terminal
+operations"), the Filecrypt lifecycle state rendered as a status badge, the
+tested/total ratio bar, the ``<time data-epoch>`` deadline contract, and the
+structural/privacy guards (no emoji, no identifier-shaped lifecycle data, no
+remote resources, no inline handlers/scripts).
 """
 
 import importlib
@@ -126,7 +127,10 @@ class CarbonStatisticsCoverageTests(unittest.TestCase):
             f"{STATS_FIXTURE['crypter_cooldowns']:,}",
             f"{STATS_FIXTURE['crypter_probes']:,}",
             f"{STATS_FIXTURE['deferred_packages']:,}",
-            STATS_FIXTURE["crypter_sweep_state"],
+            # The Filecrypt cohort state renders through `status()`, which
+            # capitalizes it for display (a presentation choice, not data
+            # loss - the same state text is shown, just title-cased).
+            STATS_FIXTURE["crypter_sweep_state"].capitalize(),
             (
                 f"{STATS_FIXTURE['crypter_sweep_tested']:,} / "
                 f"{STATS_FIXTURE['crypter_sweep_total']:,}"
@@ -170,17 +174,33 @@ class CarbonStatisticsCoverageTests(unittest.TestCase):
         self.assertIn("Filecrypt cohort", html)
         self.assertIn("Terminal operations", html)
 
-    def test_lifecycle_states_rendered_as_tags(self):
+    def test_lifecycle_state_rendered_as_status_badge(self):
+        """The Filecrypt cohort state renders through the shared `status()`
+        component (a colored-dot badge, not a `cds-tag`) with the state text
+        capitalized for display; the individual-mode reason stays plain,
+        unbadged text in its own key/value row.
+        """
         html = self._render()
-        self.assertIn('class="cds-tag', html)
-        self.assertRegex(html, r'<span class="cds-tag[^"]*">sweeping</span>')
-        self.assertRegex(html, r'<span class="cds-tag[^"]*">cohort_oversized</span>')
+        self.assertRegex(
+            html,
+            r'<span class="cds-status cds-status--warning cds-status--strong">'
+            r'<span class="cds-status__dot" aria-hidden="true"></span>Sweeping</span>',
+        )
+        self.assertIn(
+            '<span class="cds-kv__label">Individual mode</span>'
+            '<span class="cds-kv__value">cohort_oversized</span>',
+            html,
+        )
 
     def test_individual_mode_falls_back_to_none(self):
         stats = dict(STATS_FIXTURE)
         stats["crypter_individual_mode"] = ""
         html = self._render(stats=stats)
-        self.assertRegex(html, r'<span class="cds-tag[^"]*">None</span>')
+        self.assertIn(
+            '<span class="cds-kv__label">Individual mode</span>'
+            '<span class="cds-kv__value">none</span>',
+            html,
+        )
 
     def test_zero_deadline_epoch_has_no_epoch_time_element(self):
         stats = dict(STATS_FIXTURE)
@@ -188,6 +208,13 @@ class CarbonStatisticsCoverageTests(unittest.TestCase):
         html = self._render(stats=stats)
         self.assertNotIn('data-epoch="0"', html)
         self.assertNotIn("1970", html)
+        # Absence of the epoch element isn't enough on its own - the reader
+        # depends on the fixed fallback text actually appearing in its place.
+        self.assertIn(
+            '<span class="cds-kv__label">Deadline</span>'
+            '<span class="cds-kv__value">No active deadline</span>',
+            html,
+        )
 
     def test_deadline_is_a_time_element_with_data_epoch(self):
         html = self._render()
@@ -203,7 +230,10 @@ class CarbonStatisticsCoverageTests(unittest.TestCase):
 
     def test_captcha_count_reflects_live_protected_queue(self):
         html = self._render(protected_titles=[("id-1", "t"), ("id-2", "t")])
-        self.assertIn("<strong>2</strong>", html)
+        self.assertIn(
+            '<span class="cds-header__badge" aria-hidden="true">2</span>', html
+        )
+        self.assertIn('aria-label="Notifications, 2 CAPTCHA items"', html)
 
     def test_captcha_count_defaults_to_zero_on_lookup_failure(self):
         shared_state = _FakeSharedState()
@@ -216,100 +246,155 @@ class CarbonStatisticsCoverageTests(unittest.TestCase):
         ):
             helper_cls.return_value.get_stats.return_value = dict(STATS_FIXTURE)
             html = self.mod.render_statistics(shared_state)
-        self.assertIn("<strong>0</strong>", html)
+        # An empty queue shows no bell badge at all (spec 2.5: badge only
+        # for a counter > 0); the swallowed read failure must still reach
+        # the shell as a real 0, which the bell's accessible name carries.
+        self.assertIn('aria-label="Notifications, 0 CAPTCHA items"', html)
+        self.assertNotIn("cds-header__badge", html)
 
-    def test_captcha_ratio_bars_present_with_visible_text(self):
-        html = self._render()
-        self.assertEqual(html.count('class="cds-progress"'), 2)
-        self.assertEqual(html.count('role="progressbar"'), 2)
-        # Automatic: 77.1%, Manual: 66.3% (STATS_FIXTURE) - both the visible
-        # text and the bar width must reflect the unclamped provider value.
-        self.assertRegex(
-            html,
-            r"<span>77\.1%</span>"
-            r'<div class="cds-progress" role="progressbar" aria-valuemin="0" '
-            r'aria-valuemax="100" aria-valuenow="77\.1" '
-            r'aria-label="Automatic success rate 77\.1%">'
-            r'<span style="width:77\.1%"></span></div>',
-        )
-        self.assertRegex(
-            html,
-            r"<span>66\.3%</span>"
-            r'<div class="cds-progress" role="progressbar" aria-valuemin="0" '
-            r'aria-valuemax="100" aria-valuenow="66\.3" '
-            r'aria-label="Manual success rate 66\.3%">'
-            r'<span style="width:66\.3%"></span></div>',
-        )
-
-    def test_ratio_bar_width_clamped_to_0_100(self):
-        stats = dict(STATS_FIXTURE)
-        stats["automatic_decryption_success_rate"] = 150.0
-        stats["manual_decryption_success_rate"] = -12.0
-        html = self._render(stats=stats)
-        self.assertIn('style="width:100.0%"', html)
-        self.assertIn('style="width:0.0%"', html)
-        # The displayed text is not silently rewritten by the clamp.
-        self.assertIn("<span>150.0%</span>", html)
-        self.assertIn("<span>-12.0%</span>", html)
-        self.assertNotIn('style="width:150.0%"', html)
-        self.assertNotIn('style="width:-12.0%"', html)
-
-    def test_kv_band_markup_matches_data_table_structure(self):
-        """The raw-HTML-carrying bands (CAPTCHAs, Filecrypt cohort) must
-        render byte-identical wrapper/caption/header/cell markup to the
-        plain ``_band()`` groups, which delegate straight to the real,
-        already-tested ``data_table()`` component - only the value cell's
-        escaping differs, and only because it carries pre-built safe HTML.
+    def test_captcha_decryption_bars_show_value_and_help_text(self):
+        """The CAPTCHA-decryptions detail tile's two bars keep every
+        underlying number visible as text: the raw decryption count in the
+        bar's head row, and the success rate plus failed count in its help
+        line - the same six values the old kv rows showed, just regrouped.
         """
-        templates = importlib.import_module("quasarr.providers.carbon_templates")
-        columns = (
-            templates.TableColumn("metric", "Metric"),
-            templates.TableColumn("value", "Value", classes="is-num is-mono"),
+        html = self._render()
+        self.assertIn(
+            '<div class="cds-bar__head"><span>Automatic (SponsorsHelper)</span>'
+            "<strong>60,789</strong></div>",
+            html,
         )
-        rows = [("Alpha", "1,234"), ("Beta", "5,678")]
-        expected = templates.data_table(
-            columns,
-            [{"metric": label, "value": value} for label, value in rows],
-            caption="Sample",
+        self.assertIn(
+            '<div class="cds-bar__head"><span>Manual (browser userscript)</span>'
+            "<strong>70,891</strong></div>",
+            html,
         )
-        actual = self.mod._kv_band("Sample", rows)
-        self.assertEqual(expected, actual)
+        self.assertIn('<p class="cds-bar__help">77.1% success · 8,012 failed</p>', html)
+        self.assertIn('<p class="cds-bar__help">66.3% success · 9,123 failed</p>', html)
+
+    def test_bar_width_clamped_to_0_100(self):
+        """`_bar()`'s fill width is clamped to [0, 100] independent of the
+        displayed value text, matching the old ratio bar's clamp contract -
+        and `aria-valuenow` carries that exact same clamped integer, never
+        the raw unclamped input.
+        """
+        over = self.mod._bar("Label", "150", 150)
+        under = self.mod._bar("Label", "-12", -12)
+        self.assertIn('style="width:100%"', over)
+        self.assertIn('style="width:0%"', under)
+        self.assertIn('aria-valuenow="100"', over)
+        self.assertIn('aria-valuenow="0"', under)
+        self.assertNotIn('aria-valuenow="150"', over)
+        self.assertNotIn('aria-valuenow="-12"', under)
+        # The displayed value text is never rewritten by the clamp.
+        self.assertIn("<strong>150</strong>", over)
+        self.assertIn("<strong>-12</strong>", under)
+
+    def test_progress_bars_carry_aria_contract(self):
+        """Every `.cds-progress` bar keeps the accessibility contract the
+        old `_ratio_bar()` had: `role="progressbar"` plus
+        `aria-valuemin`/`aria-valuemax`/`aria-valuenow` and an identifying
+        `aria-label`, so a screen reader still announces which bar it is and
+        its current value. Regression guard for that contract silently
+        disappearing again.
+        """
+        html = self._render()
+        self.assertEqual(html.count('role="progressbar"'), 3)
+        self.assertEqual(html.count('aria-valuemin="0"'), 3)
+        self.assertEqual(html.count('aria-valuemax="100"'), 3)
+        # Automatic: 60,789 / 131,680 share -> 46%; Manual -> 53%;
+        # Filecrypt cohort Tested: 15,678 / 99,999 -> 16% (STATS_FIXTURE).
+        self.assertIn(
+            '<div class="cds-progress cds-progress--thick" role="progressbar" '
+            'aria-valuemin="0" aria-valuemax="100" aria-valuenow="46" '
+            'aria-label="Automatic (SponsorsHelper)">',
+            html,
+        )
+        self.assertIn(
+            '<div class="cds-progress cds-progress--thick" role="progressbar" '
+            'aria-valuemin="0" aria-valuemax="100" aria-valuenow="53" '
+            'aria-label="Manual (browser userscript)">',
+            html,
+        )
+        self.assertIn(
+            '<div class="cds-progress cds-progress--thick" role="progressbar" '
+            'aria-valuemin="0" aria-valuemax="100" aria-valuenow="16" '
+            'aria-label="Tested">',
+            html,
+        )
+
+    def test_captcha_share_bars_safe_at_zero(self):
+        """A fresh install (both CAPTCHA counters at 0) must never divide by
+        zero computing the two bars' fill share, and both bars must still
+        render real, count-consistent zero state - a zero-width fill, a
+        zero `aria-valuenow`, and an actual "0" value in the head row -
+        rather than merely not crashing.
+        """
+        stats = dict(STATS_FIXTURE)
+        stats["captcha_decryptions_automatic"] = 0
+        stats["captcha_decryptions_manual"] = 0
+        html = self._render(stats=stats)
+        self.assertEqual(html.count('style="width:0%"'), 2)
+        self.assertEqual(html.count('aria-valuenow="0"'), 2)
+        self.assertIn(
+            '<div class="cds-bar__head"><span>Automatic (SponsorsHelper)</span>'
+            "<strong>0</strong></div>",
+            html,
+        )
+        self.assertIn(
+            '<div class="cds-bar__head"><span>Manual (browser userscript)</span>'
+            "<strong>0</strong></div>",
+            html,
+        )
 
     def test_four_top_kpi_tiles(self):
         html = self._render()
         self.assertEqual(html.count("cds-tile--is-metric"), 4)
 
+    def test_four_metric_tiles_with_large_values(self):
+        html = self._render()
+        self.assertEqual(html.count("cds-tile--is-metric"), 4)
+        self.assertIn('<h2 class="cds-tile__heading">Download attempts</h2>', html)
+        self.assertIn('<p class="cds-metric__value">10,234</p>', html)
+        self.assertIn(
+            '<p class="cds-metric__sub cds-metric__sub--success">'
+            "91.2% success rate</p>",
+            html,
+        )
+
+    def test_detail_tiles_replace_tables(self):
+        html = self._render()
+        self.assertNotIn("<table", html)
+        self.assertIn('<div class="cds-grid--2">', html)
+        self.assertIn('<div class="cds-grid--3">', html)
+        for heading in (
+            "CAPTCHA decryptions",
+            "Cached metadata",
+            "Linkcrypter blocks",
+            "Filecrypt cohort",
+            "Terminal operations",
+        ):
+            with self.subTest(heading=heading):
+                self.assertIn(f'<h2 class="cds-tile__heading">{heading}</h2>', html)
+        # automatic, manual, cohort tested - the thick modifier class always
+        # rides alongside the base class, matching `_bar()`'s literal markup.
+        self.assertEqual(html.count('class="cds-progress cds-progress--thick"'), 3)
+
     def test_kpi_tiles_wrapped_in_kpi_row(self):
         """The four top KPI tiles render inside one `.cds-kpi-row` wrapper,
-        so carbon.css's grid layout applies to them
-        instead of the default vertical tile stack. Each tile itself nests a
-        `.cds-tile__content` div, so the wrapper's own close tag is found by
-        slicing up to the immediately following Downloads band rather than
-        matching the first (nested) `</div>`.
+        so carbon.css's grid layout applies to them instead of the default
+        vertical tile stack. Each tile itself nests a `.cds-tile__content`
+        div, so the wrapper's own close tag is found by slicing up to the
+        immediately following 2-column detail grid rather than matching the
+        first (nested) `</div>`.
         """
         html = self._render()
         start = html.index('<div class="cds-kpi-row">')
-        end = html.index('<div class="cds-table-wrap">', start)
+        end = html.index('<div class="cds-grid--2">', start)
         row_html = html[start:end]
 
         self.assertTrue(row_html.endswith("</div>"))
         self.assertEqual(row_html.count("cds-tile--is-metric"), 4)
-        # The row closes before the first banded table caption follows.
-        self.assertLess(end, html.index("<caption>Downloads</caption>"))
-
-    def test_six_grouped_bands(self):
-        html = self._render()
-        self.assertEqual(html.count("<caption>"), 6)
-        for caption in (
-            "Downloads",
-            "CAPTCHAs",
-            "Linkcrypter blocks",
-            "Filecrypt cohort",
-            "Terminal operations",
-            "Cached metadata",
-        ):
-            with self.subTest(caption=caption):
-                self.assertIn(f"<caption>{caption}</caption>", html)
 
     def test_no_renderer_owned_emoji(self):
         html = self._render()

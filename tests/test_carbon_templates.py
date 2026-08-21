@@ -8,6 +8,16 @@ from html.parser import HTMLParser
 from pathlib import Path
 from unittest import mock
 
+from quasarr.providers.carbon_templates import (
+    grid,
+    icon_button,
+    kv_rows,
+    metric_tile,
+    render_carbon_html,
+    status,
+    tile,
+)
+
 
 class _TagCollector(HTMLParser):
     def __init__(self):
@@ -97,6 +107,11 @@ class CarbonTemplateContractsTests(unittest.TestCase):
             "page_header",
             "tile",
             "tag",
+            "status",
+            "grid",
+            "kv_rows",
+            "metric_tile",
+            "icon_button",
             "field",
             "toggle",
             "data_table",
@@ -524,6 +539,155 @@ class CarbonTemplateContractsTests(unittest.TestCase):
         self._assert_no_inline_script(html)
 
 
+class CarbonTemplateHelperTests(unittest.TestCase):
+    """The five design-system helpers every page renderer composes with,
+    plus the shell chrome they sit inside. Each helper owns one repeated
+    markup shape from the approved design so no page renderer hand-writes
+    it: the status dot, the page grids, the key-value list, the metric
+    tile, and the compact row-action icon button.
+    """
+
+    def test_status_renders_dot_and_text(self):
+        html = status("Connected", "success", strong=True)
+        self.assertEqual(
+            html,
+            '<span class="cds-status cds-status--success cds-status--strong">'
+            '<span class="cds-status__dot" aria-hidden="true"></span>Connected</span>',
+        )
+
+    def test_status_as_button_carries_action_and_data(self):
+        html = status(
+            "Login failed",
+            "error",
+            tinted=True,
+            as_button=True,
+            action="hostname-status",
+            data={"hostname-id": "nx"},
+        )
+        self.assertTrue(
+            html.startswith(
+                '<button type="button" class="cds-status cds-status--error '
+                'cds-status--tinted cds-status--link"'
+            )
+        )
+        self.assertIn('data-action="hostname-status"', html)
+        self.assertIn('data-hostname-id="nx"', html)
+        self.assertIn("Login failed</button>", html)
+
+    def test_status_escapes_text_action_and_data(self):
+        html = status(
+            "<b>down</b>",
+            "warning",
+            as_button=True,
+            action='x"><script>',
+            data={"id": '"><script>'},
+        )
+        self.assertNotIn("<b>down</b>", html)
+        self.assertIn("&lt;b&gt;down&lt;/b&gt;", html)
+        self.assertNotIn("<script>", html)
+
+    def test_status_rejects_unknown_tone(self):
+        with self.assertRaises(ValueError):
+            status("x", "pink")
+
+    def test_grid_variants(self):
+        self.assertEqual(
+            grid(["<a></a>", "<b></b>"], "dashboard"),
+            '<div class="cds-grid--dashboard"><a></a><b></b></div>',
+        )
+        self.assertEqual(
+            grid(["<a></a>"], "stack"), '<div class="cds-stack"><a></a></div>'
+        )
+        with self.assertRaises(ValueError):
+            grid([], "4")
+
+    def test_metric_tile_markup(self):
+        html = metric_tile(
+            "Download attempts", "1,284", "94.2% success rate", sub_success=True
+        )
+        self.assertIn('class="cds-tile cds-tile--is-status cds-tile--is-metric"', html)
+        self.assertIn('<h2 class="cds-tile__heading">Download attempts</h2>', html)
+        self.assertIn('<p class="cds-metric__value">1,284</p>', html)
+        self.assertIn(
+            '<p class="cds-metric__sub cds-metric__sub--success">94.2% success rate</p>',
+            html,
+        )
+
+    def test_metric_tile_without_sub_line(self):
+        html = metric_tile("Sources", "3")
+        self.assertIn('<p class="cds-metric__value">3</p>', html)
+        self.assertNotIn("cds-metric__sub", html)
+
+    def test_kv_rows_escape_values(self):
+        self.assertEqual(
+            kv_rows([("IMDb cached IDs", "<1>")]),
+            '<div class="cds-kv__row"><span class="cds-kv__label">IMDb cached IDs</span>'
+            '<span class="cds-kv__value">&lt;1&gt;</span></div>',
+        )
+
+    def test_icon_button_markup_and_danger_variant(self):
+        html = icon_button(
+            "trash-can", "Delete package", action="package-delete", data={"id": "p1"}
+        )
+        self.assertIn('class="cds-icon-button cds-icon-button--sm"', html)
+        self.assertIn('type="button"', html)
+        self.assertIn('aria-label="Delete package"', html)
+        self.assertIn('title="Delete package"', html)
+        self.assertIn('data-action="package-delete"', html)
+        self.assertIn('data-id="p1"', html)
+        self.assertIn("<svg", html)
+
+        danger = icon_button(
+            "trash-can", "Delete", action="package-delete", danger=True
+        )
+        self.assertIn(
+            'class="cds-icon-button cds-icon-button--sm cds-icon-button--danger"',
+            danger,
+        )
+
+    def test_tile_help_text_follows_the_heading(self):
+        html = tile("Body", heading="Sources", help_text="Two configured")
+        self.assertIn(
+            '<h2 class="cds-tile__heading">Sources</h2>'
+            '<p class="cds-tile__help">Two configured</p>'
+            '<div class="cds-tile__content">Body</div>',
+            html,
+        )
+        self.assertNotIn("cds-tile__help", tile("Body", heading="Sources"))
+
+    def test_shell_brand_and_footer(self):
+        html = render_carbon_html(
+            "dashboard", "<p>x</p>", title="Dashboard", captcha_count=2, show_user=False
+        )
+        self.assertIn(
+            '<span class="cds-product"><strong>Quasarr</strong> Web UI</span>', html
+        )
+        self.assertNotIn("cds-captcha-count", html)
+        self.assertNotIn("cds-header__status", html)
+        self.assertIn('class="cds-header__badge"', html)
+        # Behavior kept from the previous shell: the switch returns to the
+        # Classic equivalent of the current page, not to Classic's home.
+        self.assertIn('href="/ui/classic?next=/"', html)
+        self.assertIn('class="cds-nav__link cds-nav__link--footer"', html)
+        self.assertIn('<p class="cds-nav__version">Quasarr v', html)
+
+    def test_shell_badge_only_when_captcha_items_are_waiting(self):
+        """Spec 2.5: the bell badge appears only for a counter > 0; the
+        text indicator "CAPTCHA n" that used to sit in the header center
+        is gone entirely.
+        """
+        empty = render_carbon_html("dashboard", "<p>x</p>", title="Dashboard")
+        self.assertNotIn("cds-header__badge", empty)
+        self.assertIn('aria-label="Notifications, 0 CAPTCHA items"', empty)
+
+        waiting = render_carbon_html(
+            "dashboard", "<p>x</p>", title="Dashboard", captcha_count=7
+        )
+        self.assertIn(
+            '<span class="cds-header__badge" aria-hidden="true">7</span>', waiting
+        )
+
+
 class ProtectedCaptchaCountTests(unittest.TestCase):
     """``protected_captcha_count`` is the Carbon-UI-integration hoist of the
     shell's CAPTCHA-badge count out of the private
@@ -622,9 +786,9 @@ class CarbonStaticContractsTests(unittest.TestCase):
         (Downloads' toolbar/search/sticky-column CSS included) inside them.
         Above the un-nested block's own trigger condition, none of that
         nested CSS ever actually applied in a real browser - confirmed live
-        via computed styles (`.cds-toolbar` margin-top read 0px instead of
-        16px, `.cds-field--search` max-width read "none" instead of
-        "320px") before this fix.
+        via computed styles (the Downloads search field's max-width read
+        "none" instead of its declared value, and the bulk-selection
+        header's margin read 0px) before this fix.
         """
         css = self._read_static("carbon.css")
         unclosed = _css_unclosed_block_starts(css)
@@ -707,13 +871,18 @@ class CarbonStaticContractsTests(unittest.TestCase):
         self.assertRegex(css, r"@media\s*\(max-width:\s*672px\)")
         self.assertIn("@media (prefers-reduced-motion: reduce)", css)
         self.assertRegex(css, r"min-height:\s*44px")
-        self.assertNotRegex(css, r"\.cds-tile[^\{]*\.cds-tile")
+        # Guards the real mistake this pin exists for - a stacked duplicate
+        # class typo like `.cds-tile.cds-tile` - without flagging the
+        # legitimate comma-grouped (`.cds-tile--is-compact,\n.cds-tile--is-status`)
+        # and descendant (`.cds-tile--is-status .cds-tile__heading`) selectors
+        # the target design now ships.
+        self.assertNotRegex(css, r"\.cds-tile\.cds-tile\b")
         self.assertNotIn("http://", css)
         self.assertNotIn("https://", css)
 
     def test_carbon_css_kpi_row_layout_contract(self):
-        """The statistics KPI row: a 4-column grid at
-        desktop width, matching the file's `repeat(4, minmax(0, 1fr))`/16px
+        """The statistics KPI row: a 4-column hairline grid at
+        desktop width, matching the file's `repeat(4, minmax(0, 1fr))`/1px
         gap conventions, collapsing to 2 columns at the existing 1056px
         breakpoint and 1 column at the existing 672px breakpoint.
         """
@@ -723,8 +892,25 @@ class CarbonStaticContractsTests(unittest.TestCase):
             css,
             r"\.cds-kpi-row\s*\{[^}]*display:\s*grid;"
             r"[^}]*grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\);"
-            r"[^}]*gap:\s*16px;",
+            r"[^}]*gap:\s*1px;",
         )
+        # Status dot component + page grids exist
+        self.assertRegex(
+            css,
+            r"\.cds-status__dot\s*\{[^}]*width:\s*10px;[^}]*height:\s*10px;[^}]*border-radius:\s*50%;",
+        )
+        self.assertRegex(
+            css, r"\.cds-grid--dashboard\s*\{[^}]*grid-template-columns:\s*1\.4fr 1fr;"
+        )
+        self.assertRegex(
+            css,
+            r"\.cds-grid--settings\s*\{[^}]*repeat\(auto-fit,\s*minmax\(400px,\s*1fr\)\);",
+        )
+        self.assertRegex(
+            css,
+            r"\.cds-modal__actions \.cds-btn\s*\{[^}]*flex:\s*1 1 0;[^}]*min-height:\s*56px;",
+        )
+        self.assertNotRegex(css, r"\.cds-tile\s*\{[^}]*border:\s*1px solid")
         self.assertRegex(
             css,
             r"@media\s*\(max-width:\s*1056px\)[\s\S]*?\.cds-kpi-row\s*\{"
@@ -736,17 +922,19 @@ class CarbonStaticContractsTests(unittest.TestCase):
             r"[^}]*grid-template-columns:\s*repeat\(1,\s*minmax\(0,\s*1fr\)\);",
         )
 
-    def test_carbon_css_status_card_wide_modifier_and_hostname_row_wrap_contract(self):
-        """The wide setup-page card cap,
-        and the fix that makes it actually usable - .cds-hostname-row (a
-        flex row) must wrap so its inline .cds-hostname-credentials Details
-        panel (a flex sibling of status/body/actions on the setup
-        Hostnames page, unlike the main Hostnames page's modal-based
-        equivalent) gets its own full-width line via flex-basis:100%,
-        instead of being squeezed to ~150-190px wide as a fourth column.
-        Confirmed live: before this fix the credentials panel's own two
-        <input> fields measured ~154px wide at 1280px viewport; after,
-        726.86px (the full row width).
+    def test_carbon_css_status_card_wide_modifier_and_credentials_panel_contract(self):
+        """The wide setup-page card cap, and the credentials Details panel
+        it has to fit.
+
+        The panel used to be a flex child of a `.cds-hostname-row` and
+        needed `flex-basis: 100%` to stop being squeezed to ~150-190px as a
+        fourth column. The dense-table rework replaced that row with
+        `.cds-hostname-table__row` and made the panel a plain block-level
+        sibling, so full width now comes from normal block layout. The
+        full-width guarantee itself is guarded structurally against the
+        rendered markup by SetupHostnameCredentialsPanelWidthTests below;
+        what this test still pins is the wide card cap and the panel's own
+        separation from the row above it.
         """
         css = self._read_static("carbon.css")
 
@@ -754,16 +942,14 @@ class CarbonStaticContractsTests(unittest.TestCase):
             css,
             r"\.cds-status-card--wide\s*\{[^}]*max-width:\s*760px;",
         )
+        self.assertNotIn(".cds-hostname-row {", css)
         self.assertRegex(
             css,
-            r"\.cds-hostname-row\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*wrap;",
-        )
-        self.assertRegex(
-            css,
-            r"\.cds-hostname-credentials\s*\{[^}]*flex-basis:\s*100%;",
+            r"\.cds-hostname-credentials\s*\{[^}]*margin-top:\s*16px;"
+            r"[^}]*border-top:[^}]*padding-top:\s*16px;",
         )
 
-    def test_reduced_motion_block_was_never_inside_the_corrupted_region(self):
+    def test_reduced_motion_block_sits_above_the_once_corrupted_region(self):
         """Corrects an earlier inaccuracy: prefers-reduced-motion sits
         well ABOVE the two blocks that were missing their own closing brace
         (Hostnames/Categories' 672px media query, .cds-status-footer
@@ -771,13 +957,13 @@ class CarbonStaticContractsTests(unittest.TestCase):
         "covered transitively" by the brace-balance regression test in any
         special sense beyond what every other rule in the file already gets.
         This just pins its position relative to the once-corrupted region so
-        that relationship can't silently get it wrong again.
+        that relationship can't silently get it wrong again. The anchor is
+        the Hostnames section marker rather than the `.cds-hostname-row`
+        media query the dense-table rework retired.
         """
         css = self._read_static("carbon.css")
         reduced_motion_index = css.index("@media (prefers-reduced-motion: reduce)")
-        corrupted_region_index = css.index(
-            "@media (max-width: 672px) {\n\t.cds-hostname-row,"
-        )
+        corrupted_region_index = css.index("/* ---- Hostnames ---- */")
         self.assertLess(reduced_motion_index, corrupted_region_index)
 
     def test_carbon_css_modal_surface_scrolls_when_taller_than_viewport(self):
@@ -806,9 +992,16 @@ class CarbonStaticContractsTests(unittest.TestCase):
             r"\.cds-modal__body\s*\{[^}]*overflow-y:\s*auto;[^}]*min-height:\s*0;"
             r"[^}]*overscroll-behavior:\s*contain;[^}]*\}",
         )
+        # .cds-modal__header and .cds-modal__actions are separate rules
+        # (not a combined selector) since the design's footer buttons need
+        # their own flex/sizing distinct from the header's.
         self.assertRegex(
             css,
-            r"\.cds-modal__header,\s*\.cds-modal__actions\s*\{[^}]*flex:\s*0 0 auto;",
+            r"\.cds-modal__header\s*\{[^}]*flex:\s*0 0 auto;",
+        )
+        self.assertRegex(
+            css,
+            r"\.cds-modal__actions\s*\{[^}]*flex:\s*0 0 auto;",
         )
 
     def test_carbon_css_mirror_row_move_buttons_are_scoped_for_the_light_modal_surface(
@@ -820,6 +1013,14 @@ class CarbonStaticContractsTests(unittest.TestCase):
         Mirrors the same `.cds-row-actions` scoped-override precedent the
         Downloads table already uses: 32px sizing, a visible hover tint,
         and the existing 672px 44px tap-target bump.
+
+        Also pins that convention for `.cds-icon-button--sm`, the third
+        32px override in the file. Every 32px override MUST ship a paired
+        672px 44px bump, because all of them sit after the generic
+        `@media (max-width: 672px) .cds-icon-button { 44px }` rule at equal
+        specificity and would otherwise win on source order alone.
+        `--sm` matters most: it is the only unscoped one, so a missing bump
+        shrinks the tap target of every `icon_button()` on every page.
         """
         css = self._read_static("carbon.css")
         self.assertRegex(
@@ -838,34 +1039,109 @@ class CarbonStaticContractsTests(unittest.TestCase):
             r"\.cds-mirror-row__move \.cds-icon-button\s*\{"
             r"[^}]*min-width:\s*44px;[^}]*min-height:\s*44px;[^}]*\}",
         )
+        self.assertRegex(
+            css,
+            r"\.cds-icon-button--sm\s*\{"
+            r"[^}]*min-width:\s*32px;[^}]*min-height:\s*32px;[^}]*\}",
+        )
+        self.assertRegex(
+            css,
+            r"@media \(max-width:\s*672px\)[\s\S]*?"
+            r"\.cds-icon-button--sm\s*\{"
+            r"[^}]*min-width:\s*44px;[^}]*min-height:\s*44px;[^}]*\}",
+        )
 
-    def test_carbon_js_has_no_emoji_dingbat_or_arrow_glyphs_anywhere(self):
-        """Carbon markup has no emoji. The renderer-owned
-        guard (`test_renderer_owned_emoji_guard` above) only scans
-        server-rendered HTML - it never sees JS-built DOM, which is exactly
-        how the mirror modal's bare star emoji and glyph arrows escaped
-        review. Scans the WHOLE file, not just one function, so the next
-        one cannot land either. Range covers Arrows (2190-21FF), Misc
-        Technical (2300-23FF, e.g. hourglass/keyboard glyphs), Geometric
-        Shapes (25A0-25FF, e.g. solid triangles), Misc Symbols (2600-26FF),
-        Dingbats (2700-27BF), Supplemental Arrows-A (27F0-27FF),
-        Supplemental Arrows-B (2900-297F), Misc Symbols and Arrows
-        (2B00-2BFF, covers the star that shipped here), and the
-        Mahjong/Domino/emoji supplementary planes (1F000-1FAFF).
+    def test_carbon_css_compact_button_keeps_a_44px_tap_target(self):
+        """`.cds-btn--compact` is the fourth 32px override in the file,
+        alongside `.cds-mirror-row__move .cds-icon-button`,
+        `.cds-icon-button--sm`, and `.cds-row-actions .cds-icon-button`
+        pinned above - it sits after the generic `@media (max-width: 672px)
+        .cds-btn { 44px }` rule at equal specificity and would otherwise
+        win on source order alone. It matters as much as `--sm`: it is
+        unscoped, so a missing bump shrinks the tap target of every
+        buildTextActionButton() caller - currently the deferred table's
+        Check and Remove buttons, two per row.
+        """
+        css = self._read_static("carbon.css")
+        self.assertRegex(
+            css,
+            r"\.cds-btn--compact\s*\{[^}]*min-height:\s*32px;[^}]*\}",
+        )
+        self.assertRegex(
+            css,
+            r"@media \(max-width:\s*672px\)[\s\S]*?"
+            r"\.cds-btn--compact\s*\{[^}]*min-height:\s*44px;[^}]*\}",
+        )
+
+    def test_carbon_css_nav_footer_link_keeps_a_44px_tap_target(self):
+        """The nav footer's classic switch used to be `.cds-classic-link`,
+        which carries its own `min-height: 44px`. As a
+        `.cds-nav__link--footer` it inherits `.cds-nav__link`'s 32px (40px
+        in the compact overlay) instead, so it needs an explicit bump at
+        the 672px breakpoint to keep a touch-sized target. The file's
+        generic `min-height: 44px` assertions elsewhere cannot catch this -
+        they match other rules and stay green while this one regresses.
+        """
+        css = self._read_static("carbon.css")
+        self.assertRegex(
+            css,
+            r"@media \(max-width:\s*672px\)[\s\S]*?"
+            r"\.cds-nav__link--footer\s*\{[^}]*min-height:\s*44px;[^}]*\}",
+        )
+
+    GLYPH_AS_ICON_PATTERN = (
+        "[\u2190-\u2191\u2193-\u21ff\u2300-\u23ff\u25a0-\u25ff\u2600-\u27bf"
+        "\u27f0-\u27ff\u2900-\u297f\u2b00-\u2bff\U0001f000-\U0001faff]"
+    )
+
+    def test_carbon_js_uses_no_glyph_as_an_icon(self):
+        """Carbon markup draws its icons as real SVG, never as a character.
+        The renderer-owned guard (`test_renderer_owned_emoji_guard` above)
+        only scans server-rendered HTML - it never sees JS-built DOM, which
+        is exactly how the mirror modal's bare star and its glyph arrows -
+        a Recommended marker and two reorder buttons - shipped. Scans the
+        WHOLE file, not just one function, so the next one cannot land
+        either. Range covers Arrows (2190-21FF), Misc Technical (2300-23FF,
+        e.g. hourglass/keyboard glyphs), Geometric Shapes (25A0-25FF, e.g.
+        solid triangles), Misc Symbols (2600-26FF), Dingbats (2700-27BF),
+        Supplemental Arrows-A (27F0-27FF), Supplemental Arrows-B
+        (2900-297F), Misc Symbols and Arrows (2B00-2BFF, covers the star
+        that shipped here), and the Mahjong/Domino/emoji supplementary
+        planes (1F000-1FAFF).
+
+        U+2192 RIGHTWARDS ARROW is the one exception, because it is
+        typography inside a link label rather than a control drawn as a
+        character: it names no action of its own, it is never an element's
+        only content, and dropping it would leave the label complete. The
+        Python renderers already ship that exact form ("Solve CAPTCHA -> "
+        on the dashboard CAPTCHA banner and "Statistics -> " on the all-time
+        tile, both in `quasarr/api/carbon.py`), so the JS-built inline link
+        beside a queue release would otherwise be the only one spelling the
+        same affordance differently. Every other arrow in the block stays
+        forbidden, so a reorder control can still never be a character.
         """
         js = self._read_static("carbon.js")
-        match = re.search(
-            "[\u2190-\u21ff\u2300-\u23ff\u25a0-\u25ff\u2600-\u27bf"
-            "\u27f0-\u27ff\u2900-\u297f\u2b00-\u2bff\U0001f000-\U0001faff]",
-            js,
-        )
+        match = re.search(self.GLYPH_AS_ICON_PATTERN, js)
         self.assertIsNone(
             match,
-            "emoji/dingbat/arrow glyph found in carbon.js: "
+            "glyph used as an icon found in carbon.js: "
             f"{match.group()!r} at offset {match.start()}"
             if match
             else "",
         )
+
+    def test_carbon_js_glyph_guard_permits_only_the_one_typographic_arrow(self):
+        """The carve-out above is exactly one codepoint wide, and the label
+        it exists for really is what carbon.js ships.
+        """
+        for codepoint in (0x2190, 0x2191, 0x2193, 0x21D2, 0x27A1, 0x2B50, 0x2705):
+            with self.subTest(codepoint=hex(codepoint)):
+                self.assertIsNotNone(
+                    re.search(self.GLYPH_AS_ICON_PATTERN, chr(codepoint))
+                )
+        self.assertIsNone(re.search(self.GLYPH_AS_ICON_PATTERN, chr(0x2192)))
+        js = self._read_static("carbon.js")
+        self.assertIn("'Solve CAPTCHA " + chr(0x2192) + "'", js)
 
 
 def _javascript_function_body(source, name):
@@ -944,6 +1220,240 @@ class ModalFocusChainTests(unittest.TestCase):
         )
         self.assertIn("lastFocusedElement.focus();", body)
         self.assertIn("lastFocusedElement = null;", body)
+
+
+class SetupHostnameCredentialsPanelWidthTests(unittest.TestCase):
+    """The setup Hostnames page's inline credentials panel must span the
+    full width of the rows container, not sit inside a row.
+
+    This is the same guarantee the retired `.cds-hostname-row` +
+    `flex-basis: 100%` CSS pin existed for - measured live at the time:
+    the panel's own two `<input>` fields were ~154px wide at a 1280px
+    viewport while the panel was a fourth child of the row, and 726.86px
+    once it got its own full-width line. The dense-table rework achieved
+    the same result differently, by emitting the panel as a block sibling
+    of `.cds-hostname-table__row` inside `.cds-hostname-table`, so the
+    guard now asserts that structure against the rendered HTML instead of
+    a CSS declaration that no longer exists. `.cds-hostname-table__row` is
+    a four-column grid (`56px 150px minmax(200px,1.2fr)
+    minmax(260px,1.6fr)`), so a panel nested inside one would be squeezed
+    into a single track exactly as before.
+    """
+
+    # Elements that never receive an end tag, so they must not be pushed
+    # onto the ancestor stack (`<input>` in particular is all over these
+    # rows).
+    VOID_ELEMENTS = frozenset(
+        {
+            "area",
+            "base",
+            "br",
+            "col",
+            "embed",
+            "hr",
+            "img",
+            "input",
+            "link",
+            "meta",
+            "param",
+            "source",
+            "track",
+            "wbr",
+        }
+    )
+
+    class _AncestorCollector(HTMLParser):
+        """Records the open-element class stack above every element
+        carrying the class it was asked about.
+        """
+
+        def __init__(self, wanted_class, void_elements):
+            super().__init__(convert_charrefs=True)
+            self.wanted_class = wanted_class
+            self.void_elements = void_elements
+            self.stack = []
+            self.matches = []
+
+        def handle_starttag(self, tag, attrs):
+            classes = frozenset(
+                dict(attrs).get("class", "").split() if dict(attrs).get("class") else []
+            )
+            if self.wanted_class in classes:
+                self.matches.append(list(self.stack))
+            if tag not in self.void_elements:
+                self.stack.append(classes)
+
+        def handle_startendtag(self, tag, attrs):
+            classes = frozenset(
+                dict(attrs).get("class", "").split() if dict(attrs).get("class") else []
+            )
+            if self.wanted_class in classes:
+                self.matches.append(list(self.stack))
+
+        def handle_endtag(self, tag):
+            if self.stack:
+                self.stack.pop()
+
+    def _render_setup_hostnames(self):
+        from types import SimpleNamespace
+
+        from quasarr.storage.setup import carbon as setup_carbon
+
+        row = {
+            "id": "gb",
+            "label": "GB",
+            "hostname": "gb-fixture.invalid",
+            "status": "skipped",
+            "status_emoji": "",
+            "status_title": "Login was skipped",
+            "details": "",
+            "timestamp": "",
+            "operation": "",
+            "missing_arr_client": None,
+            "supports_login": True,
+            "credential_section": "GB",
+            "skip_login": True,
+            "language": "de",
+            "categories": [],
+            "invite_only": False,
+            "requires_login": True,
+            "requires_account": False,
+            "requires_flaresolverr": False,
+        }
+
+        class _Section:
+            def get(self, _key):
+                return ""
+
+        class _Table:
+            def retrieve(self, _key):
+                return None
+
+        with (
+            mock.patch.object(setup_carbon, "build_hostname_rows", return_value=[row]),
+            mock.patch.object(setup_carbon, "Config", lambda _section: _Section()),
+            mock.patch.object(setup_carbon, "DataBase", lambda _table: _Table()),
+        ):
+            return setup_carbon.render_setup_hostnames(
+                SimpleNamespace(
+                    values={
+                        "sites": ["GB"],
+                        "external_address": "http://setup.invalid:8080",
+                        "port": 8080,
+                    }
+                )
+            )
+
+    def test_credentials_panel_is_a_block_sibling_of_the_row(self):
+        html = self._render_setup_hostnames()
+        parser = self._AncestorCollector("cds-hostname-credentials", self.VOID_ELEMENTS)
+        parser.feed(html)
+        parser.close()
+
+        self.assertEqual(
+            len(parser.matches),
+            1,
+            "expected exactly one credentials panel for the one fixture row",
+        )
+        ancestors = parser.matches[0]
+        for ancestor_classes in ancestors:
+            self.assertNotIn(
+                "cds-hostname-table__row",
+                ancestor_classes,
+                "credentials panel is nested inside a row - its fields would "
+                "be squeezed into one grid track instead of taking the full "
+                "row width",
+            )
+        self.assertIn(
+            "cds-hostname-table",
+            ancestors[-1],
+            "credentials panel must be a direct child of the rows container, "
+            """so normal block layout gives it the full width""",
+        )
+
+    def test_the_row_itself_really_is_the_narrow_grid_this_guards_against(self):
+        """Without this the sibling assertion above could quietly stop
+        meaning anything: it only protects a real width if the row it must
+        stay out of is still a multi-column grid.
+        """
+        css = (
+            Path(__file__)
+            .resolve()
+            .parent.parent.joinpath("quasarr", "static", "carbon.css")
+            .read_text(encoding="utf-8")
+        )
+        self.assertRegex(
+            css,
+            r"\.cds-hostname-table__head,\s*\n\.cds-hostname-table__row\s*\{"
+            r"[^}]*display:\s*grid;[^}]*grid-template-columns:",
+        )
+
+
+class ThemeSwitcherTests(unittest.TestCase):
+    """Settings' Light | Dark | System content switcher drives the shell's
+    own theme functions. "System" is not a third stored theme: it clears
+    the stored preference and falls back to the OS media query, exactly
+    like a first visit does.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (
+            Path(__file__)
+            .resolve()
+            .parent.parent.joinpath("quasarr", "static", "carbon.js")
+            .read_text(encoding="utf-8")
+        )
+
+    def test_change_handler_reacts_to_the_switcher_not_a_select(self):
+        body = _javascript_function_body(self.js, "onChange")
+        self.assertIn("'theme-switch'", body)
+        self.assertIn("applyThemePreference(", body)
+        self.assertNotIn("theme-select", self.js)
+
+    def test_system_preference_clears_storage_and_reads_the_media_query(self):
+        body = _javascript_function_body(self.js, "applyThemePreference")
+        self.assertIn("'system'", body)
+        self.assertIn("localStorage.removeItem(THEME_KEY)", body)
+        self.assertIn("systemTheme()", body)
+        self.assertIn("setTheme(preference)", body)
+
+        system_body = _javascript_function_body(self.js, "systemTheme")
+        self.assertIn("prefers-color-scheme: dark", system_body)
+
+    def test_switcher_selection_is_restored_from_the_stored_preference(self):
+        body = _javascript_function_body(self.js, "updateThemeSwitcher")
+        self.assertIn('input[name="theme"]', body)
+        self.assertIn("input.checked = input.value === preference", body)
+
+        stored_body = _javascript_function_body(self.js, "storedThemePreference")
+        self.assertIn("localStorage.getItem(THEME_KEY)", stored_body)
+        self.assertIn("'system'", stored_body)
+
+    def test_header_toggle_keeps_the_switcher_in_sync(self):
+        # The header's light/dark toggle stores an explicit theme, which
+        # must move the switcher off "System" rather than leave it lying.
+        body = _javascript_function_body(self.js, "setTheme")
+        self.assertIn("updateThemeSwitcher();", body)
+
+
+class ModalAnatomyOptionsTests(unittest.TestCase):
+    """The design's modal anatomy adds an eyebrow above the title and a
+    wide-surface variant for content-heavy dialogs (e.g. the mirrors
+    editor); showModal() gains a fourth `options` parameter carrying both.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parent.parent
+        cls.js = root.joinpath("quasarr", "static", "carbon.js").read_text(
+            encoding="utf-8"
+        )
+
+    def test_show_modal_reads_eyebrow_and_wide_from_options(self):
+        body = _javascript_function_body(self.js, "showModal")
+        self.assertIn("options && options.eyebrow", body)
+        self.assertIn("cds-modal__surface--wide", body)
 
 
 class NavOverlayFocusTrapTests(unittest.TestCase):

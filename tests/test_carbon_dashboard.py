@@ -162,6 +162,7 @@ class CarbonDashboardModelTests(unittest.TestCase):
             "jd_device_name",
             "hostnames_working",
             "hostnames_total",
+            "hostnames_issue_line",
             "captcha_count",
             "helper_active",
             "flaresolverr_url",
@@ -183,10 +184,11 @@ class CarbonDashboardRenderTests(unittest.TestCase):
 
     def _render(self, **model_overrides):
         model = {
-            "jd_connected": True,
+            "jd_connected": False,
             "jd_device_name": "MyJD",
             "hostnames_working": 3,
             "hostnames_total": 4,
+            "hostnames_issue_line": "",
             "captcha_count": 0,
             "helper_active": False,
             "flaresolverr_url": "",
@@ -199,6 +201,8 @@ class CarbonDashboardRenderTests(unittest.TestCase):
                 "failed_downloads": 3,
                 "total_captcha_decryptions": 9,
                 "decryption_success_rate": 75.0,
+                "total_download_attempts": 15,
+                "download_success_rate": 80.0,
             },
             "show_user": False,
         }
@@ -222,18 +226,74 @@ class CarbonDashboardRenderTests(unittest.TestCase):
         # its id bounds the row without needing to balance nested </div>s.
         row_end = html.index('id="dashboard-queue-tile"', start)
         row_html = html[start:row_end]
-        self.assertEqual(row_html.count("cds-tile--is-compact"), 4)
+        self.assertEqual(row_html.count("cds-tile--is-status"), 4)
 
-    def test_captcha_banner_present_when_count_positive(self):
-        html, _model = self._render(captcha_count=2, helper_active=False)
-        self.assertIn("CAPTCHA required", html)
-        self.assertIn("2 links waiting for a CAPTCHA solution.", html)
-        self.assertIn("SponsorsHelper can solve these automatically.", html)
-        self.assertIn('href="/captcha"', html)
+    def test_status_tiles_use_dots_not_tags(self):
+        html, _model = self._render()
+        start = html.index('<div class="cds-kpi-row">')
+        row_html = html[start : html.index('<div class="cds-grid--dashboard">', start)]
+        self.assertEqual(row_html.count("cds-tile--is-status"), 4)
+        self.assertNotIn("cds-tag", row_html)
+        self.assertIn(
+            'cds-status cds-status--error cds-status--strong">'
+            '<span class="cds-status__dot" aria-hidden="true"></span>Disconnected',
+            row_html,
+        )
+        for heading in ("JDownloader", "Hostnames", "FlareSolverr", "SponsorsHelper"):
+            self.assertIn(f'<h2 class="cds-tile__heading">{heading}</h2>', row_html)
+
+    def test_captcha_banner_is_single_line_with_ghost_link(self):
+        html, _model = self._render(captcha_count=2)
+        self.assertIn(
+            "<strong>Action required.</strong> 2 links are waiting for a CAPTCHA solution.",
+            html,
+        )
+        self.assertIn(
+            '<a class="cds-btn cds-btn--ghost" href="/captcha">Solve CAPTCHAs →</a>',
+            html,
+        )
+        self.assertNotIn(
+            "cds-btn--primary", html[: html.index('<div class="cds-kpi-row">')]
+        )
+
+    def test_captcha_banner_singular_link_uses_singular_verb(self):
+        html, _model = self._render(captcha_count=1)
+        self.assertIn(
+            "<strong>Action required.</strong> 1 link is waiting for a CAPTCHA solution.",
+            html,
+        )
+        self.assertIn(
+            '<a class="cds-btn cds-btn--ghost" href="/captcha">Solve CAPTCHA →</a>',
+            html,
+        )
+
+    def test_captcha_banner_plural_links_use_plural_verb(self):
+        html, _model = self._render(captcha_count=3)
+        self.assertIn(
+            "<strong>Action required.</strong> 3 links are waiting for a CAPTCHA solution.",
+            html,
+        )
 
     def test_captcha_banner_absent_when_count_zero(self):
         html, _model = self._render(captcha_count=0)
-        self.assertNotIn("CAPTCHA required", html)
+        self.assertNotIn("cds-notification--inline", html)
+        self.assertNotIn("Action required", html)
+
+    def test_dashboard_uses_two_column_grid(self):
+        html, _model = self._render()
+        self.assertIn(
+            '<div class="cds-grid--dashboard"><section class="cds-tile" id="dashboard-queue-tile"',
+            html,
+        )
+        self.assertIn(
+            '<div class="cds-stack"><section class="cds-tile" id="dashboard-api-tile">',
+            html,
+        )
+        self.assertIn(
+            '<a class="cds-btn cds-btn--ghost" href="/statistics">Statistics →</a>',
+            html,
+        )
+        self.assertNotIn("<table", html)
 
     def test_queue_tile_scaffold_present_and_empty(self):
         html, _model = self._render()
@@ -253,9 +313,12 @@ class CarbonDashboardRenderTests(unittest.TestCase):
 
     def test_all_time_summary_present(self):
         html, _model = self._render()
-        self.assertIn("<caption>All-time summary</caption>", html)
-        self.assertIn("12", html)
-        self.assertIn("75.0%", html)
+        self.assertIn('<h2 class="cds-tile__heading">All time</h2>', html)
+        self.assertIn('<span class="cds-kv__label">Download attempts</span>', html)
+        self.assertIn('<span class="cds-kv__label">Download success rate</span>', html)
+        self.assertIn('<span class="cds-kv__label">CAPTCHA decryptions</span>', html)
+        self.assertIn("15", html)
+        self.assertIn("80.0%", html)
 
     def test_structural_guards_pass(self):
         html, _model = self._render(captcha_count=1)

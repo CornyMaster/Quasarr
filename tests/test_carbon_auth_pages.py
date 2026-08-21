@@ -147,7 +147,13 @@ class LoginPageDispatchTests(CarbonAuthDispatchTestCase):
         # The login shell is exempt from the Carbon switch link.
         self.assertNotIn("/ui/carbon", text)
 
-    def test_carbon_login_page_renders_with_csp_and_no_classic_switch(self):
+    def test_carbon_login_page_renders_with_csp_and_classic_link(self):
+        """The centred 400px sign-in card: a brand mark above it, the
+        eyebrow/H1 and both fields inside it, a full-width primary submit,
+        the helper line, and a footer carrying the version plus a Classic UI
+        link - unlike the Basic-auth 401 challenge, an unauthenticated
+        visitor here may freely switch UI before signing in.
+        """
         app = self._make_app()
         with self._carbon_env():
             status, headers, body = wsgi_request(app, path="/login")
@@ -158,11 +164,43 @@ class LoginPageDispatchTests(CarbonAuthDispatchTestCase):
             [importlib.import_module("quasarr.providers.page_dispatch").CSP_POLICY],
         )
         self.assertIn("<!doctype html>", text)
-        self.assertIn(">Login<", text)
-        # Exemption preserved in the Carbon variant too: no switch-to-classic
-        # link on an unauthenticated login page.
-        self.assertNotIn("/ui/classic", text)
-        self.assertNotIn("Switch to Classic UI", text)
+        self.assertIn('<div class="cds-auth">', text)
+        self.assertIn('<p class="cds-page-header__eyebrow">Sign in</p>', text)
+        self.assertIn('<h1 class="cds-page-header__title">Welcome back</h1>', text)
+        self.assertIn('id="carbon-login-username" name="username"', text)
+        self.assertIn('id="carbon-login-password" name="password"', text)
+        self.assertIn(
+            '<button class="cds-btn cds-btn--primary cds-btn--cta cds-btn--block" '
+            'type="submit">Log in</button>',
+            text,
+        )
+        self.assertIn("Sessions last 30 days on this device.", text)
+        self.assertIn('href="/ui/classic"', text)
+        self.assertIn(">Classic UI<", text)
+        self.assertIn("Quasarr v", text)
+
+    def test_structural_guards_pass(self):
+        """The composed login document (not render_carbon_simple_page(), so
+        not covered by that helper's own guard call) must pass the same
+        structural guards every other Carbon page does, on both the plain
+        render and the failed-login render (extra notification markup).
+        """
+        from quasarr.providers.carbon_templates import _assert_structural_guards
+
+        app = self._make_app()
+        with self._carbon_env():
+            _status, _headers, body = wsgi_request(app, path="/login")
+        _assert_structural_guards(body.decode("utf-8"))
+
+        post_body = urlencode({"username": "wrong", "password": "wrong"}).encode(
+            "ascii"
+        )
+        post_headers = {"CONTENT_TYPE": "application/x-www-form-urlencoded"}
+        with self._carbon_env():
+            _status, _headers, failed_body = wsgi_request(
+                app, method="POST", path="/login", headers=post_headers, body=post_body
+            )
+        _assert_structural_guards(failed_body.decode("utf-8"))
 
     def test_carbon_login_form_requires_no_javascript(self):
         """The login form must be a plain POST: name attributes on every
@@ -264,7 +302,7 @@ class LoginPageDispatchTests(CarbonAuthDispatchTestCase):
             self._carbon_env(),
             mock.patch.object(
                 self.carbon_templates,
-                "render_carbon_simple_page",
+                "tile",
                 side_effect=RuntimeError("boom"),
             ),
         ):

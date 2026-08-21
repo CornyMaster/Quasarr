@@ -232,6 +232,37 @@ class SetupHostnamesCarbonRenderTests(unittest.TestCase):
         self.assertIn('value="ga-fixture.invalid"', html)
         self.assertIn('value="gb-fixture.invalid"', html)
 
+    def test_rows_are_wrapped_in_the_scroll_container(self):
+        """Regression pin: without this wrapper, carbon.css's narrow-
+        viewport rule (a forced 760px min-width on every
+        .cds-hostname-table__row, which these rows carry regardless, via
+        the shared row builder) had no .cds-hostname-table ancestor to
+        become a horizontal scroll container, so the rows overflowed this
+        page's narrower (760px-max) card instead of scrolling.
+
+        Walks balanced <div>/</div> tags from the wrapper's own opening tag
+        to find where THAT div actually closes, rather than just checking
+        some </div> exists later in the page (true of any HTML document)
+        or that the next </div> after a row closes it (the row's own
+        nested credentials panel <div> would satisfy that without the
+        wrapper ever really containing the rows).
+        """
+        html = self._render()
+        start = html.index('<div class="cds-hostname-table">')
+        depth = 0
+        wrapper_end = None
+        for match in re.finditer(r"<div\b|</div>", html[start:]):
+            depth += -1 if match.group() == "</div>" else 1
+            if depth == 0:
+                wrapper_end = start + match.end()
+                break
+        self.assertIsNotNone(
+            wrapper_end, "the .cds-hostname-table wrapper never closes"
+        )
+        wrapped = html[start:wrapper_end]
+        self.assertIn('data-hostname-id="ga"', wrapped)
+        self.assertIn('data-hostname-id="gb"', wrapped)
+
     def test_uncontrolled_details_text_never_in_initial_markup(self):
         """The exception-derived `details` text may embed a configured
         hostname; it must be fetched fresh by carbon.js, never rendered here.
@@ -1011,6 +1042,17 @@ class CarbonJsSetupFlowsScriptTests(unittest.TestCase):
     def test_credentials_check_body_hits_the_check_endpoint(self):
         body = javascript_function_body(self.js, "checkSetupHostnameCredentials")
         self.assertIn("/api/hostnames/check-credentials/", body)
+
+    def test_credentials_check_success_uses_the_status_component_not_a_tag(self):
+        """The dense-row redesign replaced the row's status .cds-tag pill
+        with the dot+text status component everywhere else - this in-place
+        update after a successful check must match, not reintroduce a
+        `.cds-tag cds-tag--green` pill next to it.
+        """
+        body = javascript_function_body(self.js, "checkSetupHostnameCredentials")
+        self.assertIn("cds-status cds-status--success", body)
+        self.assertIn("cds-status__dot", body)
+        self.assertNotIn("cds-tag cds-tag--green", body)
 
     def test_credentials_skip_body_posts_then_navigates(self):
         body = javascript_function_body(self.js, "performCredentialsSkip")

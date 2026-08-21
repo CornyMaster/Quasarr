@@ -24,6 +24,7 @@
 	let navMediaQuery = null;
 	let modalElement = null;
 	let modalTitle = null;
+	let modalEyebrow = null;
 	let modalBody = null;
 	let modalActions = null;
 	let toastRegion = null;
@@ -34,6 +35,20 @@
 	function currentTheme() {
 		const theme = document.documentElement.getAttribute('data-carbon-theme');
 		return VALID_THEMES.has(theme) ? theme : 'light';
+	}
+
+	function systemTheme() {
+		return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+	}
+
+	function storedThemePreference() {
+		let stored = '';
+		try {
+			stored = localStorage.getItem(THEME_KEY) || '';
+		} catch (_error) {
+			stored = '';
+		}
+		return VALID_THEMES.has(stored) ? stored : 'system';
 	}
 
 	function setTheme(theme) {
@@ -47,6 +62,33 @@
 			// The selected theme still applies when storage is unavailable.
 		}
 		updateThemeControl();
+		updateThemeSwitcher();
+	}
+
+	// Settings' Light | Dark | System switcher. "System" is not a third
+	// stored theme: it clears the stored preference so the page falls back
+	// to the OS media query, exactly like a first visit does.
+	function applyThemePreference(preference) {
+		if (preference === 'system') {
+			try {
+				localStorage.removeItem(THEME_KEY);
+			} catch (_error) {
+				// Nothing was stored, or storage is unavailable - either way
+				// the media-query fallback below still applies.
+			}
+			document.documentElement.setAttribute('data-carbon-theme', systemTheme());
+			updateThemeControl();
+			updateThemeSwitcher();
+			return;
+		}
+		setTheme(preference);
+	}
+
+	function updateThemeSwitcher() {
+		const preference = storedThemePreference();
+		document.querySelectorAll('[data-action="theme-switch"] input[name="theme"]').forEach(function (input) {
+			input.checked = input.value === preference;
+		});
 	}
 
 	function toggleTheme() {
@@ -233,7 +275,7 @@
 		closeModalInternal();
 	};
 
-	window.showModal = function showModal(title, bodyHtml, actionsHtml) {
+	window.showModal = function showModal(title, bodyHtml, actionsHtml, options) {
 		if (!modalElement) {
 			return;
 		}
@@ -250,7 +292,34 @@
 		if (modalElement.hidden) {
 			lastFocusedElement = document.activeElement;
 		}
-		modalTitle.textContent = String(title || 'Dialog');
+		// Design anatomy: an optional eyebrow line above the title, and an
+		// optional wide surface for content-heavy dialogs (e.g. the mirrors
+		// editor). Both are read from the same caller-owned `options` bag so
+		// existing three-argument callers are unaffected.
+		const eyebrowText = options && options.eyebrow ? String(options.eyebrow) : '';
+		if (modalEyebrow) {
+			modalEyebrow.textContent = eyebrowText;
+			modalEyebrow.hidden = !eyebrowText;
+		}
+		const surface = modalElement.querySelector('.cds-modal__surface');
+		if (surface) {
+			surface.classList.toggle('cds-modal__surface--wide', Boolean(options && options.wide));
+		}
+		// options.titleMonoSuffix (e.g. " · nx.example.invalid") renders in
+		// its own Mono-styled node appended after the plain-text title -
+		// design spec §2.4. Every existing 3-argument caller, and every
+		// 4-argument caller that doesn't pass this field, keeps getting a
+		// plain-text title exactly as before.
+		const titleMonoSuffix =
+			options && options.titleMonoSuffix ? String(options.titleMonoSuffix) : '';
+		modalTitle.textContent = '';
+		modalTitle.appendChild(document.createTextNode(String(title || 'Dialog')));
+		if (titleMonoSuffix) {
+			const suffixEl = document.createElement('span');
+			suffixEl.className = 'cds-mono';
+			suffixEl.textContent = titleMonoSuffix;
+			modalTitle.appendChild(suffixEl);
+		}
 		// Compatibility: caller-owned body/actions fragments are intentionally injected.
 		modalBody.innerHTML = String(bodyHtml || '');
 		modalActions.innerHTML = String(actionsHtml || '');
@@ -371,11 +440,8 @@
 			return;
 		}
 		const action = actionElement.getAttribute('data-action');
-		if (action === 'theme-select') {
-			const value = String(event.target.value || '');
-			if (VALID_THEMES.has(value)) {
-				setTheme(value);
-			}
+		if (action === 'theme-switch') {
+			applyThemePreference(String(event.target.value || ''));
 		}
 	}
 
@@ -415,6 +481,7 @@
 		navMediaQuery = window.matchMedia('(max-width: 1056px)');
 		modalElement = document.getElementById('cds-modal');
 		modalTitle = document.getElementById('cds-modal-title');
+		modalEyebrow = document.getElementById('cds-modal-eyebrow');
 		modalBody = document.getElementById('cds-modal-body');
 		modalActions = document.getElementById('cds-modal-actions');
 		toastRegion = document.getElementById('cds-toast-region');
@@ -425,6 +492,7 @@
 		];
 
 		updateThemeControl();
+		updateThemeSwitcher();
 		syncNavViewport();
 		if (typeof navMediaQuery.addEventListener === 'function') {
 			navMediaQuery.addEventListener('change', syncNavViewport);
@@ -480,6 +548,41 @@
 		return (result.data && result.data.message) || fallback;
 	}
 
+	// ---- Sequential saves. Two Settings tiles (Link protection, *arr
+	// clients) now carry ONE Save that drives two independent existing
+	// endpoints, and one Send test that drives every configured provider.
+	// Every such helper resolves to { ok, message } instead of throwing or
+	// writing its own status line, so a failure of the first call can
+	// neither stop the second from running nor hide itself behind the
+	// second one's result. combineResults() then names what failed AND
+	// what still saved - a bare "Save failed" would leave the user unable
+	// to tell which half of the tile actually applied. ----
+
+	function combineResults(parts, successMessage, doneLabel) {
+		var failed = parts.filter(function (part) {
+			return !part.result.ok;
+		});
+		if (!failed.length) {
+			return successMessage;
+		}
+		var message = failed
+			.map(function (part) {
+				return part.label + ': ' + part.result.message;
+			})
+			.join(' · ');
+		var saved = parts
+			.filter(function (part) {
+				return part.result.ok;
+			})
+			.map(function (part) {
+				return part.label;
+			});
+		if (saved.length) {
+			message += ' · ' + saved.join(' and ') + ' ' + doneLabel + '.';
+		}
+		return message;
+	}
+
 	// ---- JDownloader (no GET endpoint exists for stored credentials, so
 	// this always submits fresh user/pass/device input - same as Classic). ----
 
@@ -508,10 +611,6 @@
 					select.appendChild(option);
 				});
 			}
-			var section = byId('settings-jd-device-section');
-			if (section) {
-				section.hidden = false;
-			}
 			setFieldStatus(statusId, 'Credentials verified');
 		} catch (error) {
 			setFieldStatus(statusId, error.message);
@@ -519,7 +618,7 @@
 	}
 
 	async function saveJDownloaderSettings() {
-		var statusId = 'settings-jd-save-status';
+		var statusId = 'settings-jd-status';
 		setFieldStatus(statusId, 'Saving...');
 		try {
 			var deviceSelect = byId('settings-jd-device');
@@ -542,8 +641,6 @@
 	// key. Clearing both fields is a separate explicit action. ----
 
 	async function saveArrSettings(service) {
-		var statusId = 'settings-' + service + '-status';
-		setFieldStatus(statusId, 'Saving...');
 		try {
 			var current = await fetchJsonSettings('/api/' + service + '/settings');
 			var base = (current && current.settings) || {};
@@ -556,15 +653,43 @@
 			if (!result.ok || !result.data.success) {
 				throw new Error(errorMessage(result, 'Save failed'));
 			}
-			setFieldStatus(statusId, result.data.message || 'Saved');
+			return { ok: true, message: result.data.message || 'Saved' };
 		} catch (error) {
-			setFieldStatus(statusId, error.message);
+			return { ok: false, message: error.message };
 		}
 	}
 
+	function arrServiceLabel(service) {
+		return service === 'sonarr' ? 'Sonarr' : 'Radarr';
+	}
+
+	// One Save for the tile: Radarr first, then Sonarr, both always
+	// attempted, both outcomes reported in the one shared status line.
+	async function saveAllArrSettings() {
+		var statusId = 'settings-arr-status';
+		setFieldStatus(statusId, 'Saving...');
+		var radarr = await saveArrSettings('radarr');
+		var sonarr = await saveArrSettings('sonarr');
+		setFieldStatus(
+			statusId,
+			combineResults(
+				[
+					{ label: arrServiceLabel('radarr'), result: radarr },
+					{ label: arrServiceLabel('sonarr'), result: sonarr }
+				],
+				'Saved',
+				'saved'
+			)
+		);
+	}
+
+	// Radarr and Sonarr share one status line, so every message names the
+	// service it is about - otherwise "Cleared" next to two Clear buttons
+	// says nothing about which client was removed.
 	async function clearArrSettings(service) {
-		var statusId = 'settings-' + service + '-status';
-		setFieldStatus(statusId, 'Clearing...');
+		var statusId = 'settings-arr-status';
+		var label = arrServiceLabel(service);
+		setFieldStatus(statusId, 'Clearing ' + label + '...');
 		try {
 			var result = await postJsonSettings('/api/' + service + '/settings', {
 				url: '',
@@ -581,10 +706,33 @@
 			if (keyInput) {
 				keyInput.value = '';
 			}
-			setFieldStatus(statusId, result.data.message || 'Cleared');
+			setFieldStatus(statusId, result.data.message || label + ' cleared');
 		} catch (error) {
-			setFieldStatus(statusId, error.message);
+			setFieldStatus(statusId, label + ': ' + error.message);
 		}
+	}
+
+	// Clear wipes a configured client immediately once confirmed, so it
+	// gets the same confirm-modal treatment as "Restart Quasarr" and
+	// "Delete package" - a danger action never fires straight off a click.
+	function openArrClearModal(service) {
+		if (typeof window.showModal !== 'function') {
+			return;
+		}
+		var label = arrServiceLabel(service);
+		var body = document.createElement('div');
+		body.appendChild(
+			buildEl('p', '', 'This removes the configured URL and API key for ' + label + '. This cannot be undone.')
+		);
+		window.showModal(
+			'Clear ' + label + ' configuration?',
+			body.innerHTML,
+			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
+				'<button class="cds-btn cds-btn--danger" type="button" data-action="' +
+				service +
+				'-clear-confirm">Clear</button>',
+			{ eyebrow: '*arr clients' }
+		);
 	}
 
 	// ---- Notifications ----
@@ -656,24 +804,60 @@
 		}
 	}
 
-	async function testNotificationProvider(provider) {
-		var statusId = 'settings-notification-' + provider + '-status';
-		setFieldStatus(statusId, 'Saving settings before test...');
-		var saved = await saveNotifications();
-		if (!saved) {
-			setFieldStatus(statusId, 'Save failed. Fix settings and retry.');
-			return;
+	// Which providers a test can reach at all, read from the same rendered
+	// fields the save reads - the tile has one Send test, so it must cover
+	// every provider the user actually configured rather than pick one and
+	// leave the other untestable.
+	function configuredNotificationProviders() {
+		var providers = [];
+		if (readFieldValue('settings-notification-discord-webhook')) {
+			providers.push({ id: 'discord', label: 'Discord' });
 		}
-		setFieldStatus(statusId, 'Sending test message...');
+		if (
+			readFieldValue('settings-notification-telegram-token') &&
+			readFieldValue('settings-notification-telegram-chat-id')
+		) {
+			providers.push({ id: 'telegram', label: 'Telegram' });
+		}
+		return providers;
+	}
+
+	async function testNotificationProvider(provider) {
 		try {
 			var result = await postJsonSettings('/api/notifications/test', { provider: provider });
 			if (!result.ok || !result.data.success) {
 				throw new Error(errorMessage(result, 'Failed to send test message'));
 			}
-			setFieldStatus(statusId, result.data.message || 'Test message sent');
+			return { ok: true, message: result.data.message || 'Test message sent' };
 		} catch (error) {
-			setFieldStatus(statusId, error.message);
+			return { ok: false, message: error.message };
 		}
+	}
+
+	async function testConfiguredNotificationProviders() {
+		var statusId = 'settings-notifications-status';
+		var providers = configuredNotificationProviders();
+		if (!providers.length) {
+			setFieldStatus(statusId, 'Configure Discord or Telegram before sending a test.');
+			return;
+		}
+		setFieldStatus(statusId, 'Saving settings before test...');
+		var saved = await saveNotifications();
+		if (!saved) {
+			// saveNotifications() already wrote the real reason into this
+			// same status line; a generic sentence here would throw away
+			// the only clue the user has about what to fix.
+			return;
+		}
+		setFieldStatus(statusId, 'Sending test message...');
+		var results = [];
+		for (var index = 0; index < providers.length; index += 1) {
+			results.push({
+				label: providers[index].label,
+				result: await testNotificationProvider(providers[index].id)
+			});
+		}
+		setFieldStatus(statusId, combineResults(results, 'Test message sent', 'sent'));
 	}
 
 	// ---- Timeouts ----
@@ -693,12 +877,48 @@
 		);
 	}
 
-	async function saveTimeoutSettings() {
+	// The Save button is gone - a timeout switch saves as soon as it is
+	// flipped - so the row's "Current: n s (normal|slow)" line has to
+	// follow immediately. Both strings are rendered server-side onto the
+	// row wrapper, so the multiplier stays owned by quasarr/constants and
+	// is never recomputed here.
+	function updateTimeoutHelpText(input) {
+		var row = input.closest('[data-timeout-help-normal]');
+		var help = byId(input.id + '-help');
+		if (!row || !help) {
+			return;
+		}
+		help.textContent = input.checked
+			? row.getAttribute('data-timeout-help-slow') || ''
+			: row.getAttribute('data-timeout-help-normal') || '';
+	}
+
+	// Re-sync every timeout switch and its help line from an authoritative
+	// settings object, the same way saveFilecryptSetting() and
+	// saveCrypterBlockSettings() re-sync their own controls from the
+	// response. With no Save button in this tile the switch IS the state
+	// indicator, so it must never be left showing a value the server does
+	// not hold.
+	function applyTimeoutSettings(settings) {
+		timeoutSlowModeKeys().forEach(function (key) {
+			var input = byId('settings-timeout-' + key);
+			if (!input || typeof settings[key] === 'undefined') {
+				return;
+			}
+			input.checked = !!settings[key];
+			input.setAttribute('aria-checked', String(input.checked));
+			updateTimeoutHelpText(input);
+		});
+	}
+
+	async function saveTimeoutSettings(previousSettings) {
 		var statusId = 'settings-timeouts-status';
 		setFieldStatus(statusId, 'Saving...');
+		var stored = null;
 		try {
 			var current = await fetchJsonSettings('/api/timeouts/settings');
 			var base = (current && current.settings) || {};
+			stored = base;
 			var settings = Object.assign({}, base);
 			timeoutSlowModeKeys().forEach(function (key) {
 				settings[key] = readCheckboxValue('settings-timeout-' + key, settings[key]);
@@ -707,8 +927,15 @@
 			if (!result.ok || !result.data.success) {
 				throw new Error(errorMessage(result, 'Save failed'));
 			}
+			applyTimeoutSettings(result.data.settings || settings);
 			setFieldStatus(statusId, result.data.message || 'Saved');
 		} catch (error) {
+			// Nothing was stored: put the switch and its "Current: n s" line
+			// back to what the server actually holds - the freshly fetched
+			// settings when the GET got through, otherwise the state the
+			// switch had before the user flipped it, which the change
+			// handler captured for exactly this case.
+			applyTimeoutSettings(stored || previousSettings || {});
 			setFieldStatus(statusId, error.message);
 		}
 	}
@@ -716,8 +943,6 @@
 	// ---- Filecrypt enabled / Link protection block policy (B1) ----
 
 	async function saveFilecryptSetting() {
-		var statusId = 'settings-filecrypt-status';
-		setFieldStatus(statusId, 'Saving...');
 		try {
 			var enabled = readCheckboxValue('settings-filecrypt-enabled', true);
 			var result = await postJsonSettings('/api/filecrypt/settings', { enabled: enabled });
@@ -727,16 +952,15 @@
 			var checkbox = byId('settings-filecrypt-enabled');
 			if (checkbox) {
 				checkbox.checked = !!result.data.enabled;
+				checkbox.setAttribute('aria-checked', String(checkbox.checked));
 			}
-			setFieldStatus(statusId, result.data.message || 'Saved');
+			return { ok: true, message: result.data.message || 'Saved' };
 		} catch (error) {
-			setFieldStatus(statusId, error.message);
+			return { ok: false, message: error.message };
 		}
 	}
 
 	async function saveCrypterBlockSettings() {
-		var statusId = 'settings-crypter-block-status';
-		setFieldStatus(statusId, 'Saving...');
 		try {
 			var current = await fetchJsonSettings('/api/crypter-block/settings');
 			var base = (current && current.settings) || {};
@@ -779,15 +1003,37 @@
 			}
 			if (defaultCheckbox) {
 				defaultCheckbox.checked = settings.filecrypt_sweep_window_override == null;
+				defaultCheckbox.setAttribute('aria-checked', String(defaultCheckbox.checked));
 			}
 			var cooldownInput = byId('settings-crypter-cooldown-hours');
 			if (cooldownInput && typeof settings.cooldown_hours !== 'undefined') {
 				cooldownInput.value = settings.cooldown_hours;
 			}
-			setFieldStatus(statusId, result.data.message || 'Saved');
+			return { ok: true, message: result.data.message || 'Saved' };
 		} catch (error) {
-			setFieldStatus(statusId, error.message);
+			return { ok: false, message: error.message };
 		}
+	}
+
+	// One Save for the Link protection tile: the Filecrypt switch and the
+	// linkcrypter block policy keep their own separate existing endpoints
+	// and payloads, posted one after the other. Neither result is dropped.
+	async function saveLinkProtectionSettings() {
+		var statusId = 'settings-link-protection-status';
+		setFieldStatus(statusId, 'Saving...');
+		var filecrypt = await saveFilecryptSetting();
+		var block = await saveCrypterBlockSettings();
+		setFieldStatus(
+			statusId,
+			combineResults(
+				[
+					{ label: 'Filecrypt decryption', result: filecrypt },
+					{ label: 'Access blocks', result: block }
+				],
+				'Saved',
+				'saved'
+			)
+		);
 	}
 
 	// ---- FlareSolverr: single field, no merge - a blank URL is an
@@ -816,10 +1062,11 @@
 			return;
 		}
 		window.showModal(
-			'Regenerate API Key?',
+			'Regenerate API key?',
 			'Regenerating replaces the current API key. Every *arr client using the old key will need to be updated.',
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
-				'<a class="cds-btn cds-btn--danger-ghost" href="/regenerate-api-key">Regenerate</a>'
+				'<a class="cds-btn cds-btn--danger" href="/regenerate-api-key">Regenerate</a>',
+			{ eyebrow: 'API access' }
 		);
 	}
 
@@ -832,6 +1079,64 @@
 		extracting: 'Extracting',
 		queued: 'Queued'
 	};
+	var QUEUE_BAR_TONES = {
+		waiting_captcha: 'warning',
+		downloading: 'interactive',
+		extracting: 'success',
+		queued: 'interactive'
+	};
+
+	// buildEl()/buildProgress() are scoped to this IIFE the same way
+	// QUEUE_STATUS_LABELS above already is: carbon.js ships one script whose
+	// per-page IIFEs share nothing but the handful of documented window
+	// exports, so the Dashboard's preview stays independent of the Downloads
+	// page module even though both draw the same kind of bar.
+	function buildEl(tagName, className, text) {
+		var el = document.createElement(tagName);
+		if (className) {
+			el.className = className;
+		}
+		if (text !== undefined) {
+			el.textContent = text;
+		}
+		return el;
+	}
+
+	// Same accessibility contract as every other Carbon progress bar: an
+	// announced role, value bounds, and a name identifying the package. The
+	// preview's bar carries no value text of its own (the meta line beside
+	// the name already states it), which is why it is a distinct function
+	// from the Downloads table's labelled `buildProgress()`.
+	function buildPreviewProgress(pct, tone, ariaLabel) {
+		var value = Math.max(0, Math.min(100, Number(pct) || 0));
+		var wrap = buildEl('div', 'cds-progress-cell');
+		var bar = buildEl('div', 'cds-progress');
+		bar.setAttribute('role', 'progressbar');
+		bar.setAttribute('aria-valuemin', '0');
+		bar.setAttribute('aria-valuemax', '100');
+		bar.setAttribute('aria-valuenow', String(Math.round(value)));
+		bar.setAttribute('aria-label', String(ariaLabel || 'Progress'));
+		var fill = buildEl('div', 'cds-progress__fill cds-progress__fill--' + tone);
+		fill.style.width = value + '%';
+		bar.appendChild(fill);
+		wrap.appendChild(bar);
+		return wrap;
+	}
+
+	// A package that is actually moving reports its own numbers; anything
+	// else (waiting for a CAPTCHA, extracting, queued) reports what it is
+	// waiting on, because a percentage says nothing there.
+	function queuePreviewMeta(row) {
+		var statusLabel = QUEUE_STATUS_LABELS[row.status] || String(row.status || '');
+		if (row.status !== 'downloading') {
+			return statusLabel;
+		}
+		var percent = String(row.percentage || 0) + '%';
+		if (row.eta_unknown || !row.eta) {
+			return percent;
+		}
+		return percent + ' · ' + row.eta + ' left';
+	}
 
 	function renderQueueMessage(message) {
 		var content = byId('dashboard-queue-content');
@@ -850,19 +1155,19 @@
 			content.textContent = 'No active downloads.';
 			return;
 		}
-		var list = document.createElement('ul');
-		list.className = 'cds-queue-preview';
+		var list = buildEl('ul', 'cds-queue-preview');
 		rows.slice(0, 3).forEach(function (row) {
-			var item = document.createElement('li');
-			var name = document.createElement('span');
-			name.textContent = String(row.name || 'Unknown');
-			var meta = document.createElement('span');
-			meta.className = 'cds-queue-preview__meta';
-			var statusLabel = QUEUE_STATUS_LABELS[row.status] || String(row.status || '');
-			meta.textContent =
-				statusLabel + ' - ' + String(row.percentage || 0) + '% - ' + String(row.size_label || '');
-			item.appendChild(name);
-			item.appendChild(meta);
+			var name = String(row.name || 'Unknown');
+			var item = buildEl('li', 'cds-queue-preview__row');
+			item.appendChild(buildEl('span', 'cds-release', name));
+			item.appendChild(buildEl('span', 'cds-queue-preview__meta', queuePreviewMeta(row)));
+			item.appendChild(
+				buildPreviewProgress(
+					row.percentage,
+					QUEUE_BAR_TONES[row.status] || 'interactive',
+					'Download progress: ' + name
+				)
+			);
 			list.appendChild(item);
 		});
 		content.textContent = '';
@@ -915,7 +1220,6 @@
 		if (!target) {
 			return;
 		}
-		var provider = target.getAttribute('data-provider') || '';
 		switch (target.getAttribute('data-action')) {
 			case 'jd-verify':
 				verifyJDownloaderCredentials();
@@ -923,32 +1227,31 @@
 			case 'jd-save':
 				saveJDownloaderSettings();
 				break;
-			case 'radarr-save':
-				saveArrSettings('radarr');
+			case 'arr-save':
+				saveAllArrSettings();
 				break;
-			case 'radarr-clear':
+			case 'radarr-clear-open':
+				openArrClearModal('radarr');
+				break;
+			case 'sonarr-clear-open':
+				openArrClearModal('sonarr');
+				break;
+			case 'radarr-clear-confirm':
+				window.closeModal();
 				clearArrSettings('radarr');
 				break;
-			case 'sonarr-save':
-				saveArrSettings('sonarr');
-				break;
-			case 'sonarr-clear':
+			case 'sonarr-clear-confirm':
+				window.closeModal();
 				clearArrSettings('sonarr');
 				break;
 			case 'notifications-save':
 				saveNotifications();
 				break;
 			case 'notifications-test':
-				testNotificationProvider(provider);
+				testConfiguredNotificationProviders();
 				break;
-			case 'timeouts-save':
-				saveTimeoutSettings();
-				break;
-			case 'filecrypt-save':
-				saveFilecryptSetting();
-				break;
-			case 'crypter-block-save':
-				saveCrypterBlockSettings();
+			case 'link-protection-save':
+				saveLinkProtectionSettings();
 				break;
 			case 'flaresolverr-save':
 				saveFlareSolverrSettings();
@@ -971,17 +1274,22 @@
 			if (sweepInput) {
 				sweepInput.disabled = target.checked;
 			}
+			return;
+		}
+		// Timeouts have no Save button any more: flipping a switch is the
+		// save. Same function, same endpoint, same merged payload the
+		// button used to send. The browser has already flipped the switch
+		// by the time this runs, so the pre-flip state is handed to the
+		// save as the fallback it restores when even the GET fails.
+		if (target.matches('input[id^="settings-timeout-"]')) {
+			var previousSettings = {};
+			previousSettings[target.id.replace('settings-timeout-', '')] = !target.checked;
+			updateTimeoutHelpText(target);
+			saveTimeoutSettings(previousSettings);
 		}
 	}
 
 	document.addEventListener('DOMContentLoaded', function () {
-		var themeSelect = document.querySelector('select[data-action="theme-select"]');
-		if (themeSelect) {
-			var theme = document.documentElement.getAttribute('data-carbon-theme');
-			if (theme === 'light' || theme === 'dark') {
-				themeSelect.value = theme;
-			}
-		}
 		loadDashboardQueue();
 		document.addEventListener('click', onSettingsDashboardClick);
 		document.addEventListener('change', onSettingsDashboardChange);
@@ -1042,7 +1350,8 @@
 		window.showModal(
 			'Error',
 			body.innerHTML,
-			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Close</button>'
+			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Close</button>',
+			{ eyebrow: 'Hostnames' }
 		);
 	}
 
@@ -1062,7 +1371,7 @@
 		// every submit - not just after a successful import - exactly like
 		// Classic's validateHostnames(); otherwise typing or clearing the
 		// URL and pressing Save silently reverts the stored value.
-		var urlField = byId('hostnames-import-url');
+		var urlField = byId('hostname-import-url');
 		var hiddenUrl = byId('hostnames-url-hidden');
 		if (urlField && hiddenUrl) {
 			hiddenUrl.value = String(urlField.value || '').trim();
@@ -1096,8 +1405,31 @@
 			'Save hostnames?',
 			body.innerHTML,
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
-				'<button class="cds-btn cds-btn--primary" type="button" data-action="hostnames-save-confirm">Save</button>'
+				'<button class="cds-btn cds-btn--primary" type="button" data-action="hostnames-save-confirm">Save</button>',
+			{ eyebrow: 'Hostnames' }
 		);
+	}
+
+	// ---- Hostnames: filter by site code or hostname value. Follows the
+	// Downloads page's applySearchFilter() shape (a term read from a search
+	// input, rows hidden by a simple case-insensitive substring match) -
+	// here the input carries data-action="hostname-filter" instead of a
+	// fixed id, and each row is matched against both its data-hostname-id
+	// (the site code, e.g. "ga") and its hostname input's current value. ----
+
+	function applyHostnameFilter() {
+		var input = document.querySelector('[data-action="hostname-filter"]');
+		var term = input ? input.value.trim().toLowerCase() : '';
+		document.querySelectorAll('.cds-hostname-table__row[data-hostname-id]').forEach(function (row) {
+			if (!term) {
+				row.hidden = false;
+				return;
+			}
+			var id = String(row.getAttribute('data-hostname-id') || '').toLowerCase();
+			var hostnameInput = row.querySelector('.cds-hostname-table__input');
+			var hostnameValue = hostnameInput ? String(hostnameInput.value || '').toLowerCase() : '';
+			row.hidden = id.indexOf(term) === -1 && hostnameValue.indexOf(term) === -1;
+		});
 	}
 
 	// ---- Hostnames: Import from URL ----
@@ -1118,7 +1450,7 @@
 		if (typeof window.showModal !== 'function') {
 			return;
 		}
-		var urlField = byId('hostnames-import-url');
+		var urlField = byId('hostname-import-url');
 		var url = urlField ? String(urlField.value || '').trim() : '';
 
 		var body = document.createElement('div');
@@ -1135,13 +1467,14 @@
 			'Import hostnames',
 			body.innerHTML,
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
-				'<button class="cds-btn cds-btn--primary" type="button" data-action="hostnames-import-confirm">Import</button>'
+				'<button class="cds-btn cds-btn--primary" type="button" data-action="hostnames-import-confirm">Import</button>',
+			{ eyebrow: 'Hostnames' }
 		);
 	}
 
 	function performHostnameImport() {
 		var statusEl = byId('hostnames-import-modal-status');
-		var urlField = byId('hostnames-import-url');
+		var urlField = byId('hostname-import-url');
 		var url = urlField ? String(urlField.value || '').trim() : '';
 		if (!url) {
 			if (statusEl) {
@@ -1239,8 +1572,9 @@
 		window.showModal(
 			'flaresolverr-next required',
 			body.innerHTML,
-			'<a class="cds-btn cds-btn--primary" href="/settings">Open Settings</a>' +
-				'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Close</button>'
+			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Skip source</button>' +
+				'<a class="cds-btn cds-btn--primary" href="/settings">Open settings</a>',
+			{ eyebrow: 'Hostnames' }
 		);
 	}
 
@@ -1260,7 +1594,8 @@
 			body.innerHTML,
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
 				'<button class="cds-btn cds-btn--primary" type="button" data-action="hostname-skip-login-clear" ' +
-				'data-hostname-id="' + escapeAttr(row.id) + '">Require login</button>'
+				'data-hostname-id="' + escapeAttr(row.id) + '">Require login</button>',
+			{ eyebrow: 'Hostnames' }
 		);
 	}
 
@@ -1320,6 +1655,32 @@
 			});
 	}
 
+	// Mirrors the Python _STATUS_TONE dict in quasarr/api/config/carbon.py -
+	// this JS-built status line has no access to that server-side constant,
+	// so the tone mapping is duplicated here deliberately.
+	var STATUS_TONE = {
+		ok: 'success',
+		error: 'error',
+		login_failed: 'error',
+		skipped: 'warning',
+		unset: 'neutral'
+	};
+
+	function buildStatusLine(row) {
+		var tone = STATUS_TONE[row.status] || 'neutral';
+		var classes = 'cds-status cds-status--' + tone;
+		if (tone === 'warning' || tone === 'error' || tone === 'neutral') {
+			classes += ' cds-status--tinted';
+		}
+		var line = buildEl('p', classes);
+		var dot = document.createElement('span');
+		dot.className = 'cds-status__dot';
+		dot.setAttribute('aria-hidden', 'true');
+		line.appendChild(dot);
+		line.appendChild(document.createTextNode(row.status_title));
+		return line;
+	}
+
 	function buildCredentialsSection(row) {
 		var wrap = buildEl('div', 'cds-hostname-credentials');
 		wrap.appendChild(buildEl('h3', '', 'Credentials'));
@@ -1357,17 +1718,12 @@
 		wrap.appendChild(userField);
 		wrap.appendChild(passField);
 
+		// The check/save action itself now lives in the modal footer
+		// (Close + "Check & save session" - design spec §3), not inside
+		// this section, so only the status feedback line stays here.
 		var status = buildEl('p', 'cds-field__help', '');
 		status.id = 'hostname-cred-status';
 		wrap.appendChild(status);
-
-		var checkBtn = document.createElement('button');
-		checkBtn.type = 'button';
-		checkBtn.className = 'cds-btn cds-btn--primary';
-		checkBtn.textContent = 'Check & Save Credentials';
-		checkBtn.setAttribute('data-action', 'hostname-credentials-check');
-		checkBtn.setAttribute('data-hostname-id', row.id);
-		wrap.appendChild(checkBtn);
 
 		return wrap;
 	}
@@ -1385,13 +1741,34 @@
 				lastStatusRow = row;
 
 				var body = document.createElement('div');
+				body.appendChild(buildStatusLine(row));
+				// Quick link to the configured hostname itself - built at
+				// runtime from `row.hostname` (never a literal source
+				// hostname in this file). Lives in the body, not the
+				// footer: design spec §3's footer is defined as exactly
+				// Close + "Check & save session", but this link is real
+				// function this page offered before and must keep
+				// offering (no loss of function).
+				if (row.hostname) {
+					var openHref = row.hostname;
+					if (!/^https?:\/\//i.test(openHref)) {
+						openHref = 'https:' + '//' + openHref;
+					}
+					var openLink = document.createElement('a');
+					openLink.className = 'cds-btn cds-btn--tertiary';
+					openLink.href = openHref;
+					openLink.target = '_blank';
+					openLink.rel = 'noopener noreferrer';
+					openLink.textContent = 'Open ' + String(row.id).toUpperCase();
+					body.appendChild(openLink);
+				}
 				body.appendChild(buildEl('p', '', row.details || 'No additional details available.'));
 				if (row.timestamp) {
-					var suffix = row.operation ? ' in ' + row.operation : '';
+					var suffix = row.operation ? ' (' + row.operation + ')' : '';
 					body.appendChild(buildEl(
 						'p',
 						'cds-field__help',
-						'Occurred' + suffix + ' at ' + formatTimestamp(row.timestamp)
+						'Last checked: ' + formatTimestamp(row.timestamp) + suffix
 					));
 				}
 				if (row.skip_login) {
@@ -1402,6 +1779,8 @@
 					skipBtn.setAttribute('data-action', 'hostname-skip-login-open');
 					body.appendChild(skipBtn);
 				}
+
+				var showCredentialsCheck = false;
 				if (row.supports_login) {
 					if (row.requires_flaresolverr && isFlaresolverrSkipped()) {
 						var fsBtn = document.createElement('button');
@@ -1412,28 +1791,34 @@
 						body.appendChild(fsBtn);
 					} else {
 						body.appendChild(buildCredentialsSection(row));
+						showCredentialsCheck = true;
 					}
 				}
 
+				// design spec §3 Hostnames: footer is exactly Close
+				// (secondary) + "Check & save session" (primary, only when
+				// credentials are supported) - the "Open <ID>" link lives in
+				// the body above instead (see its own comment).
 				var actions = '<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Close</button>';
-				if (row.hostname) {
-					var href = row.hostname;
-					if (!/^https?:\/\//i.test(href)) {
-						href = 'https:' + '//' + href;
-					}
-					var link = document.createElement('a');
-					link.className = 'cds-btn cds-btn--primary';
-					link.href = href;
-					link.target = '_blank';
-					link.rel = 'noopener noreferrer';
-					link.textContent = 'Open ' + String(row.id).toUpperCase();
-					actions = link.outerHTML + actions;
+				if (showCredentialsCheck) {
+					actions += '<button class="cds-btn cds-btn--primary" type="button" ' +
+						'data-action="hostname-credentials-check" data-hostname-id="' + escapeAttr(id) + '">' +
+						'Check &amp; save session</button>';
 				}
 
 				window.showModal(
-					row.label + ' - ' + row.status_title,
+					row.label,
 					body.innerHTML,
-					actions
+					actions,
+					{
+						eyebrow: 'Hostname status',
+						// design spec §2.4: the title's hostname suffix
+						// renders in Mono - showModal writes the base title
+						// via textContent (plain text, no styling), so this
+						// options field is the minimum addition needed to
+						// give the suffix its own styled node.
+						titleMonoSuffix: row.hostname ? ' · ' + row.hostname : ''
+					}
 				);
 			})
 			.catch(function () {
@@ -1453,7 +1838,8 @@
 			'Restart Quasarr?',
 			body.innerHTML,
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
-				'<button class="cds-btn cds-btn--primary" type="button" data-action="hostname-restart-confirm">Restart</button>'
+				'<button class="cds-btn cds-btn--danger" type="button" data-action="hostname-restart-confirm">Restart</button>',
+			{ eyebrow: 'Hostnames' }
 		);
 	}
 
@@ -1522,10 +1908,10 @@
 	}
 
 	function buildMirrorRow(hoster, isChecked, isTier1) {
-		// isTier1 gates the "Recommended" .cds-tag rendered below - it no
-		// longer needs its own row-level class token: that class had exactly
-		// one visual consumer (the removed bare star), and left inert (no
-		// CSS rule) once the star was replaced by the tag.
+		// isTier1 gates the tier-1 .cds-tag rendered below - it no longer
+		// needs its own row-level class token: that class had exactly one
+		// visual consumer (the removed bare star), and left inert (no CSS
+		// rule) once the star was replaced by the tag.
 		var row = buildEl(
 			'div',
 			'cds-mirror-row' + (isChecked ? ' is-selected' : '')
@@ -1551,6 +1937,9 @@
 			checkbox.setAttribute('checked', '');
 		}
 		label.appendChild(checkbox);
+		// Row anatomy: rank, checkbox, hoster name (Mono), recommendation
+		// tag - the name must render before the tag it sits beside.
+		label.appendChild(buildEl('span', 'cds-mirror-row__name cds-mono', hoster));
 		if (isTier1) {
 			// Carbon markup has no emoji. Reuses the existing
 			// `.cds-tag` component idiom (already styled/themed) instead of a
@@ -1558,9 +1947,17 @@
 			// accessible name, so no separate aria-label is needed.
 			label.appendChild(buildEl('span', 'cds-tag cds-tag--blue', 'Recommended'));
 		}
-		label.appendChild(buildEl('span', '', hoster));
 		row.appendChild(label);
 
+		// Reorder controls are built for EVERY row, checked or not - only
+		// their visibility is a display concern. The row's `is-selected`
+		// class (set above at construction, and kept live afterward by
+		// onChange -> reflowMirrorRows on every checkbox toggle) drives
+		// the CSS pair below, so an arrow group appears the moment a row
+		// is ticked and disappears the moment it is unticked, with no
+		// need to reopen the modal:
+		//   .cds-mirror-row__move { visibility: hidden; }
+		//   .cds-mirror-row.is-selected .cds-mirror-row__move { visibility: visible; }
 		var moveGroup = buildEl('span', 'cds-mirror-row__move');
 		var upBtn = document.createElement('button');
 		upBtn.type = 'button';
@@ -1656,12 +2053,19 @@
 		var ordered = selected.concat(unselected);
 
 		var body = document.createElement('div');
-		body.appendChild(buildEl(
+		// Design spec §3 Categories: a real warn-notification component in
+		// the body, not a bare tinted paragraph - matches the pattern every
+		// other destructive/cautionary modal on this page already uses
+		// (e.g. the Downloads delete confirmation).
+		var warning = buildEl('section', 'cds-notification cds-notification--warning');
+		warning.setAttribute('role', 'alert');
+		warning.appendChild(buildEl(
 			'p',
-			'cds-hostname-credentials__warning',
+			'cds-notification__message',
 			'The mirror whitelist only affects downloads, not search. If you enable specific ' +
 				'mirrors, a release must include one of them or its download fails.'
 		));
+		body.appendChild(warning);
 		body.appendChild(buildEl(
 			'p',
 			'cds-field__help',
@@ -1681,11 +2085,12 @@
 		body.appendChild(list);
 
 		window.showModal(
-			'Edit download category: ' + name,
+			'Edit mirrors · ' + name,
 			body.innerHTML,
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
 				'<button class="cds-btn cds-btn--primary" type="button" data-action="download-category-save" ' +
-				'data-category="' + escapeAttr(name) + '">Save</button>'
+				'data-category="' + escapeAttr(name) + '">Save mirrors</button>',
+			{ eyebrow: 'Download category', wide: true }
 		);
 		reflowMirrorRows();
 	}
@@ -1758,11 +2163,12 @@
 		var body = document.createElement('div');
 		body.appendChild(buildEl('p', '', 'Delete category "' + name + '"? This cannot be undone.'));
 		window.showModal(
-			'Delete category?',
+			'Delete · ' + name,
 			body.innerHTML,
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
-				'<button class="cds-btn cds-btn--danger-ghost" type="button" ' +
-				'data-action="download-category-delete-confirm" data-category="' + escapeAttr(name) + '">Delete</button>'
+				'<button class="cds-btn cds-btn--danger" type="button" ' +
+				'data-action="download-category-delete-confirm" data-category="' + escapeAttr(name) + '">Delete category</button>',
+			{ eyebrow: 'Confirm deletion' }
 		);
 	}
 
@@ -1788,10 +2194,10 @@
 	// all hostnames - this page never sends a synthetic "select all" list. ----
 
 	function buildSourcePill(source, isChecked) {
-		var label = buildEl('label', 'cds-source-pill' + (isChecked ? ' is-selected' : ''));
+		var label = buildEl('label', 'cds-pill' + (isChecked ? ' is-selected' : ''));
 		var checkbox = document.createElement('input');
 		checkbox.type = 'checkbox';
-		checkbox.className = 'cds-source-pill__checkbox';
+		checkbox.className = 'cds-pill__checkbox';
 		checkbox.value = source;
 		checkbox.checked = Boolean(isChecked);
 		// Same innerHTML-serialization gap as buildMirrorRow() above: the
@@ -1819,7 +2225,7 @@
 			'cds-hostname-credentials__warning',
 			'This affects search results. If specific hostnames are set, only those are searched.'
 		));
-		var pills = buildEl('div', 'cds-source-pills');
+		var pills = buildEl('div', 'cds-pills');
 		sourceData.hostnames.forEach(function (source) {
 			var supported = sourceData.supported[source];
 			if (supported && supported.indexOf(categoryForFilter) === -1) {
@@ -1830,11 +2236,12 @@
 		body.appendChild(pills);
 
 		window.showModal(
-			'Edit search category: ' + name,
+			'Edit hostnames · ' + name,
 			body.innerHTML,
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
 				'<button class="cds-btn cds-btn--primary" type="button" data-action="search-category-save" ' +
-				'data-cat-id="' + escapeAttr(String(catId)) + '">Save</button>'
+				'data-cat-id="' + escapeAttr(String(catId)) + '">Save</button>',
+			{ eyebrow: 'Search category' }
 		);
 	}
 
@@ -1843,7 +2250,7 @@
 		var selected = [];
 		if (modalBody) {
 			Array.prototype.forEach.call(
-				modalBody.querySelectorAll('.cds-source-pill__checkbox:checked'),
+				modalBody.querySelectorAll('.cds-pill__checkbox:checked'),
 				function (checkbox) {
 					selected.push(checkbox.value);
 				}
@@ -1910,11 +2317,12 @@
 			'Delete search category "' + name + '"? This cannot be undone.'
 		));
 		window.showModal(
-			'Delete search category?',
+			'Delete · ' + name,
 			body.innerHTML,
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
-				'<button class="cds-btn cds-btn--danger-ghost" type="button" ' +
-				'data-action="search-category-delete-confirm" data-cat-id="' + escapeAttr(String(catId)) + '">Delete</button>'
+				'<button class="cds-btn cds-btn--danger" type="button" ' +
+				'data-action="search-category-delete-confirm" data-cat-id="' + escapeAttr(String(catId)) + '">Delete search category</button>',
+			{ eyebrow: 'Confirm deletion' }
 		);
 	}
 
@@ -1945,18 +2353,28 @@
 		}
 		var action = target.getAttribute('data-action');
 		switch (action) {
-			case 'hostnames-save':
-				openHostnamesSaveModal();
-				break;
 			case 'hostnames-save-confirm':
 				submitHostnamesForm();
 				break;
-			case 'hostnames-import-open':
+			case 'hostname-import':
 				openHostnameImportModal();
 				break;
 			case 'hostnames-import-confirm':
 				performHostnameImport();
 				break;
+			case 'hostname-reset': {
+				var hostnamesForm = byId('hostnames-form');
+				if (hostnamesForm) {
+					hostnamesForm.reset();
+					// reset() reverts the filter <input> (it lives inside
+					// this form) but fires no 'input' event, and
+					// applyHostnameFilter() only runs on 'input' - without
+					// this, rows a stale filter had hidden stay hidden even
+					// though the now-empty filter box looks cleared.
+					applyHostnameFilter();
+				}
+				break;
+			}
 			case 'hostname-status':
 				openHostnameStatusModal(target.getAttribute('data-hostname-id') || '');
 				break;
@@ -2048,17 +2466,64 @@
 		if (target.classList.contains('cds-mirror-row__checkbox')) {
 			reflowMirrorRows();
 		}
-		if (target.classList.contains('cds-source-pill__checkbox')) {
-			var pillLabel = target.closest('.cds-source-pill');
+		if (target.classList.contains('cds-pill__checkbox')) {
+			var pillLabel = target.closest('.cds-pill');
 			if (pillLabel) {
 				pillLabel.classList.toggle('is-selected', target.checked);
 			}
 		}
 	}
 
+	function onInput(event) {
+		var target = event.target;
+		if (target instanceof Element && target.getAttribute('data-action') === 'hostname-filter') {
+			applyHostnameFilter();
+		}
+	}
+
+	// The Save button is a real type="submit" (design spec §3), but
+	// submitHostnamesForm() still has to run first to sync the visible
+	// import-URL field into the hidden one and inject the API key (see its
+	// own comments) - a bare native submit would skip both. Intercepting
+	// the form's own 'submit' event and routing through the existing
+	// confirm-then-submit flow keeps that behaviour: submitHostnamesForm()
+	// finishes by calling form.submit() directly, which (unlike a second
+	// click on a submit button) never re-fires this 'submit' event.
+	//
+	// carbon.js is one bundle served on both the main config page (this
+	// IIFE's page) AND the setup wizard's own standalone Hostnames step,
+	// which renders a SECOND, unrelated `<form id="hostnames-form">` with a
+	// real, uninterrupted native submit (see storage/setup/carbon.py) - the
+	// id collision is fine day-to-day since the two pages never coexist in
+	// one document, but this listener is registered unconditionally on
+	// every Carbon page, so it must not fire there. The gate is the modal
+	// host's actual presence, not a URL/page check and not the setup
+	// form's data-guard-submit attribute (an incidental marker that could
+	// be added to this form too, or dropped from that one, for unrelated
+	// reasons - silently flipping this gate without anyone noticing):
+	// openHostnamesSaveModal() -> showModal() is a hard no-op without
+	// #cds-modal (see showModal's own `if (!modalElement) return;` guard),
+	// which render_carbon_simple_page (the setup wizard's shell) never
+	// renders and render_carbon_html (this page's shell) always does - so
+	// checking for the element directly ties the interception to the one
+	// capability it structurally requires, and cannot silently invert.
+	function onHostnamesFormSubmit(event) {
+		var form = event.target;
+		if (!(form instanceof HTMLFormElement) || form.id !== 'hostnames-form') {
+			return;
+		}
+		if (!document.getElementById('cds-modal')) {
+			return;
+		}
+		event.preventDefault();
+		openHostnamesSaveModal();
+	}
+
 	document.addEventListener('DOMContentLoaded', function () {
 		document.addEventListener('click', onClick);
 		document.addEventListener('change', onChange);
+		document.addEventListener('input', onInput);
+		document.addEventListener('submit', onHostnamesFormSubmit);
 	});
 })();
 
@@ -2163,8 +2628,38 @@
 			window.showModal(
 				'Tutorial Reset',
 				'<p>Tutorial reset! Click the Open button to see it again.</p>',
-				'<button class="cds-btn cds-btn--primary" type="button" data-action="captcha-reload">Reload</button>'
+				'<button class="cds-btn cds-btn--primary" type="button" data-action="captcha-reload">Reload</button>',
+				{ eyebrow: 'CAPTCHA · tutorial' }
 			);
+		}
+	}
+
+	// Same consequence and wording as Downloads' confirmDeletePackage() (the
+	// button here promises exactly the same thing: "Delete package & files")
+	// but this page has no table row to read a package id from - it stays
+	// gated on the clicked element's own data-href, so onCaptchaClick()'s
+	// 'package-delete' case is kept separate from Downloads' 'closest("tr")'
+	// version rather than merged into one shared helper.
+	function confirmDeleteCaptchaPackage(deleteHref) {
+		if (typeof window.showModal !== 'function' || !deleteHref) {
+			return;
+		}
+		var body =
+			'<section class="cds-notification cds-notification--warning" role="alert">' +
+			'<p class="cds-notification__message"><strong>Files are deleted too.</strong> The package is ' +
+			'removed from JDownloader together with downloaded files. This cannot be undone.</p>' +
+			'</section>';
+		var actions =
+			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
+			'<button class="cds-btn cds-btn--danger" type="button" id="captcha-confirm-delete">Delete package and files</button>';
+
+		window.showModal('Delete package and files?', body, actions, { eyebrow: 'Confirm deletion' });
+		var confirmButton = document.getElementById('captcha-confirm-delete');
+		if (confirmButton) {
+			confirmButton.addEventListener('click', function onConfirm() {
+				confirmButton.removeEventListener('click', onConfirm);
+				window.location.href = deleteHref;
+			});
 		}
 	}
 
@@ -2183,10 +2678,10 @@
 		var content = source ? source.innerHTML : '';
 		var btnId = 'captcha-modal-proceed-' + Math.floor(Math.random() * 10000);
 		var buttons =
-			'<button id="' + btnId + '" class="cds-btn cds-btn--primary" type="button" disabled>Wait 5s...</button>' +
-			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>';
+			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Later</button>' +
+			'<button id="' + btnId + '" class="cds-btn cds-btn--primary" type="button" disabled>Wait 5s...</button>';
 
-		window.showModal('First Time Setup', content, buttons);
+		window.showModal('First Time Setup', content, buttons, { eyebrow: 'CAPTCHA · first time' });
 
 		var count = 5;
 		var btn = document.getElementById(btnId);
@@ -2241,6 +2736,13 @@
 			case 'captcha-reload':
 				window.location.reload();
 				break;
+			case 'package-delete': {
+				var deleteHref = actionElement.getAttribute('data-href') || '';
+				if (deleteHref) {
+					confirmDeleteCaptchaPackage(deleteHref);
+				}
+				break;
+			}
 			default:
 				break;
 		}
@@ -2418,6 +2920,13 @@
 		document
 			.querySelectorAll('[data-action="reconnect-poll"]')
 			.forEach(startReconnectPoll);
+		document
+			.querySelectorAll('[data-action="jd-retry"]')
+			.forEach(function (button) {
+				button.addEventListener('click', function onRetryClick() {
+					window.location.reload();
+				});
+			});
 	});
 })();
 
@@ -2588,11 +3097,19 @@
 				}
 				var tag = byId('hostname-status-tag-' + id);
 				if (tag) {
+					// Matches the row builder's plain (non-button) status
+					// component (quasarr.providers.carbon_templates.status())
+					// - a colored dot plus text, not a .cds-tag pill, which
+					// the dense-row redesign replaced everywhere else.
 					tag.innerHTML = '';
-					var span = document.createElement('span');
-					span.className = 'cds-tag cds-tag--green';
-					span.textContent = 'Working normally';
-					tag.appendChild(span);
+					var statusEl = document.createElement('span');
+					statusEl.className = 'cds-status cds-status--success';
+					var dot = document.createElement('span');
+					dot.className = 'cds-status__dot';
+					dot.setAttribute('aria-hidden', 'true');
+					statusEl.appendChild(dot);
+					statusEl.appendChild(document.createTextNode('Working normally'));
+					tag.appendChild(statusEl);
 				}
 				var banner = byId('hostname-skip-banner-' + id);
 				if (banner) {
@@ -2888,6 +3405,11 @@
 	var SLOW_THRESHOLD_MS = 5000;
 	var SCROLL_STORAGE_KEY = 'quasarr_downloads_scroll_y';
 	var COLLAPSE_STORAGE_KEY = 'otherPackagesOpen';
+	// Mirrors EVIDENCE_THRESHOLD in quasarr/providers/crypter_cooldowns.py:
+	// a provisional hold needs three distinct observations before the
+	// crypter itself cools down. Shown so "1" reads as "1 of 3" rather than
+	// as a bare counter with no scale.
+	var EVIDENCE_TARGET = 3;
 
 	var refreshTimer = null;
 	var isFetching = false;
@@ -2900,10 +3422,15 @@
 		cooldown: 'Cooldown',
 		probe_queued: 'Probe queued'
 	};
+	// Status TONES are the four semantic dot colors (`.cds-status--*`), used
+	// wherever a live state is shown as a dot; TAG tones are the pill palette
+	// (`.cds-tag--*`), used for closed classifications (category, final
+	// history result). The two vocabularies are deliberately separate - a
+	// running download is a state, a category is a label.
 	var DEFERRED_STATE_TONES = {
-		observing: 'blue',
-		cooldown: 'red',
-		probe_queued: 'purple'
+		observing: 'info',
+		cooldown: 'warning',
+		probe_queued: 'info'
 	};
 	var QUEUE_STATUS_LABELS = {
 		waiting_captcha: 'Waiting for CAPTCHA',
@@ -2911,13 +3438,96 @@
 		extracting: 'Extracting',
 		queued: 'Queued'
 	};
+	var QUEUE_STATUS_TONES = {
+		waiting_captcha: 'warning',
+		downloading: 'success',
+		extracting: 'success',
+		queued: 'info'
+	};
+	// The bar fill follows the work itself rather than the dot: a paused or
+	// queued package is not "healthy green" progress, and a package waiting
+	// for a CAPTCHA carries the same warning color as its dot.
+	var QUEUE_BAR_TONES = {
+		waiting_captcha: 'warning',
+		downloading: 'interactive',
+		extracting: 'success',
+		queued: 'interactive'
+	};
 	var HISTORY_STATUS_LABELS = {
 		completed: 'Completed',
 		failed: 'Failed'
 	};
+	var HISTORY_STATUS_TONES = {
+		completed: 'green',
+		failed: 'red'
+	};
+	// Category tags. An unknown or custom category (including "not_quasarr")
+	// falls back to the neutral gray pill rather than borrowing a meaning.
+	var CATEGORY_TONES = {
+		movies: 'blue',
+		tv: 'purple',
+		music: 'teal',
+		docs: 'teal',
+		anime: 'teal',
+		books: 'teal'
+	};
 
 	function byId(id) {
 		return document.getElementById(id);
+	}
+
+	function buildEl(tagName, className, text) {
+		var el = document.createElement(tagName);
+		if (className) {
+			el.className = className;
+		}
+		if (text !== undefined) {
+			el.textContent = text;
+		}
+		return el;
+	}
+
+	function queueStatusLabel(status) {
+		return QUEUE_STATUS_LABELS[status] || String(status || '');
+	}
+
+	// A `.cds-status` indicator: a colored dot plus optional visible text.
+	// The dot itself is decorative (`aria-hidden`) - callers that render it
+	// without visible text must give it an accessible name of their own.
+	function buildStatusDot(tone, text) {
+		var span = buildEl('span', 'cds-status cds-status--' + tone);
+		var dot = buildEl('span', 'cds-status__dot');
+		dot.setAttribute('aria-hidden', 'true');
+		span.appendChild(dot);
+		if (text) {
+			span.appendChild(document.createTextNode(text));
+		}
+		return span;
+	}
+
+	// A `.cds-progress` bar with the value kept readable as text beside it.
+	// Carries the same accessibility contract the Statistics ratio bars have
+	// (role plus aria-valuemin/max/now and an identifying aria-label), so a
+	// screen reader announces which package is at which percentage instead
+	// of meeting a decorative div. `label` is optional - the Dashboard
+	// preview shows its percentage in its own meta line already.
+	function buildProgress(pct, tone, label, ariaLabel) {
+		var value = Math.max(0, Math.min(100, Number(pct) || 0));
+		var wrap = buildEl('div', 'cds-progress-cell');
+		var bar = buildEl('div', 'cds-progress');
+		bar.setAttribute('role', 'progressbar');
+		bar.setAttribute('aria-valuemin', '0');
+		bar.setAttribute('aria-valuemax', '100');
+		bar.setAttribute('aria-valuenow', String(Math.round(value)));
+		bar.setAttribute('aria-label', String(ariaLabel || 'Progress'));
+		var fill = buildEl('div', 'cds-progress__fill cds-progress__fill--' + tone);
+		fill.style.width = value + '%';
+		bar.appendChild(fill);
+		wrap.appendChild(bar);
+		if (label) {
+			wrap.appendChild(buildEl('span', 'cds-progress-cell__label', label));
+		}
+		return wrap;
 	}
 
 	function escapeForModal(value) {
@@ -2932,9 +3542,11 @@
 		row.appendChild(cell);
 	}
 
-	// Mirrors quasarr/providers/carbon_icons.py's reviewed "trash-can"/
-	// "renew"/"unlocked" icons (same Carbon source + sha256, recorded
-	// there) - duplicated here as FIXED, non-interpolated markup (this
+	// Mirrors quasarr/providers/carbon_icons.py's reviewed "trash-can" and
+	// "unlocked" icons (same Carbon source + sha256, recorded there) - the
+	// two this file draws itself, while the bulk toolbar's "renew" is
+	// rendered server-side by render_icon() and needs no mirror here.
+	// Duplicated as FIXED, non-interpolated markup (this
 	// object never carries package data; only buildActionIcon()'s closed
 	// `name` lookup touches it) because render_icon() only runs server-side
 	// and these row/bulk actions are built entirely client-side. Parsed via
@@ -2950,10 +3562,6 @@
 			'<rect x="12" y="12" width="2" height="12"/><rect x="18" y="12" width="2" height="12"/>' +
 			'<path d="M4,6V8H6V28a2,2,0,0,0,2,2H24a2,2,0,0,0,2-2V8h2V6ZM8,28V8H24V28Z"/>' +
 			'<rect x="12" y="2" width="8" height="2"/></svg>',
-		renew:
-			'<svg viewBox="0 0 32 32" fill="currentColor" aria-hidden="true" focusable="false" class="cds-icon cds-icon--sm">' +
-			'<path d="M12,10H6.78A11,11,0,0,1,27,16h2A13,13,0,0,0,6,7.68V4H4v8h8Z"/>' +
-			'<path d="M20,22h5.22A11,11,0,0,1,5,16H3a13,13,0,0,0,23,8.32V28h2V20H20Z"/></svg>',
 		unlocked:
 			'<svg viewBox="0 0 32 32" fill="currentColor" aria-hidden="true" focusable="false" class="cds-icon cds-icon--sm">' +
 			'<path d="M24,14H12V8a4,4,0,0,1,8,0h2A6,6,0,0,0,10,8v6H8a2,2,0,0,0-2,2V28a2,2,0,0,0,2,2H24a2,2,0,0,0,2-2V16A2,2,0,0,0,24,14Zm0,14H8V16H24Z"/></svg>'
@@ -2971,9 +3579,6 @@
 
 	function iconNameForAction(action) {
 		switch (action) {
-			case 'deferred-probe-one':
-				return 'renew';
-			case 'deferred-remove-one':
 			case 'package-delete':
 				return 'trash-can';
 			default:
@@ -2984,7 +3589,7 @@
 	function buttonTextForAction(action) {
 		switch (action) {
 			case 'deferred-probe-one':
-				return 'Check now';
+				return 'Check';
 			case 'deferred-remove-one':
 				return 'Remove';
 			case 'package-delete':
@@ -3016,19 +3621,42 @@
 		return button;
 	}
 
-	function buildCaptchaLink(packageId, name) {
+	// `variant` picks the presentation only: 'inline' is the text link the
+	// queue row puts directly under the release name, anything else the icon
+	// button the deferred row groups with its other actions. The target, the
+	// accessible name and the tooltip are built here either way, so the two
+	// presentations can never drift apart.
+	// A labelled row action. The deferred table has room for words, and two
+	// named buttons read faster than two icons whose meaning has to be
+	// learned first. The accessible name still adds the package, so the
+	// control reads "Check" on screen and "Check now: <release>" to a screen
+	// reader - the visible words are contained in the accessible name, which
+	// is what label-in-name (WCAG 2.5.3) asks for.
+	function buildTextActionButton(action, label, variantClass) {
+		var button = document.createElement('button');
+		button.type = 'button';
+		button.className = 'cds-btn ' + variantClass + ' cds-btn--compact';
+		button.setAttribute('data-action', action);
+		button.setAttribute('aria-label', label);
+		button.setAttribute('title', label);
+		button.textContent = buttonTextForAction(action);
+		return button;
+	}
+
+	function buildCaptchaLink(packageId, name, variant) {
+		var inline = variant === 'inline';
 		var link = document.createElement('a');
-		link.className = 'cds-icon-button';
+		link.className = inline ? 'cds-release__action' : 'cds-icon-button';
 		link.href = '/captcha?package_id=' + encodeURIComponent(packageId);
 		var label = 'Solve CAPTCHA: ' + String(name || 'package');
 		link.setAttribute('aria-label', label);
 		link.title = label;
-		var icon = buildActionIcon('unlocked');
+		var icon = inline ? null : buildActionIcon('unlocked');
 		if (icon) {
 			link.appendChild(icon);
-		} else {
-			link.textContent = 'Solve CAPTCHA';
+			return link;
 		}
+		link.textContent = inline ? 'Solve CAPTCHA →' : 'Solve CAPTCHA';
 		return link;
 	}
 
@@ -3064,24 +3692,35 @@
 		selectCell.appendChild(checkbox);
 		tr.appendChild(selectCell);
 
-		appendTextCell(tr, row.name);
+		var nameCell = document.createElement('td');
+		nameCell.appendChild(buildEl('p', 'cds-release', row.name));
+		nameCell.appendChild(
+			buildEl('p', 'cds-field__help', row.crypter_label + ' · ' + row.reason_label)
+		);
+		tr.appendChild(nameCell);
 
 		var stateCell = document.createElement('td');
-		var stateTag = document.createElement('span');
-		var tone = DEFERRED_STATE_TONES[row.state] || 'gray';
-		stateTag.className = 'cds-tag cds-tag--' + tone;
-		stateTag.textContent = DEFERRED_STATE_LABELS[row.state] || String(row.state || 'Unknown');
-		stateCell.appendChild(stateTag);
+		stateCell.appendChild(
+			buildStatusDot(
+				DEFERRED_STATE_TONES[row.state] || 'info',
+				DEFERRED_STATE_LABELS[row.state] || String(row.state || 'Unknown')
+			)
+		);
 		tr.appendChild(stateCell);
 
+		// Inside a sweep the package's own evidence counter is meaningless -
+		// the cohort's tested/total is what decides its fate - so the column
+		// reports whichever of the two currently governs this package.
 		var evidenceCell = document.createElement('td');
-		var crypterLine = document.createElement('div');
-		crypterLine.textContent = row.crypter_label + ' – ' + row.reason_label;
-		var evidenceLine = document.createElement('div');
-		evidenceLine.className = 'cds-field__help';
-		evidenceLine.textContent = 'Evidence: ' + String(row.evidence_count);
-		evidenceCell.appendChild(crypterLine);
-		evidenceCell.appendChild(evidenceLine);
+		evidenceCell.appendChild(
+			buildEl(
+				'span',
+				'cds-mono',
+				row.cohort_total > 0
+					? row.cohort_tested + ' / ' + row.cohort_total
+					: row.evidence_count + ' / ' + EVIDENCE_TARGET
+			)
+		);
 		tr.appendChild(evidenceCell);
 
 		var nextCheckCell = document.createElement('td');
@@ -3094,30 +3733,29 @@
 		tr.appendChild(nextCheckCell);
 
 		var sweepCell = document.createElement('td');
-		if (row.cohort_total > 0) {
-			var testedLine = document.createElement('div');
-			testedLine.textContent = 'Tested: ' + row.cohort_tested + ' / ' + row.cohort_total;
-			var retestLine = document.createElement('div');
-			retestLine.className = 'cds-field__help';
-			retestLine.textContent = 'Retest queue: ' + row.cohort_retest_depth;
-			sweepCell.appendChild(testedLine);
-			sweepCell.appendChild(retestLine);
-		} else {
-			sweepCell.textContent = 'Not part of a sweep';
-		}
+		sweepCell.appendChild(
+			buildProgress(
+				row.cohort_total > 0 ? (100 * row.cohort_tested) / row.cohort_total : 0,
+				'interactive',
+				row.cohort_total > 0 ? row.cohort_tested + ' / ' + row.cohort_total : '—',
+				'Sweep progress: ' + row.name
+			)
+		);
 		tr.appendChild(sweepCell);
 
 		var actionsCell = document.createElement('td');
 		actionsCell.className = 'cds-row-actions';
-		actionsCell.appendChild(buildActionButton('deferred-probe-one', 'Check now: ' + row.name));
+		actionsCell.appendChild(
+			buildTextActionButton('deferred-probe-one', 'Check now: ' + row.name, 'cds-btn--ghost')
+		);
 		if (row.can_solve_captcha) {
 			actionsCell.appendChild(buildCaptchaLink(row.package_id, row.name));
 		}
 		actionsCell.appendChild(
-			buildActionButton(
+			buildTextActionButton(
 				'deferred-remove-one',
 				'Remove pending package: ' + row.name,
-				'cds-icon-button--danger'
+				'cds-btn--danger-ghost'
 			)
 		);
 		tr.appendChild(actionsCell);
@@ -3130,18 +3768,56 @@
 		tr.dataset.packageId = row.package_id;
 		tr.dataset.packageName = row.name;
 
-		appendTextCell(tr, row.name);
-		appendTextCell(tr, row.category);
-		appendTextCell(tr, QUEUE_STATUS_LABELS[row.status] || String(row.status || ''));
-		appendTextCell(tr, String(row.percentage) + '%');
-		appendTextCell(tr, row.eta_unknown ? 'Unknown' : row.eta);
+		// The status is a dot, not a column of repeated words. The dot is
+		// decorative, so the label lives on twice: as the cell's tooltip for
+		// a pointer, and as visually hidden text for the accessible name a
+		// screen reader reads out with the rest of the row.
+		var statusLabel = queueStatusLabel(row.status);
+		var statusCell = document.createElement('td');
+		var dot = buildStatusDot(QUEUE_STATUS_TONES[row.status] || 'info', '');
+		dot.setAttribute('title', statusLabel);
+		dot.appendChild(buildEl('span', 'cds-visually-hidden', statusLabel));
+		statusCell.appendChild(dot);
+		tr.appendChild(statusCell);
+
+		var nameCell = document.createElement('td');
+		nameCell.appendChild(buildEl('p', 'cds-release', row.name));
+		if (row.can_solve_captcha) {
+			// The one action a waiting package actually needs sits with the
+			// release name instead of hiding among the row's icon buttons.
+			nameCell.appendChild(buildCaptchaLink(row.package_id, row.name, 'inline'));
+		}
+		tr.appendChild(nameCell);
+
+		var categoryCell = document.createElement('td');
+		categoryCell.appendChild(
+			buildEl(
+				'span',
+				'cds-tag cds-tag--' + (CATEGORY_TONES[row.category] || 'gray'),
+				row.category
+			)
+		);
+		tr.appendChild(categoryCell);
+
 		appendTextCell(tr, row.size_label);
+
+		var etaCell = document.createElement('td');
+		etaCell.appendChild(buildEl('span', 'cds-mono', row.eta_unknown ? '—' : row.eta));
+		tr.appendChild(etaCell);
+
+		var progressCell = document.createElement('td');
+		progressCell.appendChild(
+			buildProgress(
+				row.percentage,
+				QUEUE_BAR_TONES[row.status] || 'interactive',
+				String(row.percentage) + '%',
+				'Download progress: ' + row.name
+			)
+		);
+		tr.appendChild(progressCell);
 
 		var actionsCell = document.createElement('td');
 		actionsCell.className = 'cds-row-actions';
-		if (row.can_solve_captcha) {
-			actionsCell.appendChild(buildCaptchaLink(row.package_id, row.name));
-		}
 		actionsCell.appendChild(
 			buildActionButton(
 				'package-delete',
@@ -3159,18 +3835,35 @@
 		tr.dataset.packageId = row.package_id;
 		tr.dataset.packageName = row.name;
 
-		appendTextCell(tr, row.name);
-		appendTextCell(tr, row.category);
-
+		// History is a finished classification, not a live state, so it
+		// leads with a tag rather than a dot - and leads the row, because
+		// "did this work?" is the question a history table answers first.
 		var statusCell = document.createElement('td');
-		statusCell.textContent = HISTORY_STATUS_LABELS[row.status] || String(row.status || '');
-		if (row.status === 'failed' && row.error) {
-			var errorLine = document.createElement('div');
-			errorLine.className = 'cds-field__help';
-			errorLine.textContent = row.error;
-			statusCell.appendChild(errorLine);
-		}
+		statusCell.appendChild(
+			buildEl(
+				'span',
+				'cds-tag cds-tag--' + (HISTORY_STATUS_TONES[row.status] || 'gray'),
+				HISTORY_STATUS_LABELS[row.status] || String(row.status || '')
+			)
+		);
 		tr.appendChild(statusCell);
+
+		var nameCell = document.createElement('td');
+		nameCell.appendChild(buildEl('p', 'cds-release', row.name));
+		if (row.status === 'failed' && row.error) {
+			nameCell.appendChild(buildEl('p', 'cds-release__error', row.error));
+		}
+		tr.appendChild(nameCell);
+
+		var categoryCell = document.createElement('td');
+		categoryCell.appendChild(
+			buildEl(
+				'span',
+				'cds-tag cds-tag--' + (CATEGORY_TONES[row.category] || 'gray'),
+				row.category
+			)
+		);
+		tr.appendChild(categoryCell);
 
 		appendTextCell(tr, row.size_label);
 
@@ -3486,12 +4179,12 @@
 			'.</p>';
 		var actions =
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
-			'<button class="cds-btn cds-btn--danger-ghost" type="button" id="downloads-confirm-remove">Remove pending package' +
+			'<button class="cds-btn cds-btn--danger" type="button" id="downloads-confirm-remove">Remove pending package' +
 			(ids.length === 1 ? '' : 's') +
 			'</button>';
 
 		pauseRefresh();
-		window.showModal(title, body, actions);
+		window.showModal(title, body, actions, { eyebrow: 'Downloads' });
 		var confirmBtn = byId('downloads-confirm-remove');
 		if (confirmBtn) {
 			confirmBtn.addEventListener('click', function onConfirm() {
@@ -3509,14 +4202,17 @@
 		var body =
 			'<p class="modal-package-name">' +
 			escapeForModal(name) +
-			'</p><p><strong>Warning:</strong> this permanently deletes the package and all of its ' +
-			'downloaded files from disk. This action cannot be undone.</p>';
+			'</p>' +
+			'<section class="cds-notification cds-notification--warning" role="alert">' +
+			'<p class="cds-notification__message"><strong>Files are deleted too.</strong> The package is ' +
+			'removed from JDownloader together with downloaded files. This cannot be undone.</p>' +
+			'</section>';
 		var actions =
 			'<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>' +
-			'<button class="cds-btn cds-btn--danger-ghost" type="button" id="downloads-confirm-delete">Delete package and files</button>';
+			'<button class="cds-btn cds-btn--danger" type="button" id="downloads-confirm-delete">Delete package and files</button>';
 
 		pauseRefresh();
-		window.showModal('Delete package and files?', body, actions);
+		window.showModal('Delete package and files?', body, actions, { eyebrow: 'Downloads' });
 		var confirmButton = byId('downloads-confirm-delete');
 		if (confirmButton) {
 			confirmButton.addEventListener('click', function onConfirm() {
@@ -3567,6 +4263,15 @@
 		updateDeferredToolbarState();
 	}
 
+	// The Queue tile heading carries its own count, so the number stays
+	// readable while the table itself scrolls out of view.
+	function updateQueueCount(total) {
+		var countEl = byId('queue-count');
+		if (countEl) {
+			countEl.textContent = '(' + total + ')';
+		}
+	}
+
 	function renderQueueTable(rows) {
 		var tbody = byId('queue-table-body');
 		if (!tbody) {
@@ -3576,6 +4281,7 @@
 		rows.forEach(function (row) {
 			tbody.appendChild(buildQueueRow(row));
 		});
+		updateQueueCount(rows.length);
 		updateEmptyMessage('queue-empty-message', rows.length === 0, 'No active downloads.');
 	}
 
@@ -3636,6 +4342,7 @@
 		if (otherSection) {
 			otherSection.hidden = true;
 		}
+		updateQueueCount(0);
 		updateDeferredToolbarState();
 	}
 

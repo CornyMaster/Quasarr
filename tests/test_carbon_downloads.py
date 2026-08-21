@@ -23,6 +23,12 @@ Covers:
     `records_only` anywhere.
   - Selection snapshot/restore by `Set.has(checkbox.value)`, never a selector
     built from package data.
+  - The client-side row design: a status dot (not a text column) plus a
+    category tag and an announced progress bar in Queue rows, a
+    Completed/Failed tag leading each History row, a state dot and a sweep
+    bar in Deferred rows, and the Dashboard queue preview built from the
+    same vocabulary - all pinned against the shipped carbon.js text and the
+    table heads those rows line up with.
   - A blacklist-scrub simulation (c294f65) against the real
     `GET /api/packages/list` route with a real `CrypterCooldownService` and
     an injected clock, proving the exact JSON carbon.js consumes keeps
@@ -337,17 +343,23 @@ class DownloadsSkeletonRenderTests(unittest.TestCase):
         # render_downloads() never called it.
         self._render()
 
-    def test_search_input_lives_outside_the_refreshed_subtree(self):
+    def test_search_input_lives_in_the_queue_tile_head(self):
         html = self._render()
-        search_index = html.index('id="downloads-search"')
-        content_index = html.index('id="downloads-content"')
-        self.assertLess(
-            search_index,
-            content_index,
-            "downloads-search must be a sibling BEFORE downloads-content, "
-            "not inside it - otherwise its value/focus don't survive a poll "
-            "that rebuilds #downloads-content",
-        )
+        head_start = html.index('id="downloads-queue-section"')
+        head_end = html.index('id="queue-table"', head_start)
+        head_html = html[head_start:head_end]
+        self.assertIn('class="cds-tile__head-row"', head_html)
+        self.assertIn('id="queue-count"', head_html)
+        self.assertIn('id="downloads-search"', head_html)
+        self.assertIn('placeholder="Search releases"', head_html)
+
+    def test_search_input_keeps_an_accessible_name(self):
+        # The head row shows no visible field label (the placeholder is not
+        # one), so the <label> stays in the accessibility tree only.
+        html = self._render()
+        start = html.index('for="downloads-search"')
+        label_open = html.rindex("<label", 0, start)
+        self.assertIn("cds-visually-hidden", html[label_open:start])
 
     def test_all_four_sections_and_bodies_are_present(self):
         html = self._render()
@@ -372,11 +384,13 @@ class DownloadsSkeletonRenderTests(unittest.TestCase):
         head_html = html[table_start:thead_end]
         headers = re.findall(r"<th[^>]*>(.*?)</th>", head_html, re.S)
         # First header is the select-all checkbox cell (selection column);
-        # the remaining six are the A1 text columns in order.
+        # the last is the action column, unlabelled like the Queue and
+        # History tables' own action columns - the row's buttons name
+        # themselves, so a repeated column title only adds noise.
         self.assertEqual(len(headers), 7)
         self.assertIn('id="deferred-select-all"', headers[0])
         self.assertEqual(
-            ["Release", "State", "Evidence", "Next check", "Sweep progress", "Actions"],
+            ["Release", "State", "Evidence", "Next check", "Sweep progress", ""],
             headers[1:],
         )
 
@@ -412,7 +426,10 @@ class DownloadsSkeletonRenderTests(unittest.TestCase):
 
     def test_captcha_count_reflected_in_header_badge(self):
         html = self._render(titles=[("id-1", "t"), ("id-2", "t")])
-        self.assertIn("<strong>2</strong>", html)
+        self.assertIn(
+            '<span class="cds-header__badge" aria-hidden="true">2</span>', html
+        )
+        self.assertIn('aria-label="Notifications, 2 CAPTCHA items"', html)
 
     def test_deleted_success_banner_renders_when_query_param_present(self):
         html = self._render(query_string="deleted=1")
@@ -647,8 +664,23 @@ class DownloadsD1WordingTests(unittest.TestCase):
     def test_ordinary_delete_names_disk_and_irreversibility(self):
         body = javascript_function_body(self.js, "confirmDeletePackage")
         self.assertIn("Delete package and files", body)
-        self.assertIn("disk", body)
+        # The modal uses a warning notification to communicate file
+        # deletion consequences - specifically "downloaded files" - and
+        # explicitly states the action cannot be undone.
+        self.assertIn("downloaded files", body)
         self.assertIn("cannot be undone", body)
+
+    def test_ordinary_delete_uses_danger_button_and_warning_notification(self):
+        """The delete button must use the solid danger style
+        (`cds-btn--danger`, not the ghost variant), and the modal body
+        must include a warning notification explicitly stating that files
+        are deleted along with the package.
+        """
+        body = javascript_function_body(self.js, "confirmDeletePackage")
+        self.assertIn('class="cds-btn cds-btn--danger"', body)
+        self.assertIn("Delete package and files</button>", body)
+        self.assertIn("cds-notification cds-notification--warning", body)
+        self.assertIn("Files are deleted too.", body)
 
     def test_deferred_removal_uses_distinct_pending_wording(self):
         body = javascript_function_body(self.js, "confirmRemovePending")
@@ -984,11 +1016,33 @@ class DownloadsRegressionFixesTests(unittest.TestCase):
                 )
                 self.assertRegex(spec.sha256, r"^[0-9a-f]{64}$")
 
-    def test_row_action_buttons_are_icon_buttons_not_text_buttons(self):
+    def test_delete_row_action_is_an_icon_button(self):
+        # The queue/history trash control is icon-only: it repeats once per
+        # row in a dense table, where a spelled-out label would dominate.
         body = javascript_function_body(self.js, "buildActionButton")
         self.assertIn("cds-icon-button", body)
         self.assertIn("buildActionIcon(", body)
-        self.assertNotIn("cds-btn--compact", body)
+
+    def test_deferred_row_actions_are_labelled_buttons(self):
+        # The deferred table's actions are rarer, less obvious and not
+        # destructive-by-icon, so they carry their words.
+        body = javascript_function_body(self.js, "buildTextActionButton")
+        self.assertIn("'cds-btn ' + variantClass + ' cds-btn--compact'", body)
+        self.assertIn("buttonTextForAction(action)", body)
+        self.assertNotIn("cds-icon-button", body)
+        self.assertNotIn("buildActionIcon(", body)
+
+        deferred = javascript_function_body(self.js, "buildDeferredRow")
+        self.assertIn("buildTextActionButton(", deferred)
+        self.assertIn("'cds-btn--ghost'", deferred)
+        self.assertIn("'cds-btn--danger-ghost'", deferred)
+        # No icon-only button is left in this row's action group.
+        self.assertNotIn("buildActionButton(", deferred)
+
+    def test_deferred_action_button_text_matches_the_design(self):
+        body = javascript_function_body(self.js, "buttonTextForAction")
+        self.assertIn("return 'Check';", body)
+        self.assertIn("return 'Remove';", body)
 
     def test_captcha_link_is_an_icon_button(self):
         body = javascript_function_body(self.js, "buildCaptchaLink")
@@ -996,9 +1050,12 @@ class DownloadsRegressionFixesTests(unittest.TestCase):
         self.assertIn("buildActionIcon('unlocked')", body)
 
     def test_row_action_icon_set_matches_expected_icons(self):
+        # Only the icons carbon.js draws itself are mirrored client-side.
+        # The bulk toolbar's renew icon is server-rendered by render_icon(),
+        # and the deferred row's actions carry words rather than icons.
         self.assertIn("'trash-can':", self.js)
-        self.assertIn("renew:", self.js)
         self.assertIn("unlocked:", self.js)
+        self.assertNotIn("renew:", self.js)
 
     def test_row_actions_css_has_gap_and_alignment(self):
         self.assertRegex(
@@ -1033,6 +1090,43 @@ class DownloadsRegressionFixesTests(unittest.TestCase):
         build_captcha = javascript_function_body(self.js, "buildCaptchaLink")
         self.assertIn("'Solve CAPTCHA: '", build_captcha)
 
+    def test_labelled_row_actions_satisfy_label_in_name(self):
+        # WCAG 2.5.3: the accessible name must contain the visible words.
+        # Pulls the real visible label buttonTextForAction() returns and
+        # the real aria-label phrase buildDeferredRow() passes to
+        # buildTextActionButton() for each action straight out of the
+        # shipped source, then relates those two actual strings to each
+        # other - not the test's own literal tuple against itself.
+        deferred = javascript_function_body(self.js, "buildDeferredRow")
+        text_map = javascript_function_body(self.js, "buttonTextForAction")
+        for action in ("deferred-probe-one", "deferred-remove-one"):
+            with self.subTest(action=action):
+                phrase_match = re.search(
+                    r"buildTextActionButton\(\s*'"
+                    + re.escape(action)
+                    + r"'\s*,\s*'([^']+)'\s*\+\s*row\.name",
+                    deferred,
+                )
+                self.assertIsNotNone(
+                    phrase_match, f"no aria-label phrase found for {action}"
+                )
+                phrase = phrase_match.group(1)
+
+                visible_match = re.search(
+                    r"case '" + re.escape(action) + r"':\s*return '([^']+)';",
+                    text_map,
+                )
+                self.assertIsNotNone(
+                    visible_match, f"no visible label found for {action}"
+                )
+                visible = visible_match.group(1)
+
+                self.assertTrue(
+                    phrase.startswith(visible),
+                    f"visible label {visible!r} is not a prefix of the "
+                    f"aria-label phrase {phrase!r}",
+                )
+
     def test_row_action_title_matches_aria_label_exactly(self):
         # buildActionButton()/buildCaptchaLink() both set title from the
         # same `label` variable used for aria-label - never a second,
@@ -1040,6 +1134,10 @@ class DownloadsRegressionFixesTests(unittest.TestCase):
         body = javascript_function_body(self.js, "buildActionButton")
         self.assertIn("setAttribute('aria-label', label)", body)
         self.assertIn("setAttribute('title', label)", body)
+
+        text_body = javascript_function_body(self.js, "buildTextActionButton")
+        self.assertIn("setAttribute('aria-label', label)", text_body)
+        self.assertIn("setAttribute('title', label)", text_body)
 
         captcha_body = javascript_function_body(self.js, "buildCaptchaLink")
         self.assertIn("setAttribute('aria-label', label)", captcha_body)
@@ -1110,6 +1208,251 @@ class StickyCheckboxColumnTests(unittest.TestCase):
             r"\.cds-table--sticky-col th:first-child,\s*"
             r"\.cds-table--sticky-col td:first-child\s*\{\s*width:\s*40px;\s*\}",
         )
+
+
+class DownloadRowDesignTests(unittest.TestCase):
+    """Every download row is built client-side, so the target design for the
+    Queue/History/Deferred tables and the Dashboard queue preview is pinned
+    against the shipped `carbon.js` text (no JS engine in this suite) plus
+    the server-rendered table heads those rows have to line up with.
+
+    The design replaces the queue's status text column with a coloured status
+    dot, tags the category, and puts a progress bar with a visible percentage
+    in the Progress column; History leads with a Completed/Failed tag;
+    Deferred shows its state as a dot and its sweep as a bar.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = _read_static("carbon.js")
+        cls.css = _read_static("carbon.css")
+
+    def _render(self):
+        shared_state = RaisingSharedState()
+        shared_state.values["database"] = lambda table: FakeProtectedDatabaseTable([])
+        return carbon.render_downloads(shared_state)
+
+    # -- Shared row vocabulary --------------------------------------------
+
+    def test_status_dot_helper_builds_a_carbon_status_indicator(self):
+        body = javascript_function_body(self.js, "buildStatusDot")
+        self.assertIn("cds-status cds-status--", body)
+        self.assertIn("cds-status__dot", body)
+        self.assertIn("'aria-hidden', 'true'", body)
+
+    def test_progress_helper_announces_its_value_to_screen_readers(self):
+        # The same accessibility contract the Statistics ratio bars carry
+        # (`role="progressbar"` plus aria-valuemin/max/now and an identifying
+        # aria-label) - a bar that announces nothing is a regression this
+        # project has already rejected once.
+        body = javascript_function_body(self.js, "buildProgress")
+        self.assertIn("cds-progress__fill cds-progress__fill--", body)
+        self.assertIn("'role', 'progressbar'", body)
+        self.assertIn("'aria-valuemin', '0'", body)
+        self.assertIn("'aria-valuemax', '100'", body)
+        self.assertIn("'aria-valuenow'", body)
+        self.assertIn("'aria-label'", body)
+
+    # -- Queue rows --------------------------------------------------------
+
+    def test_queue_row_leads_with_a_status_dot_instead_of_a_status_column(self):
+        body = javascript_function_body(self.js, "buildQueueRow")
+        self.assertIn("buildStatusDot(QUEUE_STATUS_TONES[row.status]", body)
+        self.assertLess(body.index("buildStatusDot("), body.index("cds-release"))
+        # The four status labels are the dot's accessible name and tooltip
+        # now, never a plain text cell of their own.
+        self.assertNotIn("appendTextCell(tr, QUEUE_STATUS_LABELS", body)
+
+    def test_queue_row_status_dot_is_still_named_for_assistive_technology(self):
+        body = javascript_function_body(self.js, "buildQueueRow")
+        self.assertIn("cds-visually-hidden", body)
+        self.assertIn("'title', statusLabel", body)
+
+    def test_queue_row_tags_its_category(self):
+        body = javascript_function_body(self.js, "buildQueueRow")
+        self.assertIn("cds-tag cds-tag--", body)
+        self.assertIn("CATEGORY_TONES[row.category]", body)
+
+    def test_queue_row_offers_the_captcha_action_under_the_release_name(self):
+        body = javascript_function_body(self.js, "buildQueueRow")
+        self.assertIn("buildCaptchaLink(row.package_id, row.name, 'inline')", body)
+        # Beside the release name, not down in the row's action group.
+        self.assertLess(body.index("buildCaptchaLink("), body.index("cds-row-actions"))
+        # One builder owns both presentations, so the inline variant cannot
+        # drift away from the icon button's target or accessible name.
+        link_body = javascript_function_body(self.js, "buildCaptchaLink")
+        self.assertIn("cds-release__action", link_body)
+        # Same label form the server-rendered link actions use.
+        self.assertIn("'Solve CAPTCHA " + chr(0x2192) + "'", link_body)
+
+    def test_polling_never_replaces_the_subtree_holding_the_filter(self):
+        """The filter input sits inside `#downloads-content` now, so its
+        value and focus survive a refresh only because every render path
+        clears a `<tbody>` and never a whole tile or the container itself.
+        """
+        for name in (
+            "renderDownloads",
+            "renderQueueTable",
+            "renderDeferredTable",
+            "renderHistoryTable",
+            "renderOtherTables",
+            "renderDisconnected",
+        ):
+            with self.subTest(function=name):
+                body = javascript_function_body(self.js, name)
+                self.assertNotIn("innerHTML", body)
+                self.assertNotIn("content.textContent", body)
+
+    def test_filter_reads_the_input_and_still_matches_every_rendered_row(self):
+        body = javascript_function_body(self.js, "applySearchFilter")
+        self.assertIn("byId('downloads-search')", body)
+        self.assertIn("'#downloads-content tbody tr[data-package-name]'", body)
+
+    def test_queue_row_ends_with_a_progress_bar_and_a_percentage(self):
+        body = javascript_function_body(self.js, "buildQueueRow")
+        self.assertIn("buildProgress(", body)
+        self.assertIn("row.percentage", body)
+        self.assertIn("QUEUE_BAR_TONES[row.status]", body)
+        self.assertIn("String(row.percentage) + '%'", body)
+
+    def test_queue_row_keeps_its_delete_action_and_row_identity(self):
+        body = javascript_function_body(self.js, "buildQueueRow")
+        self.assertIn("tr.dataset.packageId = row.package_id", body)
+        self.assertIn("tr.dataset.packageName = row.name", body)
+        self.assertIn("'Delete package and files: ' + row.name", body)
+
+    # -- History rows ------------------------------------------------------
+
+    def test_history_row_builder_uses_a_status_tag_before_the_release(self):
+        body = javascript_function_body(self.js, "buildHistoryRow")
+        self.assertIn("HISTORY_STATUS_TONES[row.status]", body)
+        self.assertLess(body.index("cds-tag cds-tag--"), body.index("cds-release"))
+
+    def test_history_row_shows_the_failure_reason_under_the_release_name(self):
+        body = javascript_function_body(self.js, "buildHistoryRow")
+        self.assertIn("cds-release__error", body)
+        self.assertLess(body.index("'cds-release'"), body.index("cds-release__error"))
+
+    def test_history_row_keeps_its_delete_action_and_row_identity(self):
+        body = javascript_function_body(self.js, "buildHistoryRow")
+        self.assertIn("tr.dataset.packageId = row.package_id", body)
+        self.assertIn("tr.dataset.packageName = row.name", body)
+        self.assertIn("'Delete package and files: ' + row.name", body)
+
+    # -- Deferred rows -----------------------------------------------------
+
+    def test_deferred_row_builder_uses_a_status_dot_not_a_tag(self):
+        body = javascript_function_body(self.js, "buildDeferredRow")
+        self.assertIn("DEFERRED_STATE_TONES[row.state]", body)
+        self.assertIn("buildStatusDot(", body)
+        self.assertNotIn("cds-tag cds-tag--' + tone", body)
+
+    def test_deferred_row_names_crypter_and_reason_under_the_release(self):
+        body = javascript_function_body(self.js, "buildDeferredRow")
+        self.assertIn("row.crypter_label", body)
+        self.assertIn("row.reason_label", body)
+        self.assertLess(body.index("row.crypter_label"), body.index("buildStatusDot("))
+
+    def test_deferred_row_shows_evidence_in_mono(self):
+        body = javascript_function_body(self.js, "buildDeferredRow")
+        self.assertIn("cds-mono", body)
+        self.assertIn("row.evidence_count", body)
+
+    def test_deferred_row_keeps_both_shared_countdowns(self):
+        body = javascript_function_body(self.js, "buildDeferredRow")
+        self.assertIn("buildCountdownRow('Retry', 'data-retry-after-epoch'", body)
+        self.assertIn("'data-cohort-deadline-epoch'", body)
+
+    def test_deferred_row_shows_sweep_progress_as_a_bar(self):
+        body = javascript_function_body(self.js, "buildDeferredRow")
+        self.assertIn("buildProgress(", body)
+        self.assertIn("row.cohort_tested", body)
+        self.assertIn("row.cohort_total", body)
+
+    def test_deferred_row_keeps_selection_checkbox_and_row_identity(self):
+        body = javascript_function_body(self.js, "buildDeferredRow")
+        self.assertIn("deferred-select", body)
+        self.assertIn("checkbox.value = row.package_id", body)
+        self.assertIn("tr.dataset.packageId = row.package_id", body)
+        self.assertIn("tr.dataset.packageName = row.name", body)
+
+    # -- Dashboard queue preview -------------------------------------------
+
+    def test_dashboard_queue_preview_uses_the_same_row_vocabulary(self):
+        body = javascript_function_body(self.js, "renderQueueRows")
+        self.assertIn("cds-queue-preview__row", body)
+        self.assertIn("cds-release", body)
+        self.assertIn("cds-queue-preview__meta", body)
+        self.assertIn("buildPreviewProgress(", body)
+
+    def test_dashboard_queue_preview_bar_is_announced_too(self):
+        body = javascript_function_body(self.js, "buildPreviewProgress")
+        self.assertIn("cds-progress__fill cds-progress__fill--", body)
+        self.assertIn("'role', 'progressbar'", body)
+        self.assertIn("'aria-valuenow'", body)
+        self.assertIn("'aria-label'", body)
+
+    def test_dashboard_queue_preview_meta_pairs_percentage_with_eta(self):
+        body = javascript_function_body(self.js, "queuePreviewMeta")
+        self.assertIn("row.percentage", body)
+        self.assertIn("row.eta", body)
+        self.assertIn("row.eta_unknown", body)
+
+    # -- Table heads the client-side rows line up with ---------------------
+
+    def test_queue_table_head_follows_the_design(self):
+        html = self._render()
+        head = (
+            '<th scope="col"></th>'
+            '<th scope="col">Release</th>'
+            '<th scope="col">Category</th>'
+            '<th scope="col">Size</th>'
+            '<th scope="col">ETA</th>'
+            '<th scope="col">Progress</th>'
+            '<th scope="col"></th>'
+        )
+        # Queue and Other-queue share one row builder, so both heads have to
+        # carry the same seven columns.
+        self.assertEqual(2, html.count(head))
+
+    def test_history_table_head_follows_the_design(self):
+        html = self._render()
+        head = (
+            '<th scope="col">Status</th>'
+            '<th scope="col">Release</th>'
+            '<th scope="col">Category</th>'
+            '<th scope="col">Size</th>'
+            '<th scope="col"></th>'
+        )
+        self.assertEqual(2, html.count(head))
+
+    def test_queue_tile_head_carries_a_live_counter(self):
+        html = self._render()
+        self.assertIn('id="queue-count"', html)
+        body = javascript_function_body(self.js, "renderQueueTable")
+        self.assertIn("updateQueueCount(rows.length)", body)
+
+    def test_deferred_bulk_toolbar_leads_with_the_selection_count(self):
+        html = self._render()
+        self.assertLess(
+            html.index('id="deferred-selection-count"'),
+            html.index('data-action="deferred-probe-selected"'),
+        )
+        self.assertIn("cds-btn cds-btn--tertiary", html)
+
+    # -- CSS the new row parts need -----------------------------------------
+
+    def test_row_component_css_is_shipped(self):
+        for selector in (
+            ".cds-release {",
+            ".cds-release__action {",
+            ".cds-release__error {",
+            ".cds-progress-cell {",
+            ".cds-progress-cell__label {",
+            ".cds-queue-preview__row {",
+        ):
+            with self.subTest(selector=selector):
+                self.assertIn(selector, self.css)
 
 
 class DownloadsNoscriptTests(unittest.TestCase):

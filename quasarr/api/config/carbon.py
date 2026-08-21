@@ -46,9 +46,12 @@ from quasarr.constants import (
     SHARE_HOSTERS,
 )
 from quasarr.providers.auth import show_logout_link
+from quasarr.providers.carbon_icons import render_icon
 from quasarr.providers.carbon_templates import (
+    grid,
     protected_captcha_count,
     render_carbon_html,
+    status,
     tag,
     tile,
 )
@@ -79,9 +82,37 @@ def _h(value: object) -> str:
 # Hostnames
 # ---------------------------------------------------------------------------
 
-_STATUS_TONE = {"ok": "green", "error": "red", "unset": "gray", "skipped": "blue"}
+_STATUS_TONE = {
+    "ok": "success",
+    "error": "error",
+    "login_failed": "error",
+    "skipped": "warning",
+    "unset": "neutral",
+}
+
+_CAP_TONE = {
+    "German": "gray",
+    "English": "gray",
+    "French": "gray",
+    "Movies": "blue",
+    "TV": "purple",
+    "Anime": "teal",
+    "Music": "teal",
+    "Books": "teal",
+    "Docs": "teal",
+    "Login required": "red",
+    "Invite only": "red",
+    "FlareSolverr": "red",
+    "Account required": "red",
+}
 
 _LANGUAGE_LABELS = {"en": "English", "de": "German", "fr": "French"}
+
+# Default skip-login note for the main Hostnames page's dense row (the setup
+# wizard's row still says "Open Details" - it keeps its own separate
+# Details toggle, so it passes its own skip_note_html to _hostname_row_html
+# instead of this default).
+_SKIP_LOGIN_NOTE = "Login skipped – open the status to require login again."
 
 _CATEGORY_CHIP_ORDER = (
     (SEARCH_CAT_MOVIES, "Movies"),
@@ -114,89 +145,153 @@ def _hostname_capability_chips(row: Mapping[str, Any]) -> str:
 
     language = row.get("language")
     if language in _LANGUAGE_LABELS:
-        chips.append(tag(_LANGUAGE_LABELS[language], tone="blue"))
+        label = _LANGUAGE_LABELS[language]
+        chips.append(tag(label, tone=_CAP_TONE.get(label, "gray")))
 
     if row.get("invite_only"):
-        chips.append(tag("Invite Only", tone="red"))
+        chips.append(tag("Invite only", tone=_CAP_TONE["Invite only"]))
     if row.get("requires_login"):
-        chips.append(tag("Login Required", tone="purple"))
+        chips.append(tag("Login required", tone=_CAP_TONE["Login required"]))
     elif row.get("requires_account"):
-        chips.append(tag("Account Required", tone="purple"))
+        # requires_account is a different real thing than requires_login
+        # (see quasarr/search/sources/helpers/search_source.py) and several
+        # real sources set it without also setting requires_login, so it
+        # keeps its own distinct chip - but per spec §2.1's capability
+        # palette (gray for language, red for every "you need something
+        # extra to use this" flag) it joins the same red cluster as Login
+        # required/Invite only/FlareSolverr, sentence-cased to match them.
+        chips.append(tag("Account required", tone=_CAP_TONE["Account required"]))
     if row.get("requires_flaresolverr"):
-        chips.append(tag("FlareSolverr Required", tone="teal"))
+        chips.append(tag("FlareSolverr", tone=_CAP_TONE["FlareSolverr"]))
 
     categories = set(row.get("categories") or [])
     for cat_id, label in _CATEGORY_CHIP_ORDER:
         if cat_id in categories:
-            chips.append(tag(label, tone="green"))
+            chips.append(tag(label, tone=_CAP_TONE.get(label, "gray")))
 
-    if not chips:
-        return ""
-    return '<div class="cds-hostname-row__caps">' + "".join(chips) + "</div>"
+    return "".join(chips)
 
 
-def _hostname_row_html(row: Mapping[str, Any]) -> str:
-    field_id = row["id"]
-    safe_id = _h(field_id)
-    input_id = f"hostname-{safe_id}"
-    tone = _STATUS_TONE.get(row["status"], "gray")
-    status_html = tag(row["status_title"], tone=tone)
-    caps_html = _hostname_capability_chips(row)
+def _hostname_row_html(
+    row: Mapping[str, Any],
+    *,
+    status_action: str = "hostname-status",
+    status_wrapper_id: str = "",
+    trailing_caps_html: str = "",
+    skip_note_html: str | None = None,
+    input_form: str = "",
+) -> str:
+    """The shared dense hostname-table row: code, clickable status,
+    hostname input, capability chips. Shared verbatim between this page and
+    the setup wizard's Hostnames step
+    (``quasarr/storage/setup/carbon.py::_setup_hostname_row_html``), whose
+    genuinely different bits (a non-clickable status plus a separate
+    Details toggle button that expands an inline credentials panel, instead
+    of this page's status opening a JS-fetched modal; its own skip-login
+    banner id/wording; the ``form=`` attribute its deliberately-empty
+    ``<form>`` needs on every field that should submit) are passed in
+    explicitly rather than forked into a second copy of this function.
+    """
+    safe_id = _h(row["id"])
+    tone = _STATUS_TONE.get(row["status"], "neutral")
+    if status_action:
+        status_html = status(
+            row["status_title"],
+            tone,
+            tinted=tone in {"error", "warning", "neutral"},
+            as_button=True,
+            action=status_action,
+            data={"hostname-id": row["id"]},
+        )
+    else:
+        status_html = status(
+            row["status_title"], tone, tinted=tone in {"error", "warning", "neutral"}
+        )
+    wrapper_id_attr = f' id="{_h(status_wrapper_id)}"' if status_wrapper_id else ""
 
-    skip_html = ""
-    if row.get("skip_login"):
-        skip_html = (
-            '<p class="cds-hostname-row__skip-banner">'
-            "Login was skipped for this site. Open Details to require login again."
-            "</p>"
+    if skip_note_html is None:
+        skip_note_html = (
+            f'<p class="cds-hostname-table__note">{_h(_SKIP_LOGIN_NOTE)}</p>'
+            if row.get("skip_login")
+            else ""
         )
 
+    form_attr = f' form="{_h(input_form)}"' if input_form else ""
+
     return (
-        f'<div class="cds-hostname-row" data-hostname-id="{safe_id}">'
-        f'<div class="cds-hostname-row__status">{status_html}</div>'
-        '<div class="cds-hostname-row__body">'
-        '<div class="cds-hostname-row__heading">'
-        f'<span class="cds-hostname-row__label">{_h(row["label"])}</span>'
-        f"{caps_html}"
-        "</div>"
-        '<div class="cds-field">'
-        f'<label class="cds-field__label" for="{input_id}">Hostname</label>'
-        f'<input class="cds-field__input" id="{input_id}" name="{safe_id}" '
-        f'type="text" value="{_h(row["hostname"])}" placeholder="example.com" '
-        'autocomplete="off" autocorrect="off">'
-        "</div>"
-        f"{skip_html}"
-        "</div>"
-        '<div class="cds-hostname-row__actions">'
-        '<button class="cds-btn cds-btn--ghost" type="button" '
-        f'data-action="hostname-status" data-hostname-id="{safe_id}">Details</button>'
-        "</div>"
+        f'<div class="cds-hostname-table__row" data-hostname-id="{safe_id}">'
+        f'<span class="cds-hostname-table__code">{_h(row["label"])}</span>'
+        f"<span{wrapper_id_attr}>{status_html}</span>"
+        f'<span><input class="cds-hostname-table__input" id="hostname-{safe_id}" '
+        f'name="{safe_id}" type="text" '
+        f'value="{_h(row["hostname"])}" placeholder="example.com" '
+        f'autocomplete="off" autocorrect="off"{form_attr} '
+        f'aria-label="Hostname for {_h(row["label"])}">{skip_note_html}</span>'
+        f'<span class="cds-hostname-table__caps">'
+        f"{_hostname_capability_chips(row)}{trailing_caps_html}</span>"
         "</div>"
     )
 
 
 def _hostnames_import_section(model: Mapping[str, Any]) -> str:
+    # value="{stored_url}" is not in the design's condensed inline markup
+    # spec but is kept here regardless: without it, a previously-configured
+    # import URL would silently stop showing in this visible field on page
+    # load (it would still be present in the hidden #hostnames-url-hidden
+    # field used by Save, just invisible to the user re-opening the page).
     stored_url = _h(model["hostnames_url"])
     return tile(
-        "<p>Import hostname definitions from a URL (one entry per line, "
-        "formatted as <code>ab = example.com</code>).</p>"
-        '<div class="cds-field">'
-        '<label class="cds-field__label" for="hostnames-import-url">Source URL</label>'
-        '<input class="cds-field__input" id="hostnames-import-url" type="url" '
-        f'value="{stored_url}" placeholder="https://example.invalid/hostnames.ini" '
-        'autocomplete="off">'
+        '<p class="cds-field__label">Import from URL</p>'
+        '<div class="cds-inline-form">'
+        '<input class="cds-field__input cds-mono" id="hostname-import-url" '
+        f'type="url" value="{stored_url}" '
+        'placeholder="https://quasarr-hostnames.pages.dev/ini?token=…">'
+        '<button class="cds-btn cds-btn--tertiary" type="button" '
+        'data-action="hostname-import">Import</button>'
         "</div>"
-        '<button class="cds-btn cds-btn--secondary" type="button" '
-        'data-action="hostnames-import-open">Import from URL</button>',
-        heading="Import hostnames",
+        '<p class="cds-field__help">One hostname per line, e.g. '
+        '"fx = fx.example.com"</p>'
     )
 
 
 def render_hostnames(shared_state) -> str:
     model = build_hostnames_model(shared_state)
-    rows_html = "".join(_hostname_row_html(row) for row in model["rows"])
+    rows = model["rows"]
+    rows_html = "".join(_hostname_row_html(row) for row in rows)
     stored_url = _h(model["hostnames_url"])
     flaresolverr_flag = "true" if model["flaresolverr_skipped"] else "false"
+
+    total = len(rows)
+    configured = sum(1 for row in rows if row["hostname"])
+    working = sum(1 for row in rows if row["status"] == "ok")
+
+    table_head = (
+        '<div class="cds-hostname-table__head">'
+        "<span></span><span>Status</span><span>Hostname</span>"
+        "<span>Capabilities</span></div>"
+    )
+    table_tile = (
+        '<section class="cds-tile cds-tile--is-table">'
+        '<div class="cds-tile__head-row">'
+        '<h2 class="cds-tile__heading">Sources <span class="cds-tile__count">'
+        f"({working} of {configured} operational · {total} supported)"
+        "</span></h2>"
+        '<input class="cds-field__input cds-filter" type="search" '
+        'placeholder="Filter sources" data-action="hostname-filter">'
+        "</div>"
+        f'<div class="cds-hostname-table">{table_head}{rows_html}</div>'
+        "</section>"
+    )
+    cta_row = (
+        '<div class="cds-cta-row">'
+        '<button class="cds-btn cds-btn--primary cds-btn--cta" type="submit">'
+        "Save hostnames</button>"
+        '<button class="cds-btn cds-btn--secondary cds-btn--cta" type="button" '
+        'data-action="hostname-reset">Cancel</button>'
+        '<span class="cds-field__help">Saving a changed hostname asks to '
+        "restart Quasarr.</span>"
+        "</div>"
+    )
 
     content = "".join(
         [
@@ -206,9 +301,8 @@ def render_hostnames(shared_state) -> str:
             '<form id="hostnames-form" action="/api/hostnames" method="post">',
             '<input type="hidden" id="hostnames-url-hidden" name="hostnames_url" '
             f'value="{stored_url}">',
-            tile(rows_html, heading="Configured sources"),
-            '<button class="cds-btn cds-btn--primary" type="button" '
-            'data-action="hostnames-save">Save hostnames</button>',
+            table_tile,
+            cta_row,
             "</form>",
             tile(
                 "<p>Restarting Quasarr applies configuration changes that need a "
@@ -224,8 +318,9 @@ def render_hostnames(shared_state) -> str:
         "hostnames",
         content,
         title="Hostnames",
-        eyebrow="Configuration",
-        subtitle="Configure source hostnames, credentials, and login status",
+        eyebrow="Sources",
+        subtitle="Configure one hostname per source. Click a status to review "
+        "errors or update credentials.",
         captcha_count=model["captcha_count"],
         show_user=model["show_user"],
     )
@@ -337,9 +432,11 @@ def build_categories_model(shared_state) -> dict[str, Any]:
                 # Own Newznab-ID pill first (matches Classic's
                 # `[f"{name} ({cat_id})"] + [...]`), so a default category
                 # with no inherited subcategories still surfaces its ID.
-                "category_pills": [f"{name} ({cat_id})"]
+                # Each pill keeps its own numeric cat_id alongside its label
+                # so the renderer can tone it by Newznab base type.
+                "category_pills": [(cat_id, f"{name} ({cat_id})")]
                 + [
-                    f"{sub_details['name']} ({sub_cat_id})"
+                    (sub_cat_id, f"{sub_details['name']} ({sub_cat_id})")
                     for sub_cat_id, sub_details in inherited_subcats
                 ],
             }
@@ -416,12 +513,22 @@ def _download_category_row_html(row: Mapping[str, Any]) -> str:
         "</div>"
         '<div class="cds-category-row__actions">'
         f"{delete_btn}"
-        '<button class="cds-btn cds-btn--secondary" type="button" '
+        '<button class="cds-btn cds-btn--ghost" type="button" '
         f'data-action="download-category-edit" data-category="{safe_name}" '
         f'data-mirrors="{mirrors_json}">Edit</button>'
         "</div>"
         "</div>"
     )
+
+
+# Tag tone by Newznab base type - first digit of the category id. A custom
+# category's synthetic id (>= 100000) always starts with a digit outside
+# this table, so it falls through to the same gray it always rendered.
+_SEARCH_CATEGORY_TAG_TONE = {"2": "blue", "5": "purple", "3": "teal", "7": "gray"}
+
+
+def _search_category_tag_tone(cat_id: Any) -> str:
+    return _SEARCH_CATEGORY_TAG_TONE.get(str(cat_id)[0], "gray")
 
 
 def _search_category_row_html(row: Mapping[str, Any], *, is_custom: bool) -> str:
@@ -430,13 +537,18 @@ def _search_category_row_html(row: Mapping[str, Any], *, is_custom: bool) -> str
     sources_json = _h(json.dumps(sources))
     safe_heading = _h(row["heading"])
 
-    pills = [row["custom_pill"]] if is_custom else (row.get("category_pills") or [])
+    pills = (
+        [(row["cat_id"], row["custom_pill"])]
+        if is_custom
+        else (row.get("category_pills") or [])
+    )
     pills_html = ""
     if pills:
         pills_html = (
             '<div class="cds-category-row__pills">'
             + "".join(
-                f'<span class="cds-tag cds-tag--gray">{_h(p)}</span>' for p in pills
+                tag(text, tone=_search_category_tag_tone(pill_cat_id))
+                for pill_cat_id, text in pills
             )
             + "</div>"
         )
@@ -458,7 +570,7 @@ def _search_category_row_html(row: Mapping[str, Any], *, is_custom: bool) -> str
         "</div>"
         '<div class="cds-category-row__actions">'
         f"{delete_btn}"
-        '<button class="cds-btn cds-btn--secondary" type="button" '
+        '<button class="cds-btn cds-btn--ghost" type="button" '
         f'data-action="search-category-edit" data-cat-id="{row["cat_id"]}" '
         f'data-name="{safe_heading}" '
         f'data-base-category="{row["base_source_category_id"]}" '
@@ -479,8 +591,9 @@ def _download_category_add_form(model: Mapping[str, Any]) -> str:
         '<input class="cds-field__input" id="download-category-new-name" type="text" '
         'placeholder="a-z, 0-9" pattern="[a-z0-9]+" autocomplete="off">'
         "</div>"
-        '<button class="cds-btn cds-btn--primary" type="button" '
-        'data-action="download-category-add">Add</button>'
+        '<button class="cds-btn cds-btn--tertiary" type="button" '
+        'data-action="download-category-add">'
+        f"{render_icon('add', class_name='cds-icon cds-icon--sm')}<span>Add</span></button>"
         "</div>"
     )
 
@@ -499,8 +612,10 @@ def _search_category_add_form(model: Mapping[str, Any]) -> str:
         "Base category type</label>"
         f'<select class="cds-field__select" id="search-category-new-base">{options}</select>'
         "</div>"
-        '<button class="cds-btn cds-btn--primary" type="button" '
-        'data-action="search-category-add">Add custom category</button>'
+        '<button class="cds-btn cds-btn--tertiary" type="button" '
+        'data-action="search-category-add">'
+        f"{render_icon('add', class_name='cds-icon cds-icon--sm')}"
+        "<span>Add custom category</span></button>"
         "</div>"
     )
 
@@ -530,13 +645,22 @@ def render_categories(shared_state) -> str:
             f'data-all-hosters="{hosters_json}" data-tier1-hosters="{tier1_json}"></span>',
             '<span id="categories-source-data" hidden '
             f'data-hostnames="{hostnames_json}" data-supported="{supported_json}"></span>',
-            tile(
-                download_rows_html + _download_category_add_form(model),
-                heading="Download categories",
-            ),
-            tile(
-                search_rows_html + _search_category_add_form(model),
-                heading="Search categories",
+            grid(
+                [
+                    tile(
+                        download_rows_html + _download_category_add_form(model),
+                        heading="Download categories",
+                        help_text="Used to organize downloads in JDownloader. "
+                        "Mirror whitelists apply to the download client.",
+                    ),
+                    tile(
+                        search_rows_html + _search_category_add_form(model),
+                        heading="Search categories",
+                        help_text="Hostname whitelists for Newznab search "
+                        "categories used by the indexer.",
+                    ),
+                ],
+                "2",
             ),
         ]
     )
@@ -545,7 +669,7 @@ def render_categories(shared_state) -> str:
         "categories",
         content,
         title="Categories",
-        eyebrow="Configuration",
+        eyebrow="Organization",
         subtitle="Manage download categories, mirror priority, and search-source whitelists",
         captcha_count=model["captcha_count"],
         show_user=model["show_user"],

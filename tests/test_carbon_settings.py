@@ -235,19 +235,142 @@ class CarbonSettingsRenderTests(unittest.TestCase):
         for heading in (
             "Appearance",
             "JDownloader",
-            "API &amp; Timeouts",
-            "Link Protection",
+            "API &amp; timeouts",
+            "Link protection",
             "FlareSolverr",
             "Notifications",
-            "*arr",
+            "*arr clients",
         ):
             with self.subTest(heading=heading):
                 self.assertIn(heading, html)
 
-    def test_appearance_theme_select_present(self):
+    def test_settings_grid_and_single_primary_per_tile(self):
+        """The target design lays every section out in one auto-fit tile
+        grid and allows at most one filled primary action per tile; the
+        equal-weight `--secondary` fill is not part of the Settings button
+        vocabulary at all (Verify credentials / Send test / Regenerate are
+        `--tertiary`, destructive actions are `--danger-ghost`).
+        """
         html, _model = self._render()
-        self.assertIn('id="settings-theme"', html)
-        self.assertIn('data-action="theme-select"', html)
+        self.assertIn('<div class="cds-grid--settings">', html)
+        sections = re.findall(
+            r'<section class="cds-tile[^"]*">.*?</section>', html, flags=re.S
+        )
+        self.assertGreaterEqual(len(sections), 7)
+        for section in sections:
+            self.assertLessEqual(section.count("cds-btn--primary"), 1, section[:120])
+        self.assertNotIn("cds-btn--secondary", html)
+
+    def test_appearance_has_theme_switcher_and_classic_link(self):
+        html, _model = self._render()
+        self.assertIn(
+            '<fieldset class="cds-switcher" data-action="theme-switch">', html
+        )
+        for value in ("light", "dark", "system"):
+            with self.subTest(theme=value):
+                self.assertIn(f'<input type="radio" name="theme" value="{value}"', html)
+        # The server cannot know the visitor's localStorage preference, so
+        # it always ships "System" pre-selected and carbon.js corrects the
+        # selection on DOMContentLoaded.
+        self.assertIn('<input type="radio" name="theme" value="system" checked>', html)
+        self.assertIn(
+            'class="cds-btn cds-btn--tertiary" href="/ui/classic">Open Classic UI',
+            html,
+        )
+        self.assertNotIn('data-action="theme-select"', html)
+        self.assertNotIn('id="settings-theme"', html)
+
+    def test_timeouts_use_standard_toggles_with_current_value(self):
+        """Timeouts save on change now, so the tile has no Save button and
+        each row states the timeout currently in force.
+        """
+        html, _model = self._render()
+        self.assertNotIn("Save Timeout Settings", html)
+        self.assertNotIn('data-action="timeouts-save"', html)
+        self.assertIn("Current: ", html)
+        timeouts = html[
+            html.index("API &amp; timeouts") : html.index("Link protection")
+        ]
+        self.assertNotIn("cds-toggle--compact", timeouts)
+        # search is the one enabled slow-mode key in the fixture model.
+        self.assertIn("Current: 45 s (slow)", timeouts)
+        self.assertIn("Current: 30 s (normal)", timeouts)
+        # The two help strings for a row are rendered as data attributes so
+        # carbon.js can swap them on change without re-deriving seconds.
+        self.assertIn('data-timeout-help-normal="Current: 15 s (normal)"', timeouts)
+        self.assertIn('data-timeout-help-slow="Current: 45 s (slow)"', timeouts)
+
+    def test_api_key_uses_the_dashboard_field_row_with_reveal_and_copy(self):
+        html, _model = self._render()
+        self.assertIn(
+            '<input class="cds-field-row__input" id="settings-api-key" '
+            'type="password" value="test-api-key-value" readonly>',
+            html,
+        )
+        # Both rows say what they are; the key row's label is a real
+        # <label for>, which is also the readonly input's accessible name.
+        self.assertIn('<span class="cds-field-row__label">URL</span>', html)
+        self.assertIn(
+            '<label class="cds-field-row__label" for="settings-api-key">'
+            "API key</label>",
+            html,
+        )
+        self.assertIn('data-reveal-target="settings-api-key"', html)
+        self.assertIn('data-copy-target="settings-api-key"', html)
+        self.assertIn(
+            '<button class="cds-btn cds-btn--tertiary" type="button" '
+            'data-action="regenerate-api-key">Regenerate API key</button>',
+            html,
+        )
+
+    def test_flaresolverr_has_its_own_tile(self):
+        html, _model = self._render()
+        self.assertIn('<h2 class="cds-tile__heading">FlareSolverr</h2>', html)
+        self.assertIn('<h2 class="cds-tile__heading">Link protection</h2>', html)
+
+    def test_jdownloader_head_row_status_and_always_visible_instance(self):
+        html, _model = self._render()
+        self.assertIn(
+            '<div class="cds-tile__head-row">'
+            '<h2 class="cds-tile__heading">JDownloader</h2>',
+            html,
+        )
+        self.assertIn('<span class="cds-status cds-status--success">', html)
+        # The instance select is no longer hidden behind a verify step: the
+        # stored device is offered as the current option straight away.
+        self.assertNotIn('id="settings-jd-device-section"', html)
+        self.assertIn(
+            '<select class="cds-field__select" id="settings-jd-device" '
+            'data-current="MyJD"><option value="MyJD" selected>MyJD</option></select>',
+            html,
+        )
+        self.assertIn(
+            '<button class="cds-btn cds-btn--primary" type="button" '
+            'data-action="jd-save">Save</button>',
+            html,
+        )
+        self.assertIn(
+            '<button class="cds-btn cds-btn--tertiary" type="button" '
+            'data-action="jd-verify">Verify credentials</button>',
+            html,
+        )
+
+    def test_jdownloader_instance_placeholder_when_no_device_stored(self):
+        html, _model = self._render(
+            jdownloader={
+                "connected": False,
+                "user": "",
+                "password": "",
+                "device": "",
+            }
+        )
+        self.assertIn(
+            '<select class="cds-field__select" id="settings-jd-device" '
+            'data-current=""><option value="">Verify credentials to list '
+            "instances</option></select>",
+            html,
+        )
+        self.assertIn('<span class="cds-status cds-status--error">', html)
 
     def test_link_protection_segmented_radio_b1(self):
         html, model = self._render()
@@ -262,6 +385,43 @@ class CarbonSettingsRenderTests(unittest.TestCase):
         self.assertNotRegex(
             html,
             r'id="settings-crypter-block-mode-defer" value="defer" checked',
+        )
+
+    def test_link_protection_block_mode_uses_the_shared_switcher(self):
+        """The B1 radio group keeps its name/id/value contract but is
+        styled by the same content switcher the theme row uses - there is
+        no second segmented-control vocabulary left on the page.
+        """
+        html, _model = self._render()
+        self.assertIn('<h3 class="cds-subheading">Linkcrypter access blocks</h3>', html)
+        self.assertIn(
+            '<fieldset class="cds-switcher"><legend class="cds-visually-hidden">'
+            "When a linkcrypter blocks Quasarr</legend>",
+            html,
+        )
+        self.assertEqual(html.count('class="cds-switcher__item"'), 5)
+        self.assertNotIn("cds-segmented", html)
+
+    def test_link_protection_has_one_save_for_both_endpoints(self):
+        """Filecrypt decryption and the linkcrypter block policy live in one
+        tile now, so they share one primary Save; carbon.js posts to both
+        existing endpoints in sequence (see
+        CarbonSettingsJsMergeBeforeSaveTests).
+        """
+        html, _model = self._render()
+        self.assertEqual(html.count('data-action="link-protection-save"'), 1)
+        self.assertNotIn('data-action="filecrypt-save"', html)
+        self.assertNotIn('data-action="crypter-block-save"', html)
+        self.assertIn('id="settings-link-protection-status"', html)
+        self.assertNotIn('id="settings-filecrypt-status"', html)
+        self.assertNotIn('id="settings-crypter-block-status"', html)
+
+    def test_link_protection_number_fields_sit_side_by_side(self):
+        html, _model = self._render()
+        self.assertIn(
+            '<div class="cds-grid--2"><div class="cds-field">'
+            '<label class="cds-field__label" for="settings-crypter-cooldown-hours">',
+            html,
         )
 
     def test_link_protection_sweep_source_tag(self):
@@ -355,26 +515,96 @@ class CarbonSettingsRenderTests(unittest.TestCase):
             html,
         )
 
-    def test_notifications_has_one_unified_save_and_per_provider_test(self):
+    def test_notifications_has_one_unified_save_and_one_send_test(self):
         """The section has exactly one Save (Classic's single-save
-        semantics restored) plus one Send Test per provider."""
+        semantics restored) and, in the target design, exactly one
+        tertiary Send test - carbon.js tests every provider whose
+        credentials are filled in, so neither provider becomes untestable.
+        """
         html, _model = self._render()
         self.assertEqual(html.count('data-action="notifications-save"'), 1)
         self.assertNotIn('data-action="notifications-save" data-provider', html)
-        self.assertEqual(html.count('data-action="notifications-test"'), 2)
-        self.assertIn('data-action="notifications-test" data-provider="discord"', html)
-        self.assertIn('data-action="notifications-test" data-provider="telegram"', html)
-        self.assertIn('id="settings-notifications-status"', html)
+        self.assertEqual(html.count('data-action="notifications-test"'), 1)
+        self.assertNotIn('data-action="notifications-test" data-provider', html)
+        self.assertIn(
+            '<button class="cds-btn cds-btn--tertiary" type="button" '
+            'data-action="notifications-test">Send test</button>',
+            html,
+        )
+        self.assertEqual(html.count('id="settings-notifications-status"'), 1)
+        self.assertNotIn('id="settings-notification-discord-status"', html)
+        self.assertNotIn('id="settings-notification-telegram-status"', html)
+
+    def test_notifications_telegram_is_collapsed_with_a_configured_count(self):
+        html, _model = self._render()
+        self.assertIn(
+            '<details class="cds-details"><summary>Telegram '
+            '<span class="cds-tile__count">(configured)</span></summary>',
+            html,
+        )
+        html_empty, _model = self._render(
+            notifications={
+                "settings": {
+                    "discord_webhook": "",
+                    "telegram_bot_token": "",
+                    "telegram_chat_id": "",
+                    "toggles": {"discord": {}, "telegram": {}},
+                    "silent": {"discord": {}, "telegram": {}},
+                },
+                "cases": [
+                    ("captcha", "CAPTCHA Required"),
+                    ("solved", "CAPTCHA Solved"),
+                ],
+            }
+        )
+        self.assertIn(
+            '<details class="cds-details"><summary>Telegram '
+            '<span class="cds-tile__count">(not configured)</span></summary>',
+            html_empty,
+        )
+
+    def test_notifications_cases_render_as_a_compact_matrix(self):
+        html, _model = self._render()
+        self.assertEqual(html.count('<div class="cds-matrix__head">'), 2)
+        self.assertIn(
+            '<div class="cds-matrix__head"><span>Event</span>'
+            "<span>Enabled</span><span>Silent</span></div>",
+            html,
+        )
+        # Two providers x two cases.
+        self.assertEqual(html.count('<div class="cds-matrix__row">'), 4)
+        # Matrix switches stay compact (design 2.4); every other Settings
+        # toggle is standard size.
+        self.assertEqual(html.count("cds-toggle--compact"), 9)
 
     def test_arr_service_cards_present(self):
         html, _model = self._render()
         self.assertIn('id="settings-radarr-url"', html)
         self.assertIn('id="settings-radarr-api-key"', html)
-        self.assertIn('data-action="radarr-save"', html)
-        self.assertIn('data-action="radarr-clear"', html)
         self.assertIn('id="settings-sonarr-url"', html)
-        self.assertIn('data-action="sonarr-save"', html)
-        self.assertIn('data-action="sonarr-clear"', html)
+        self.assertIn('id="settings-sonarr-api-key"', html)
+        # One Save for the tile; clearing stays per service so a single
+        # client can still be removed (a blank field alone cannot clear a
+        # stored API key - saveArrSettings() falls back to it on purpose).
+        self.assertEqual(html.count('data-action="arr-save"'), 1)
+        self.assertNotIn('data-action="radarr-save"', html)
+        self.assertNotIn('data-action="sonarr-save"', html)
+        # Clear is destructive and wipes a configured client immediately,
+        # so the button only opens a confirmation modal - it never fires
+        # the clearing request straight off the click.
+        self.assertIn(
+            '<button class="cds-btn cds-btn--danger-ghost" type="button" '
+            'data-action="radarr-clear-open">Clear</button>',
+            html,
+        )
+        self.assertIn(
+            '<button class="cds-btn cds-btn--danger-ghost" type="button" '
+            'data-action="sonarr-clear-open">Clear</button>',
+            html,
+        )
+        self.assertEqual(html.count('id="settings-arr-status"'), 1)
+        self.assertNotIn('id="settings-radarr-status"', html)
+        self.assertNotIn('id="settings-sonarr-status"', html)
 
     def test_flaresolverr_skip_warning_when_skipped(self):
         html, _model = self._render(flaresolverr={"url": "", "skipped": True})
@@ -594,11 +824,47 @@ class CarbonSettingsJsMergeBeforeSaveTests(unittest.TestCase):
         )
 
     def test_test_button_saves_via_unified_save(self):
-        """Per-provider Send Test still saves-then-tests, now through the
-        one unified save action instead of a removed per-provider save."""
-        body = self._function_body("testNotificationProvider")
+        """Send test still saves-then-tests through the one unified save
+        action instead of a removed per-provider save. With a single
+        button, every provider whose credentials are filled in is tested,
+        so dropping the second button removes no reachable behavior.
+        """
+        body = self._function_body("testConfiguredNotificationProviders")
         self.assertIn("saveNotifications()", body)
         self.assertNotIn("saveNotificationProvider(", body)
+        self.assertIn("configuredNotificationProviders()", body)
+        self.assertIn("settings-notifications-status", body)
+        # saveNotifications() writes the real reason into the same status
+        # line; overwriting it with a generic sentence would throw away the
+        # only clue the user has.
+        self.assertNotIn("Save failed. Fix settings and retry.", self.js)
+        self.assertIn(
+            "'/api/notifications/test'",
+            self._function_body("testNotificationProvider"),
+        )
+
+    def test_configured_providers_are_derived_from_the_rendered_fields(self):
+        body = self._function_body("configuredNotificationProviders")
+        self.assertIn("readFieldValue('settings-notification-discord-webhook')", body)
+        self.assertIn("readFieldValue('settings-notification-telegram-token')", body)
+        self.assertIn("readFieldValue('settings-notification-telegram-chat-id')", body)
+
+    def test_send_test_reports_every_provider_outcome_separately(self):
+        """A failure of the first provider must neither hide itself nor
+        stop the second provider from being tested: every outcome is
+        collected into one list and rendered as one combined status line.
+        """
+        body = self._function_body("testConfiguredNotificationProviders")
+        self.assertIn("var results = [];", body)
+        self.assertIn("for (var index = 0; index < providers.length; index += 1)", body)
+        self.assertIn("results.push({", body)
+        self.assertIn("await testNotificationProvider(providers[index].id)", body)
+        self.assertIn("combineResults(results, 'Test message sent', 'sent')", body)
+        # Per-provider failures resolve instead of throwing, so one bad
+        # provider can never abort the loop before the other is tested.
+        provider_body = self._function_body("testNotificationProvider")
+        self.assertIn("return { ok: true", provider_body)
+        self.assertIn("return { ok: false", provider_body)
 
     def test_toggle_merge_preserves_unknown_case_keys(self):
         body = self._function_body("mergedCaseMap")
@@ -621,6 +887,42 @@ class CarbonSettingsJsMergeBeforeSaveTests(unittest.TestCase):
         self.assertIn("url: '',", body)
         self.assertIn("api_key: ''", body)
 
+    def test_arr_clear_button_opens_confirmation_modal_before_clearing(self):
+        """Clear wipes a configured client immediately once confirmed, so
+        the button must never reach clearArrSettings() directly from a
+        click - matching the confirm-then-act anatomy "Restart Quasarr"
+        and "Delete package" already use elsewhere in this UI.
+        """
+        dispatch_body = self._function_body("onSettingsDashboardClick")
+        self.assertIn("case 'radarr-clear-open':", dispatch_body)
+        self.assertIn("case 'sonarr-clear-open':", dispatch_body)
+        open_index = dispatch_body.index("case 'radarr-clear-open':")
+        self.assertLess(
+            open_index,
+            dispatch_body.index("openArrClearModal('radarr')", open_index),
+        )
+
+        confirm_index = dispatch_body.index("case 'radarr-clear-confirm':")
+        close_index = dispatch_body.index("window.closeModal();", confirm_index)
+        clear_index = dispatch_body.index("clearArrSettings('radarr')", confirm_index)
+        self.assertLess(confirm_index, close_index)
+        self.assertLess(close_index, clear_index)
+
+    def test_arr_clear_modal_matches_confirm_anatomy(self):
+        """Eyebrow present, secondary Cancel on the left, danger Clear on
+        the right - the same shape as openRestartModal()'s Cancel/Restart
+        footer.
+        """
+        body = self._function_body("openArrClearModal")
+        self.assertIn("eyebrow: '*arr clients'", body)
+        cancel_index = body.index(
+            '<button class="cds-btn cds-btn--secondary" type="button" data-action="modal-close">Cancel</button>'
+        )
+        danger_index = body.index('cds-btn cds-btn--danger"', cancel_index)
+        self.assertLess(cancel_index, danger_index)
+        self.assertIn('-clear-confirm">Clear</button>', body)
+        self.assertIn("This cannot be undone.", body)
+
     def test_flaresolverr_save_has_no_merge_blank_is_intentional_clear(self):
         body = self._function_body("saveFlareSolverrSettings")
         self.assertNotIn("fetchJsonSettings", body)
@@ -631,6 +933,128 @@ class CarbonSettingsJsMergeBeforeSaveTests(unittest.TestCase):
         assign_index = body.index("Object.assign({}, base)")
         overlay_index = body.index("timeoutSlowModeKeys().forEach")
         self.assertLess(assign_index, overlay_index)
+
+    def test_timeouts_save_on_change_and_have_no_save_action_left(self):
+        """The Save button is gone, so the change handler is the only thing
+        that can still persist a timeout toggle - it must call the very
+        same saveTimeoutSettings() the button used to call, and refresh the
+        row's "Current: n s" helper text from the server-rendered strings.
+        """
+        body = self._function_body("onSettingsDashboardChange")
+        self.assertIn("settings-timeout-", body)
+        self.assertIn("saveTimeoutSettings(previousSettings);", body)
+        self.assertIn("updateTimeoutHelpText(", body)
+        self.assertNotIn("case 'timeouts-save':", self.js)
+
+        help_body = self._function_body("updateTimeoutHelpText")
+        self.assertIn("data-timeout-help-slow", help_body)
+        self.assertIn("data-timeout-help-normal", help_body)
+
+    def test_failed_timeout_save_restores_the_stored_value_in_the_ui(self):
+        """Autosave has no Save button, so the switch itself is the state
+        indicator: after a failed POST it must not keep showing a value the
+        server never stored (which would silently revert on the next page
+        load). saveTimeoutSettings() re-syncs the controls from an
+        authoritative settings object on BOTH paths, exactly the way its
+        two siblings re-sync theirs from the response.
+        """
+        body = self._function_body("saveTimeoutSettings")
+        success_index = body.index("applyTimeoutSettings(result.data.settings")
+        catch_index = body.index("catch (error)")
+        self.assertLess(success_index, catch_index)
+
+        failure_branch = body[catch_index:]
+        # The freshly fetched stored settings when the GET got through,
+        # otherwise the pre-flip state the change handler captured - never
+        # a bare status message with the lying switch left alone.
+        self.assertIn(
+            "applyTimeoutSettings(stored || previousSettings || {});", failure_branch
+        )
+        self.assertLess(
+            failure_branch.index("applyTimeoutSettings("),
+            failure_branch.index("setFieldStatus("),
+        )
+
+        apply_body = self._function_body("applyTimeoutSettings")
+        self.assertIn("input.checked = !!settings[key];", apply_body)
+        self.assertIn(
+            "input.setAttribute('aria-checked', String(input.checked));", apply_body
+        )
+        self.assertIn("updateTimeoutHelpText(input);", apply_body)
+
+    def test_change_handler_captures_the_pre_flip_state_for_the_revert(self):
+        """The browser flips the checkbox before the change event fires, so
+        the only place that still knows the previous state is the handler.
+        Without this capture a total outage (GET and POST both failing)
+        would leave the switch stuck on the value the user clicked.
+        """
+        body = self._function_body("onSettingsDashboardChange")
+        self.assertIn("var previousSettings = {};", body)
+        self.assertIn(
+            "previousSettings[target.id.replace('settings-timeout-', '')] = "
+            "!target.checked;",
+            body,
+        )
+
+    def test_sequential_saves_report_each_outcome_without_swallowing_one(self):
+        """Two tiles now save through two existing endpoints behind one
+        button. Neither orchestrator may stop at the first failure, and the
+        combined status line must name what failed AND what still saved -
+        a bare "Save failed" would hide a half-applied change.
+        """
+        combine = self._function_body("combineResults")
+        self.assertIn("return successMessage;", combine)
+        self.assertIn("part.label", combine)
+        self.assertIn("part.result.message", combine)
+        self.assertIn("saved.join(", combine)
+        self.assertIn("doneLabel", combine)
+
+        for name, first, second in (
+            (
+                "saveLinkProtectionSettings",
+                "saveFilecryptSetting()",
+                "saveCrypterBlockSettings()",
+            ),
+            (
+                "saveAllArrSettings",
+                "saveArrSettings('radarr')",
+                "saveArrSettings('sonarr')",
+            ),
+        ):
+            with self.subTest(orchestrator=name):
+                body = self._function_body(name)
+                self.assertLess(body.index(first), body.index(second))
+                # Both calls are awaited unconditionally, before any status
+                # is written - no early return between them.
+                between = body[body.index(first) : body.index(second)]
+                self.assertNotIn("return", between)
+                self.assertIn("combineResults(", body)
+
+    def test_partial_save_helpers_return_a_result_instead_of_throwing(self):
+        """The three functions the two orchestrators drive must resolve to
+        {ok, message} for both outcomes; if one still threw, the second
+        save would never run.
+        """
+        for name in (
+            "saveFilecryptSetting",
+            "saveCrypterBlockSettings",
+            "saveArrSettings",
+        ):
+            with self.subTest(function=name):
+                body = self._function_body(name)
+                self.assertIn("return { ok: true", body)
+                self.assertIn("return { ok: false", body)
+                self.assertIn("catch (error)", body)
+
+    def test_arr_clear_and_link_protection_write_to_the_shared_status_line(self):
+        self.assertIn("'settings-arr-status'", self._function_body("clearArrSettings"))
+        self.assertIn(
+            "'settings-link-protection-status'",
+            self._function_body("saveLinkProtectionSettings"),
+        )
+        self.assertNotIn("settings-radarr-status", self.js)
+        self.assertNotIn("settings-crypter-block-status", self.js)
+        self.assertNotIn("settings-filecrypt-status", self.js)
 
     def test_timeout_slow_mode_keys_selector_is_scoped_to_inputs_only(self):
         """A bare `[id^="settings-timeout-"]` attribute selector would also
@@ -657,13 +1081,28 @@ class CarbonSettingsJsMergeBeforeSaveTests(unittest.TestCase):
 
 
 class CarbonSettingsCssContractTests(unittest.TestCase):
-    def test_segmented_control_and_toggle_row_styles_present(self):
+    def test_switcher_matrix_and_details_styles_present(self):
         css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
-        self.assertIn(".cds-segmented", css)
-        self.assertIn(".cds-segmented__input:checked + .cds-segmented__label", css)
-        self.assertIn(".cds-toggle-row", css)
+        self.assertIn(".cds-switcher", css)
+        self.assertIn(".cds-switcher__item input:checked + span", css)
+        self.assertIn(".cds-visually-hidden", css)
+        self.assertIn(".cds-matrix__head", css)
+        self.assertIn(".cds-matrix__row", css)
+        self.assertIn(".cds-details", css)
+        self.assertIn(".cds-field-row__label", css)
         self.assertNotIn("http://", css)
         self.assertNotIn("https://", css)
+
+    def test_rules_left_with_their_last_consumer(self):
+        # Two blocks lost their last renderer in the same change and are
+        # therefore dead weight rather than merely unused: `.cds-segmented`
+        # (Link Protection's B1 radio group, which now renders through the
+        # shared `.cds-switcher`) and `.cds-toggle-row` (the notification
+        # case rows, which now render as `.cds-matrix__row`). Both go, on
+        # the same rule as the earlier `.cds-checkbox-field` removal.
+        css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
+        self.assertNotIn(".cds-segmented", css)
+        self.assertNotIn(".cds-toggle-row", css)
 
     def test_raw_checkbox_field_style_was_removed_with_the_last_consumer(self):
         # Every boolean Settings control moved to the accessible toggle()

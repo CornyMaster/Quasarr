@@ -51,6 +51,16 @@ class IconSpec:
 # SHA-256: 5ef42a6b8f7d8c23fb9ee12d8165edb486475cd2d9c5ca7b75633cc5fe1fb22b
 # Source: https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/arrow--down.svg
 # SHA-256: 1f5817e9a2aa65dd4fefb31775e9e0cf5470f7fa51d9c90e0605505a0117ffaf
+# Source: https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/copy.svg
+# SHA-256: a38a2f8e68e87e321007205b619b997bfeb3e79a4612111c425238eec6a34c2f
+# Source: https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/view.svg
+# SHA-256: ebf55eed049820b21d476745243be3e2e79cc1f19406ae4abceaaaed1a0687af
+# Source: https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/launch.svg
+# SHA-256: 6cc1901350bb9c0e3ba1a7bdc5cb28be4a21ab5e570d91096e676ae09d77ce2b
+# Source: https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/search.svg
+# SHA-256: b502bc849256c4061ddbbb0515c111ceb0e69b2995ca994d97cd7c4a644ec7f1
+# Source: https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/add.svg
+# SHA-256: 8ba30cb11466f8ac3f0594c93c5000265a77bb3d113438344e0ffff66975c839
 ICONS: dict[str, IconSpec] = {
     "home": IconSpec(
         name="home",
@@ -170,6 +180,41 @@ ICONS: dict[str, IconSpec] = {
         shapes="<polygon points='24.59 16.59 17 24.17 17 4 15 4 15 24.17 7.41 16.59 6 18 16 28 26 18 24.59 16.59' />",
         source_url="https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/arrow--down.svg",
         sha256="1f5817e9a2aa65dd4fefb31775e9e0cf5470f7fa51d9c90e0605505a0117ffaf",
+    ),
+    "copy": IconSpec(
+        name="copy",
+        view_box="0 0 32 32",
+        shapes="<path d='M28,10V28H10V10H28m0-2H10a2,2,0,0,0-2,2V28a2,2,0,0,0,2,2H28a2,2,0,0,0,2-2V10a2,2,0,0,0-2-2Z'/><path d='M4,18H2V4A2,2,0,0,1,4,2H18V4H4Z'/>",
+        source_url="https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/copy.svg",
+        sha256="a38a2f8e68e87e321007205b619b997bfeb3e79a4612111c425238eec6a34c2f",
+    ),
+    "view": IconSpec(
+        name="view",
+        view_box="0 0 32 32",
+        shapes="<path d='M30.94,15.66A16.69,16.69,0,0,0,16,5,16.69,16.69,0,0,0,1.06,15.66a1,1,0,0,0,0,.68A16.69,16.69,0,0,0,16,27,16.69,16.69,0,0,0,30.94,16.34,1,1,0,0,0,30.94,15.66ZM16,25c-5.3,0-10.9-3.93-12.93-9C5.1,10.93,10.7,7,16,7s10.9,3.93,12.93,9C26.9,21.07,21.3,25,16,25Z'/><path d='M16,10a6,6,0,1,0,6,6A6,6,0,0,0,16,10Zm0,10a4,4,0,1,1,4-4A4,4,0,0,1,16,20Z'/>",
+        source_url="https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/view.svg",
+        sha256="ebf55eed049820b21d476745243be3e2e79cc1f19406ae4abceaaaed1a0687af",
+    ),
+    "launch": IconSpec(
+        name="launch",
+        view_box="0 0 32 32",
+        shapes="<path d='M26,28H6a2.0027,2.0027,0,0,1-2-2V6A2.0027,2.0027,0,0,1,6,4H16V6H6V26H26V16h2V26A2.0027,2.0027,0,0,1,26,28Z'/><polygon points='20 2 20 4 26.586 4 18 12.586 19.414 14 28 5.414 28 12 30 12 30 2 20 2'/>",
+        source_url="https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/launch.svg",
+        sha256="6cc1901350bb9c0e3ba1a7bdc5cb28be4a21ab5e570d91096e676ae09d77ce2b",
+    ),
+    "search": IconSpec(
+        name="search",
+        view_box="0 0 32 32",
+        shapes="<path d='M29,27.5859l-7.5521-7.5521a11.0177,11.0177,0,1,0-1.4141,1.4141L27.5859,29ZM4,13a9,9,0,1,1,9,9A9.01,9.01,0,0,1,4,13Z'/>",
+        source_url="https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/search.svg",
+        sha256="b502bc849256c4061ddbbb0515c111ceb0e69b2995ca994d97cd7c4a644ec7f1",
+    ),
+    "add": IconSpec(
+        name="add",
+        view_box="0 0 32 32",
+        shapes="<polygon points='17,15 17,8 15,8 15,15 8,15 8,17 15,17 15,24 17,24 17,17 24,17 24,15 '/>",
+        source_url="https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/add.svg",
+        sha256="8ba30cb11466f8ac3f0594c93c5000265a77bb3d113438344e0ffff66975c839",
     ),
 }
 

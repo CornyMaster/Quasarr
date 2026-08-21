@@ -419,19 +419,12 @@ def _downloads_delete_status_banner():
     return ""
 
 
-def _downloads_toolbar():
-    """Search input, slow-connection warning, and the delete-status banner -
-    all deliberately OUTSIDE `#downloads-content` (the subtree carbon.js
-    replaces on every poll), so a typed filter value and input focus survive
-    every refresh cycle.
+def _downloads_notices():
+    """The page-level notices above the tables: the slow-connection warning
+    carbon.js unhides when a poll takes too long, and the delete-status
+    banner echoing the `/packages/delete/<id>` redirect.
     """
     return (
-        '<div class="cds-toolbar">'
-        '<div class="cds-field cds-field--search">'
-        '<label class="cds-field__label" for="downloads-search">Filter by name</label>'
-        '<input class="cds-field__input" id="downloads-search" type="search" '
-        'placeholder="Filter packages by name" autocomplete="off">'
-        "</div></div>"
         '<div id="downloads-slow-warning" hidden>'
         + notification(
             "warning",
@@ -449,7 +442,8 @@ def _deferred_table_skeleton():
         '<div class="cds-section-header">'
         '<h2 class="cds-tile__heading">Deferred linkcrypter checks</h2>'
         '<div class="cds-bulk-toolbar" id="deferred-bulk-toolbar">'
-        '<button class="cds-btn cds-btn--secondary cds-btn--compact" type="button" '
+        '<span id="deferred-selection-count" class="cds-field__help">0 selected</span>'
+        '<button class="cds-btn cds-btn--tertiary cds-btn--compact" type="button" '
         'data-action="deferred-probe-selected" disabled title="Check selected packages now" '
         'aria-label="Check selected packages now">'
         f"{render_icon('renew', class_name='cds-icon cds-icon--sm')}"
@@ -459,7 +453,6 @@ def _deferred_table_skeleton():
         'aria-label="Remove selected pending packages">'
         f"{render_icon('trash-can', class_name='cds-icon cds-icon--sm')}"
         "<span>Remove selected</span></button>"
-        '<span id="deferred-selection-count" class="cds-field__help">0 selected</span>'
         "</div></div>"
         '<div id="deferred-action-status" class="cds-field__help" aria-live="polite"></div>'
         '<div class="cds-table-wrap">'
@@ -473,7 +466,7 @@ def _deferred_table_skeleton():
         '<th scope="col">Evidence</th>'
         '<th scope="col">Next check</th>'
         '<th scope="col">Sweep progress</th>'
-        '<th scope="col">Actions</th>'
+        '<th scope="col"></th>'
         "</tr></thead>"
         '<tbody id="deferred-table-body"></tbody>'
         "</table></div>"
@@ -482,22 +475,64 @@ def _deferred_table_skeleton():
     )
 
 
+def _queue_table_head():
+    """The Queue column order, shared by the Queue and Other-queue tables.
+
+    Both are populated by carbon.js's one `buildQueueRow()`, so their heads
+    have to stay identical. The first column is the status dot and the last
+    the row actions - both unlabelled, because a coloured dot and a trash
+    icon carry their own accessible names per row and a repeated column
+    title would only add noise.
+    """
+    return (
+        "<thead><tr>"
+        '<th scope="col"></th>'
+        '<th scope="col">Release</th>'
+        '<th scope="col">Category</th>'
+        '<th scope="col">Size</th>'
+        '<th scope="col">ETA</th>'
+        '<th scope="col">Progress</th>'
+        '<th scope="col"></th>'
+        "</tr></thead>"
+    )
+
+
+def _history_table_head():
+    """The History column order, shared by the History and Other-history
+    tables - both populated by carbon.js's one `buildHistoryRow()`.
+    """
+    return (
+        "<thead><tr>"
+        '<th scope="col">Status</th>'
+        '<th scope="col">Release</th>'
+        '<th scope="col">Category</th>'
+        '<th scope="col">Size</th>'
+        '<th scope="col"></th>'
+        "</tr></thead>"
+    )
+
+
 def _queue_table_skeleton():
+    """The Queue tile. Its head row carries the live count and the release
+    filter; `carbon.js` only ever swaps `<tbody>` rows, never this subtree,
+    so a typed filter value and the input's focus survive every poll.
+    """
     return (
         '<section class="cds-tile" id="downloads-queue-section" data-state="loading">'
-        '<h2 class="cds-tile__heading">Queue</h2>'
+        '<div class="cds-tile__head-row">'
+        '<h2 class="cds-tile__heading">Queue '
+        '<span class="cds-tile__count" id="queue-count">(0)</span></h2>'
+        '<div class="cds-field cds-field--search">'
+        '<label class="cds-field__label cds-visually-hidden" for="downloads-search">'
+        "Filter releases by name</label>"
+        '<input class="cds-field__input" id="downloads-search" type="search" '
+        'placeholder="Search releases" autocomplete="off">'
+        "</div>"
+        "</div>"
         '<div class="cds-table-wrap">'
         '<table class="cds-table" id="queue-table">'
         "<caption>Active downloads</caption>"
-        "<thead><tr>"
-        '<th scope="col">Release</th>'
-        '<th scope="col">Category</th>'
-        '<th scope="col">Status</th>'
-        '<th scope="col">Progress</th>'
-        '<th scope="col">ETA</th>'
-        '<th scope="col">Size</th>'
-        '<th scope="col">Actions</th>'
-        "</tr></thead>"
+        f"{_queue_table_head()}"
         '<tbody id="queue-table-body"></tbody>'
         "</table></div>"
         '<p id="queue-empty-message" class="cds-field__help">Loading queue…</p>'
@@ -512,13 +547,7 @@ def _history_table_skeleton():
         '<div class="cds-table-wrap">'
         '<table class="cds-table" id="history-table">'
         "<caption>Recent history</caption>"
-        "<thead><tr>"
-        '<th scope="col">Release</th>'
-        '<th scope="col">Category</th>'
-        '<th scope="col">Status</th>'
-        '<th scope="col">Size</th>'
-        '<th scope="col">Actions</th>'
-        "</tr></thead>"
+        f"{_history_table_head()}"
         '<tbody id="history-table-body"></tbody>'
         "</table></div>"
         '<p id="history-empty-message" class="cds-field__help">Loading history…</p>'
@@ -537,28 +566,14 @@ def _other_packages_skeleton():
         '<div class="cds-table-wrap">'
         '<table class="cds-table" id="other-queue-table">'
         "<caption>Other packages in progress</caption>"
-        "<thead><tr>"
-        '<th scope="col">Release</th>'
-        '<th scope="col">Category</th>'
-        '<th scope="col">Status</th>'
-        '<th scope="col">Progress</th>'
-        '<th scope="col">ETA</th>'
-        '<th scope="col">Size</th>'
-        '<th scope="col">Actions</th>'
-        "</tr></thead>"
+        f"{_queue_table_head()}"
         '<tbody id="other-queue-table-body"></tbody>'
         "</table></div>"
         '<h3 class="cds-tile__heading">Other history</h3>'
         '<div class="cds-table-wrap">'
         '<table class="cds-table" id="other-history-table">'
         "<caption>Other packages history</caption>"
-        "<thead><tr>"
-        '<th scope="col">Release</th>'
-        '<th scope="col">Category</th>'
-        '<th scope="col">Status</th>'
-        '<th scope="col">Size</th>'
-        '<th scope="col">Actions</th>'
-        "</tr></thead>"
+        f"{_history_table_head()}"
         '<tbody id="other-history-table-body"></tbody>'
         "</table></div>"
         "</div></details></section>"
@@ -589,16 +604,19 @@ def _downloads_noscript_notice() -> str:
 
 
 def render_downloads(shared_state) -> str:
-    """Carbon Downloads page (A1). Renders the search toolbar (outside the
-    refreshed subtree) plus a loading skeleton for the deferred/queue/history/
-    other-packages sections; `carbon.js` populates and refreshes all of them
-    from `GET /api/packages/list` every 5 seconds, exactly like the Dashboard
-    queue tile does for its own preview. A <noscript> notice fronts all of
-    that for a JS-disabled visitor, since none of it ever renders without JS.
+    """Carbon Downloads page (A1). Renders the page-level notices plus a
+    loading skeleton for the deferred/queue/history/other-packages sections;
+    `carbon.js` populates and refreshes all of them from
+    `GET /api/packages/list` every 5 seconds, exactly like the Dashboard
+    queue tile does for its own preview. The release filter lives in the
+    Queue tile's own head row - safe there because every refresh replaces
+    `<tbody>` rows only, never a whole tile. A <noscript> notice fronts all
+    of that for a JS-disabled visitor, since none of it ever renders without
+    JS.
     """
     content = (
         _downloads_noscript_notice()
-        + _downloads_toolbar()
+        + _downloads_notices()
         + '<div id="downloads-content" data-state="loading">'
         + _deferred_table_skeleton()
         + _queue_table_skeleton()

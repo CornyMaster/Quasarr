@@ -108,29 +108,44 @@ def get_jdownloader_disconnected_page(shared_state, back_url="/"):
         return render_centered_html(content)
 
     def carbon():
-        from html import escape
-
         from quasarr.providers.carbon_templates import (
+            notification,
             page_header,
             render_carbon_simple_page,
-            tag,
+            status,
             tile,
         )
 
-        status = get_jdownloader_status(shared_state)
-        tone = "green" if status["connected"] else "red"
-        text = "Connected" if status["connected"] else "Disconnected"
-        device_html = (
-            f"<p>{escape(status['device_name'], quote=True)}</p>"
-            if status["device_name"]
-            else ""
+        jd_status = get_jdownloader_status(shared_state)
+        tone = "success" if jd_status["connected"] else "error"
+        # device_name is "" when no device was ever configured - fall back
+        # to the same "JDownloader" label get_jdownloader_status() already
+        # uses for its own status_text, so the tile never shows a bare dot.
+        device_label = jd_status["device_name"] or "JDownloader"
+
+        status_html = f'<p class="cds-mono">{status(device_label, tone)}</p>'
+        error_notification = notification(
+            "error",
+            "JDownloader Disconnected",
+            "Quasarr cannot reach JDownloader right now. Reconnect the "
+            "device in Settings, or retry now if it just restarted.",
         )
-        safe_back_url = escape(back_url, quote=True)
-        back_btn = (
-            f'<a class="cds-btn cds-btn--primary" href="{safe_back_url}">Back</a>'
+        actions = (
+            '<div class="cds-captcha-actions">'
+            '<a class="cds-btn cds-btn--primary" href="/settings">'
+            "Open JDownloader settings</a>"
+            '<button type="button" class="cds-btn cds-btn--tertiary" '
+            'data-action="jd-retry">Retry now</button>'
+            "</div>"
         )
-        body = f"{tag(text, tone=tone)}{device_html}<p>{back_btn}</p>"
-        content = page_header("JDownloader", "Connection Required") + tile(body)
+        content = (
+            '<div class="cds-page--narrow">'
+            + page_header("JDownloader", "Connection required")
+            + error_notification
+            + tile(status_html)
+            + actions
+            + "</div>"
+        )
         return render_carbon_simple_page(content, title="JDownloader")
 
     from quasarr.providers.page_dispatch import render_page

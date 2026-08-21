@@ -58,7 +58,7 @@
 	--cds-button-secondary-hover: #4c4c4c;
 	--cds-danger-hover-bg: #fff1f1;
 	--cds-notification-info-bg: #edf5ff;
-	--cds-notification-warning-bg: #fff8e1;
+	--cds-notification-warning-bg: #fcf4d6;
 	--cds-notification-error-bg: #fff1f1;
 	--cds-notification-success-bg: #defbe6;
 
@@ -66,6 +66,9 @@
 	--cds-support-warning: #f1c21b;
 	--cds-support-error: #da1e28;
 	--cds-support-info: #0043ce;
+	--cds-warning-text: #b28600;
+
+	--cds-nav-selected: #e0e0e0;
 
 	--cds-tag-gray-bg: #e0e0e0;
 	--cds-tag-gray-text: #393939;
@@ -99,27 +102,30 @@
 	--cds-button-secondary: #393939;
 	--cds-button-secondary-hover: #4c4c4c;
 	--cds-danger-hover-bg: #520408;
-	--cds-notification-info-bg: #001d6c;
-	--cds-notification-warning-bg: #3d3a00;
-	--cds-notification-error-bg: #520408;
+	--cds-notification-info-bg: #1c2534;
+	--cds-notification-warning-bg: #302b17;
+	--cds-notification-error-bg: #331c1e;
 	--cds-notification-success-bg: #022d0d;
 
 	--cds-support-success: #42be65;
 	--cds-support-warning: #f1c21b;
 	--cds-support-error: #fa4d56;
 	--cds-support-info: #4589ff;
+	--cds-warning-text: #f1c21b;
 
-	--cds-tag-gray-bg: #393939;
-	--cds-tag-gray-text: #e0e0e0;
+	--cds-nav-selected: #393939;
+
+	--cds-tag-gray-bg: #525252;
+	--cds-tag-gray-text: #f4f4f4;
 	--cds-tag-blue-bg: #0043ce;
 	--cds-tag-blue-text: #d0e2ff;
-	--cds-tag-green-bg: #0e6027;
+	--cds-tag-green-bg: #044317;
 	--cds-tag-green-text: #a7f0ba;
-	--cds-tag-red-bg: #a2191f;
+	--cds-tag-red-bg: #750e13;
 	--cds-tag-red-text: #ffd7d9;
-	--cds-tag-purple-bg: #6929c4;
+	--cds-tag-purple-bg: #491d8b;
 	--cds-tag-purple-text: #e8daff;
-	--cds-tag-teal-bg: #005d5d;
+	--cds-tag-teal-bg: #004144;
 	--cds-tag-teal-text: #9ef0f0;
 }
 
@@ -200,17 +206,20 @@ a {
 	gap: 8px;
 }
 
-.cds-header__status {
-	font-size: 12px;
-}
-
-.cds-captcha-count strong {
-	font-family: "IBM Plex Mono", monospace;
+.cds-header__brand {
+	margin-right: auto;
+	color: #c6c6c6;
+	text-decoration: none;
 }
 
 .cds-product {
-	font-weight: 600;
+	font-weight: 400;
 	letter-spacing: 0.32px;
+}
+
+.cds-product strong {
+	font-weight: 600;
+	color: #f4f4f4;
 }
 
 .cds-icon {
@@ -257,19 +266,28 @@ a {
 }
 
 .cds-header__badge {
-	position: absolute;
-	top: 5px;
-	right: 4px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
 	min-width: 16px;
 	height: 16px;
 	padding: 0 4px;
 	border-radius: 8px;
-	background: #0f62fe;
+	background: #da1e28;
 	color: #ffffff;
-	font-family: "IBM Plex Mono", monospace;
+	font-family: inherit;
+	font-weight: 600;
 	font-size: 10px;
 	line-height: 16px;
 	text-align: center;
+}
+
+/* Overlaid on the header bell icon only - everywhere else (e.g. the
+   side-nav CAPTCHA link) the same badge sits inline in normal flow. */
+.cds-icon-button .cds-header__badge {
+	position: absolute;
+	top: 5px;
+	right: 4px;
 }
 
 .cds-nav {
@@ -298,18 +316,19 @@ a {
 .cds-nav__link {
 	display: flex;
 	align-items: center;
-	gap: 10px;
-	color: var(--cds-text);
+	gap: 12px;
+	color: var(--cds-text-secondary);
 	text-decoration: none;
-	min-height: 44px;
+	min-height: 32px;
 	padding: 0 16px;
 	border-left: 3px solid transparent;
 }
 
 .cds-nav__link[aria-current="page"] {
 	border-left-color: #0f62fe;
-	background: var(--cds-hover);
-	font-weight: 500;
+	background: var(--cds-nav-selected);
+	color: var(--cds-text);
+	font-weight: 600;
 }
 
 .cds-nav__footer {
@@ -330,6 +349,18 @@ a {
 	font-family: "IBM Plex Mono", monospace;
 }
 
+.cds-nav__link--footer {
+	padding: 0;
+	border-left: 0;
+}
+
+.cds-nav__version {
+	margin: 8px 0 0;
+	font-size: 12px;
+	letter-spacing: 0.32px;
+	color: var(--cds-helper);
+}
+
 .cds-main {
 	margin-left: 256px;
 	padding: 32px;
@@ -348,9 +379,8 @@ a {
 .cds-page-header__eyebrow {
 	font-size: 12px;
 	letter-spacing: 0.32px;
-	text-transform: uppercase;
 	margin: 0;
-	color: var(--cds-helper);
+	color: var(--cds-text-secondary);
 }
 
 .cds-page-header__title {
@@ -374,7 +404,7 @@ a {
 	border: 1px solid transparent;
 	border-radius: 0;
 	font: inherit;
-	font-weight: 500;
+	font-weight: 400;
 	text-align: left;
 	text-decoration: none;
 	cursor: pointer;
@@ -383,6 +413,7 @@ a {
 .cds-btn--primary {
 	background: var(--cds-button-primary);
 	color: #ffffff;
+	padding: 0 40px 0 16px;
 }
 
 .cds-btn--primary:hover {
@@ -427,6 +458,35 @@ a {
 	background: var(--cds-danger-hover-bg);
 }
 
+.cds-text-link {
+	background: none;
+	border: 0;
+	padding: 0;
+	margin: 0;
+	font: inherit;
+	color: var(--cds-link);
+	text-decoration: underline;
+	cursor: pointer;
+}
+
+.cds-text-link:hover {
+	color: var(--cds-interactive);
+}
+
+.cds-btn--cta {
+	min-height: 48px;
+	padding: 0 60px 0 16px;
+}
+
+.cds-btn--danger {
+	background: var(--cds-support-error);
+	color: #ffffff;
+}
+
+.cds-btn--danger:hover {
+	filter: brightness(0.92);
+}
+
 .cds-btn:disabled,
 .cds-btn[aria-disabled="true"] {
 	opacity: 0.5;
@@ -435,38 +495,181 @@ a {
 
 .cds-tile {
 	background: var(--cds-layer);
-	border: 1px solid var(--cds-border-subtle);
-	padding: 16px;
-	margin-top: 16px;
+	padding: 24px;
 }
 
 .cds-tile__heading {
-	margin: 0 0 12px;
+	margin: 0 0 4px;
 	font-size: 16px;
-	font-weight: 500;
+	font-weight: 600;
 }
 
-.cds-tile--is-compact {
-	padding: 12px;
+.cds-tile__help {
+	margin: 0 0 16px;
+	font-size: 12px;
+	color: var(--cds-helper);
+}
+
+.cds-tile__head-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 16px;
+	margin: 0 0 16px;
+}
+
+.cds-tile__head-row .cds-tile__heading {
+	margin: 0;
+}
+
+.cds-tile__head-row .cds-field {
+	margin-top: 0;
+	flex: 1 1 200px;
+}
+
+.cds-mono {
+	font-family: "IBM Plex Mono", monospace;
+}
+
+.cds-tile--is-compact,
+.cds-tile--is-status {
+	padding: 16px;
+}
+
+.cds-tile--is-status .cds-tile__heading {
+	margin: 0 0 12px;
+	font-size: 12px;
+	font-weight: 400;
+	letter-spacing: 0.32px;
+	text-transform: uppercase;
+	color: var(--cds-text-secondary);
 }
 
 .cds-tile--is-wide {
 	grid-column: 1 / -1;
 }
 
-.cds-tile--is-metric {
-	font-family: "IBM Plex Mono", monospace;
+.cds-tile--is-metric .cds-metric__value {
+	margin: 0;
+	font-size: 32px;
+	line-height: 40px;
+	font-weight: 400;
+}
+
+.cds-metric__sub {
+	margin: 6px 0 0;
+	font-size: 12px;
+	color: var(--cds-helper);
+}
+
+.cds-metric__sub--success {
+	color: var(--cds-support-success);
 }
 
 .cds-kpi-row {
 	display: grid;
 	grid-template-columns: repeat(4, minmax(0, 1fr));
-	gap: 16px;
-	margin-top: 16px;
+	gap: 1px;
+	margin-bottom: 24px;
 }
 
-.cds-kpi-row .cds-tile {
+.cds-grid--dashboard {
+	display: grid;
+	grid-template-columns: 1.4fr 1fr;
+	gap: 16px;
+	align-items: start;
+}
+
+.cds-grid--2 {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 16px;
+	align-items: start;
+}
+
+.cds-grid--3 {
+	display: grid;
+	grid-template-columns: repeat(3, minmax(0, 1fr));
+	gap: 16px;
+	align-items: start;
+}
+
+.cds-grid--settings {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+	gap: 16px;
+	align-items: start;
+}
+
+.cds-stack {
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+
+.cds-stack > .cds-tile + .cds-tile {
 	margin-top: 0;
+}
+
+.cds-status {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	color: var(--cds-text);
+}
+
+.cds-status__dot {
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+	flex-shrink: 0;
+	background: var(--cds-border-strong);
+}
+
+.cds-status--success .cds-status__dot { background: var(--cds-support-success); }
+.cds-status--warning .cds-status__dot { background: var(--cds-support-warning); }
+.cds-status--error .cds-status__dot { background: var(--cds-support-error); }
+.cds-status--info .cds-status__dot { background: var(--cds-support-info); }
+.cds-status--warning.cds-status--tinted { color: var(--cds-warning-text); }
+.cds-status--error.cds-status--tinted { color: var(--cds-support-error); }
+.cds-status--neutral.cds-status--tinted { color: var(--cds-helper); }
+
+.cds-status--strong {
+	font-size: 16px;
+	font-weight: 600;
+}
+
+.cds-status--link {
+	background: none;
+	border: 0;
+	padding: 0;
+	font: inherit;
+	cursor: pointer;
+	text-decoration: underline dotted;
+	text-underline-offset: 3px;
+}
+
+.cds-kv__row {
+	display: flex;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 8px 0;
+	border-top: 1px solid var(--cds-border-subtle);
+	font-size: 14px;
+}
+
+.cds-kv__label { color: var(--cds-text-secondary); }
+
+.cds-kv__value {
+	font-weight: 600;
+	font-family: "IBM Plex Mono", monospace;
+	font-size: 13px;
+}
+
+.cds-page--narrow {
+	max-width: 720px;
+	margin: 0 auto;
 }
 
 .cds-tag {
@@ -521,6 +724,39 @@ a {
 	color: var(--cds-helper);
 }
 
+.cds-meta {
+	margin: 12px 0 0;
+	font-size: 13px;
+	color: var(--cds-text-secondary);
+}
+
+.cds-field-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	height: 40px;
+	padding: 0 8px 0 16px;
+	background: var(--cds-field);
+	border-bottom: 1px solid var(--cds-border-strong);
+	margin-bottom: 16px;
+}
+
+.cds-field-row__label {
+	flex: 0 0 auto;
+	font-size: 12px;
+	color: var(--cds-text-secondary);
+}
+
+.cds-field-row__value,
+.cds-field-row__input {
+	flex: 1;
+	font-family: "IBM Plex Mono", monospace;
+	font-size: 12px;
+	background: transparent;
+	border: 0;
+	color: var(--cds-text);
+}
+
 .cds-toggle {
 	position: relative;
 	margin-top: 16px;
@@ -569,13 +805,13 @@ a {
 
 .cds-toggle__control::after {
 	content: "";
-	width: 20px;
-	height: 20px;
+	width: 18px;
+	height: 18px;
 	border-radius: 50%;
 	background: #ffffff;
 	position: absolute;
-	left: 2px;
-	top: 2px;
+	left: 3px;
+	top: 3px;
 }
 
 .cds-toggle--compact .cds-toggle__control::after {
@@ -600,21 +836,6 @@ a {
 	outline-offset: 2px;
 }
 
-/* Groups two or more related toggles on one row (e.g. a notification case's
-   "enabled" and "silent" switches) - each .cds-toggle's own top margin is
-   reset since the row wrapper already spaces itself from the field above. */
-.cds-toggle-row {
-	display: flex;
-	align-items: center;
-	flex-wrap: wrap;
-	gap: 16px;
-	margin-top: 12px;
-}
-
-.cds-toggle-row .cds-toggle {
-	margin-top: 0;
-}
-
 .cds-table-wrap {
 	overflow-x: auto;
 }
@@ -636,6 +857,10 @@ a {
 	height: 40px;
 	padding: 10px 12px;
 	text-align: left;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.32px;
+	text-transform: uppercase;
 }
 
 .cds-table tbody td {
@@ -720,16 +945,76 @@ a {
 	background: var(--cds-notification-success-bg);
 }
 
+.cds-notification--inline {
+	display: flex;
+	align-items: center;
+	gap: 16px;
+	margin: 0 0 24px;
+}
+
+.cds-notification--inline .cds-notification__message {
+	flex: 1;
+	margin: 0;
+}
+
 .cds-progress {
 	height: 4px;
 	width: 100%;
 	background: var(--cds-border-subtle);
 }
 
-.cds-progress > span {
-	display: block;
-	height: 4px;
-	background: var(--cds-interactive);
+.cds-progress--thick { height: 8px; }
+
+.cds-progress__fill { height: 100%; }
+
+.cds-progress__fill--interactive { background: var(--cds-interactive); }
+
+.cds-progress__fill--teal { background: var(--cds-tag-teal-text); }
+
+.cds-progress__fill--success { background: var(--cds-support-success); }
+
+.cds-progress__fill--warning { background: var(--cds-support-warning); }
+
+/* A bar with its value kept readable beside it - the shape a table cell
+   needs, where the Statistics page's stacked .cds-bar head row does not fit.
+   The label has a floor width so bars in adjacent rows still line up when
+   one row reads "7%" and the next "100%". */
+.cds-progress-cell {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	/* The bar's own flex basis is 0, so without a floor here the table's
+	   automatic layout would size the Progress column to its label alone
+	   and leave the bar a hairline. */
+	min-width: 140px;
+}
+
+.cds-progress-cell .cds-progress {
+	flex: 1;
+}
+
+.cds-progress-cell__label {
+	font-size: 12px;
+	color: var(--cds-text-secondary);
+	min-width: 34px;
+	text-align: right;
+}
+
+.cds-bar { margin-bottom: 20px; }
+
+.cds-bar__head {
+	display: flex;
+	justify-content: space-between;
+	font-size: 14px;
+	margin-bottom: 8px;
+}
+
+.cds-bar__head span { color: var(--cds-text-secondary); }
+
+.cds-bar__help {
+	margin: 6px 0 0;
+	font-size: 12px;
+	color: var(--cds-helper);
 }
 
 .cds-dot {
@@ -739,88 +1024,35 @@ a {
 	display: inline-block;
 }
 
-.cds-segmented {
-	border: 0;
-	margin: 16px 0 0;
-	padding: 0;
-}
-
-.cds-segmented__legend {
-	display: block;
-	font-size: 12px;
-	letter-spacing: 0.32px;
-	margin-bottom: 8px;
-	padding: 0;
-	color: var(--cds-helper);
-}
-
-.cds-segmented__group {
-	display: inline-flex;
-	border: 1px solid var(--cds-border-strong);
-	max-width: 100%;
-	flex-wrap: wrap;
-}
-
-.cds-segmented__option {
-	position: relative;
-}
-
-.cds-segmented__input {
-	position: absolute;
-	width: 1px;
-	height: 1px;
-	margin: -1px;
-	clip: rect(0 0 0 0);
-	clip-path: inset(50%);
-	overflow: hidden;
-	opacity: 0;
-}
-
-.cds-segmented__label {
-	display: flex;
-	align-items: center;
-	min-height: 40px;
-	padding: 0 16px;
-	cursor: pointer;
-	border-right: 1px solid var(--cds-border-strong);
-}
-
-.cds-segmented__option:last-child .cds-segmented__label {
-	border-right: 0;
-}
-
-.cds-segmented__input:checked + .cds-segmented__label {
-	background: var(--cds-button-primary);
-	color: #ffffff;
-}
-
-.cds-segmented__input:focus-visible + .cds-segmented__label {
-	outline: 2px solid #0f62fe;
-	outline-offset: -2px;
-}
-
 .cds-queue-preview {
 	list-style: none;
 	margin: 0;
 	padding: 0;
 }
 
-.cds-queue-preview li {
-	display: flex;
-	flex-direction: column;
-	gap: 2px;
-	padding: 8px 0;
+/* Release name on the left, its state or percentage on the right, and the
+   progress bar spanning both underneath. */
+.cds-queue-preview__row {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: baseline;
+	gap: 4px 12px;
+	padding: 12px 0;
 	border-top: 1px solid var(--cds-border-subtle);
 }
 
-.cds-queue-preview li:first-child {
+.cds-queue-preview__row:first-child {
 	border-top: 0;
 }
 
+.cds-queue-preview__row .cds-progress-cell {
+	grid-column: 1 / -1;
+}
+
 .cds-queue-preview__meta {
-	color: var(--cds-helper);
-	font-family: "IBM Plex Mono", monospace;
 	font-size: 12px;
+	color: var(--cds-text-secondary);
+	white-space: nowrap;
 }
 
 .cds-modal {
@@ -838,7 +1070,7 @@ a {
 }
 
 .cds-modal__surface {
-	width: min(720px, calc(100vw - 32px));
+	width: min(480px, calc(100vw - 32px));
 	/* calc(100vh - 32px) is the fallback for browsers without dvh support;
 	   the dvh line below overrides it where supported so a mobile
 	   browser's dynamic address-bar/toolbar chrome (which vh does not
@@ -846,18 +1078,47 @@ a {
 	max-height: calc(100vh - 32px);
 	max-height: calc(100dvh - 32px);
 	background: var(--cds-layer);
-	border: 1px solid var(--cds-border-subtle);
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 	display: flex;
 	flex-direction: column;
 }
 
-.cds-modal__header,
-.cds-modal__actions {
+.cds-modal__surface--wide {
+	width: min(520px, calc(100vw - 32px));
+}
+
+.cds-modal__header {
 	flex: 0 0 auto;
 	padding: 16px;
 	display: flex;
-	align-items: center;
+	align-items: flex-start;
 	justify-content: space-between;
+}
+
+.cds-modal__eyebrow {
+	margin: 0;
+	font-size: 12px;
+	letter-spacing: 0.32px;
+	color: var(--cds-text-secondary);
+}
+
+.cds-modal__title {
+	margin: 4px 0 0;
+	font-size: 20px;
+	font-weight: 400;
+}
+
+.cds-modal__actions {
+	flex: 0 0 auto;
+	display: flex;
+	margin-top: 8px;
+}
+
+.cds-modal__actions .cds-btn {
+	flex: 1 1 0;
+	min-height: 56px;
+	padding: 0 16px;
+	justify-content: flex-start;
 }
 
 .cds-modal__body {
@@ -933,6 +1194,17 @@ a {
 	.cds-kpi-row {
 		grid-template-columns: repeat(2, minmax(0, 1fr));
 	}
+
+	.cds-grid--dashboard,
+	.cds-grid--2,
+	.cds-grid--3,
+	.cds-grid--settings {
+		grid-template-columns: minmax(0, 1fr);
+	}
+
+	.cds-nav__link {
+		min-height: 40px;
+	}
 }
 
 @media (max-width: 672px) {
@@ -946,10 +1218,6 @@ a {
 
 	.cds-header {
 		padding-inline: 8px;
-	}
-
-	.cds-header__status {
-		display: none;
 	}
 
 	.cds-header__controls {
@@ -966,6 +1234,10 @@ a {
 	.cds-field__select {
 		min-height: 44px;
 	}
+
+	.cds-nav__link--footer {
+		min-height: 44px;
+	}
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -979,71 +1251,84 @@ a {
 
 /* ---- Hostnames ---- */
 
-.cds-hostname-row {
+.cds-tile--is-table { padding: 0; }
+.cds-tile--is-table .cds-tile__head-row { padding: 16px; }
+
+.cds-tile__count {
+	font-weight: 400;
+	color: var(--cds-text-secondary);
+}
+
+.cds-filter {
+	max-width: 240px;
+}
+
+.cds-inline-form {
 	display: flex;
-	flex-wrap: wrap;
-	gap: 16px;
-	align-items: flex-start;
-	padding: 16px 0;
-	border-top: 1px solid var(--cds-border-subtle);
-}
-
-.cds-hostname-row:first-child {
-	border-top: 0;
-	padding-top: 0;
-}
-
-.cds-hostname-row__status {
-	flex: 0 0 auto;
-	padding-top: 2px;
-}
-
-.cds-hostname-row__body {
-	flex: 1 1 auto;
-	min-width: 0;
-}
-
-.cds-hostname-row__heading {
-	display: flex;
-	flex-wrap: wrap;
 	align-items: center;
 	gap: 8px;
-	margin-bottom: 4px;
 }
 
-.cds-hostname-row__label {
-	font-weight: 600;
+.cds-inline-form .cds-field__input {
+	flex: 1 1 auto;
 }
 
-.cds-hostname-row__caps {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 4px;
+.cds-hostname-table__head,
+.cds-hostname-table__row {
+	display: grid;
+	grid-template-columns: 56px 150px minmax(200px, 1.2fr) minmax(260px, 1.6fr);
+	align-items: center;
+	padding: 0 16px;
 }
 
-.cds-hostname-row__actions {
-	flex: 0 0 auto;
-}
+.cds-hostname-table__head { height: 40px; background: var(--cds-table-header); font-size: 12px; font-weight: 600; letter-spacing: 0.32px; text-transform: uppercase; }
+.cds-hostname-table__row { min-height: 56px; padding: 8px 16px; border-top: 1px solid var(--cds-border-subtle); }
+.cds-hostname-table__code { font-family: "IBM Plex Mono", monospace; font-size: 13px; font-weight: 600; }
+.cds-hostname-table__input { height: 36px; width: calc(100% - 16px); background: var(--cds-field); border: 0; border-bottom: 1px solid var(--cds-border-strong); padding: 0 12px; font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--cds-text); }
+.cds-hostname-table__caps { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.cds-hostname-table__note { margin: 4px 0 0; font-size: 12px; color: var(--cds-warning-text); }
 
-.cds-hostname-row__skip-banner {
-	margin: 8px 0 0;
-	color: var(--cds-text);
-	background: var(--cds-notification-warning-bg);
-	border-left: 3px solid var(--cds-support-warning);
-	padding: 4px 8px;
-	font-size: 12px;
+.cds-cta-row { display: flex; align-items: center; gap: 2px; margin-top: 16px; }
+.cds-cta-row .cds-field__help { margin-left: 16px; }
+
+@media (max-width: 1056px) {
+	.cds-hostname-table {
+		overflow-x: auto;
+		/* Scroll-edge affordance: below this width the row grid no longer
+		   fits and the Capabilities column sits off-canvas with nothing
+		   indicating it can be reached by swiping - matches Carbon's own
+		   shadow treatment for a horizontally scrollable data table rather
+		   than introducing new chrome. The first (local-attachment) layer
+		   travels with the scrolled content, anchored to its trailing edge;
+		   the second (scroll-attachment) layer stays fixed to the visible
+		   edge. The first slides over the second once there is nothing left
+		   to reveal, so the shadow disappears exactly when scrolled to the
+		   end. */
+		background-image:
+			linear-gradient(to left, var(--cds-layer), transparent 24px),
+			linear-gradient(to left, rgba(0, 0, 0, 0.18), transparent 12px);
+		background-repeat: no-repeat, no-repeat;
+		background-position: 100% 0, 100% 0;
+		background-size: 24px 100%, 12px 100%;
+		background-attachment: local, scroll;
+	}
+	/* Scoped to descendants of .cds-hostname-table on purpose: that
+	   ancestor is what turns into the horizontal scroll container above.
+	   A bare .cds-hostname-table__row selector would force this min-width
+	   on any row carrying that class even without a scroll-container
+	   ancestor, overflowing whatever card it sits in instead of scrolling
+	   - exactly what happened before the setup wizard's rows gained their
+	   own .cds-hostname-table wrapper. */
+	.cds-hostname-table .cds-hostname-table__head,
+	.cds-hostname-table .cds-hostname-table__row { min-width: 760px; }
 }
 
 .cds-hostname-credentials {
-	/* On the setup Hostnames page this is a flex sibling of
-	   .cds-hostname-row__status/__body/__actions inside .cds-hostname-row
-	   (display:flex) - without flex-basis:100% it competed for horizontal
-	   space like a fourth column and was squeezed to ~150-190px wide
-	   instead of spanning its own full-width line below the row. Harmless
-	   everywhere else this class appears (the main Hostnames page's
-	   equivalent panel lives inside #cds-modal-body, not a flex row, where
-	   flex-basis has no effect). */
-	flex-basis: 100%;
+	/* On the setup Hostnames page this sits as a normal block-level
+	   sibling right after .cds-hostname-table__row (no longer a flex
+	   child of anything). Harmless everywhere else this class appears
+	   (the main Hostnames page's equivalent panel lives inside
+	   #cds-modal-body). */
 	margin-top: 16px;
 	border-top: 1px solid var(--cds-border-subtle);
 	padding-top: 16px;
@@ -1143,6 +1428,10 @@ a {
 	font-size: 12px;
 }
 
+.cds-mirror-row__name {
+	font-size: 13px;
+}
+
 .cds-mirror-row__label {
 	flex: 1 1 auto;
 	display: flex;
@@ -1182,14 +1471,18 @@ a {
 	background: var(--cds-hover);
 }
 
-.cds-source-pills {
+.cds-pills {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 8px;
 	margin-top: 12px;
 }
 
-.cds-source-pill {
+/* Outline by default; the selected fill uses --cds-interactive (the
+   selection-accent token), not --cds-button-primary - the two are
+   identical in light theme but diverge in dark theme, and a pill is a
+   selection control, not a button. */
+.cds-pill {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
@@ -1199,26 +1492,21 @@ a {
 	font-size: 12px;
 }
 
-.cds-source-pill.is-selected {
-	background: var(--cds-button-primary);
+.cds-pill.is-selected {
+	background: var(--cds-interactive);
 	color: #ffffff;
-	border-color: var(--cds-button-primary);
+	border-color: var(--cds-interactive);
 }
 
-.cds-source-pill__checkbox {
+.cds-pill__checkbox {
 	width: 14px;
 	height: 14px;
 }
 
 @media (max-width: 672px) {
-	.cds-hostname-row,
 	.cds-category-row {
 		flex-direction: column;
 		align-items: stretch;
-	}
-
-	.cds-hostname-row__actions {
-		display: flex;
 	}
 }
 
@@ -1272,15 +1560,80 @@ a {
 	color: var(--cds-helper);
 }
 
-/* Downloads page: search toolbar, bulk-selection header, and a
-   sticky first data column for the deferred table on narrow viewports. */
+/* Login page: a bespoke standalone document (auth.py's carbon() branch),
+   not render_carbon_simple_page() - the brand mark sits above the sign-in
+   card and the version/Classic-UI footer sits below it, both outside the
+   cds-tile the eyebrow/H1/fields/button/helper live in. */
+.cds-auth {
+	min-height: 100vh;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 32px 16px;
+	box-sizing: border-box;
+}
 
-.cds-toolbar {
+.cds-auth__card {
+	width: 400px;
+	max-width: 100%;
+}
+
+.cds-auth__brand {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
+	margin-bottom: 24px;
+	color: var(--cds-text-secondary);
+}
+
+.cds-auth__brand strong {
+	font-weight: 600;
+	color: var(--cds-text);
+}
+
+.cds-auth__card .cds-btn {
 	margin-top: 16px;
 }
 
+.cds-btn--block {
+	width: 100%;
+}
+
+/* Downloads page: release cells, the Queue tile's release filter,
+   bulk-selection header, and a sticky first data column for the deferred
+   table on narrow viewports. */
+
+/* Release names are Mono so version/codec/group segments line up down the
+   column, and truncated rather than wrapped so one long title cannot push
+   every other row's height around. The full name stays reachable through the
+   row's own actions, which carry it in their accessible names. */
+.cds-release {
+	display: block;
+	margin: 0;
+	max-width: 420px;
+	font-family: "IBM Plex Mono", monospace;
+	font-size: 12px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.cds-release__action {
+	display: inline-block;
+	margin-top: 4px;
+	padding: 2px 0;
+	font-size: 12px;
+}
+
+.cds-release__error {
+	margin: 0;
+	font-size: 12px;
+	color: var(--cds-support-error);
+}
+
 .cds-field--search {
-	max-width: 320px;
+	max-width: 360px;
 }
 
 .cds-section-header {
@@ -1356,7 +1709,16 @@ a {
 	background: var(--cds-hover);
 }
 
+.cds-icon-button--sm {
+	min-width: 32px;
+	min-height: 32px;
+}
+
 .cds-icon-button--danger {
+	color: var(--cds-support-error);
+}
+
+.cds-icon-button--danger:hover {
 	color: var(--cds-support-error);
 }
 
@@ -1368,6 +1730,230 @@ a {
 
 	.cds-mirror-row__move .cds-icon-button {
 		min-width: 44px;
+		min-height: 44px;
+	}
+
+	/* Unlike the two scoped overrides above, .cds-icon-button--sm applies
+	   wherever icon_button() is used, so without this bump it would defeat
+	   the generic .cds-icon-button 44px rule for every caller. */
+	.cds-icon-button--sm {
+		min-width: 44px;
+		min-height: 44px;
+	}
+
+	/* Same hazard as .cds-icon-button--sm above: .cds-btn--compact applies
+	   wherever buildTextActionButton() is used, so without this bump it
+	   would defeat the generic .cds-btn 44px rule for every caller -
+	   including the deferred table's Check/Remove buttons, two per row. */
+	.cds-btn--compact {
+		min-height: 44px;
+	}
+}
+
+/* ---- Settings ---- */
+
+/* Names a control for assistive technology without occupying layout - used
+   by the switcher fieldsets, whose visible caption is the surrounding row
+   label or subheading rather than the <legend> itself. */
+.cds-visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	padding: 0;
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	overflow: hidden;
+	white-space: nowrap;
+	border: 0;
+}
+
+.cds-subheading {
+	margin: 24px 0 0;
+	font-size: 14px;
+	font-weight: 600;
+}
+
+.cds-btn-row {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 16px;
+}
+
+.cds-setting-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 16px;
+	padding: 16px 0;
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-setting-row:first-child {
+	border-top: 0;
+	padding-top: 0;
+}
+
+.cds-setting-row__text {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	min-width: 0;
+}
+
+.cds-setting-row__label {
+	font-weight: 600;
+}
+
+.cds-setting-row__help {
+	font-size: 12px;
+	color: var(--cds-helper);
+}
+
+.cds-setting-row__control {
+	flex: 0 0 auto;
+}
+
+/* Content switcher: one radio group rendered as a segmented control. The
+   inputs stay real radios (keyboard and screen-reader behavior unchanged),
+   only their visual box is the adjacent <span>. */
+.cds-switcher {
+	display: inline-flex;
+	max-width: 100%;
+	/* Fieldsets get min-inline-size: min-content by default, which would
+	   stop the control from ever shrinking inside a narrow tile. */
+	min-width: 0;
+	flex-wrap: wrap;
+	margin: 0;
+	padding: 0;
+	border: 1px solid var(--cds-border-strong);
+}
+
+.cds-switcher__item {
+	position: relative;
+	display: flex;
+}
+
+.cds-switcher__item input {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	overflow: hidden;
+	opacity: 0;
+}
+
+.cds-switcher__item span {
+	display: flex;
+	align-items: center;
+	min-height: 40px;
+	padding: 0 16px;
+	cursor: pointer;
+	border-right: 1px solid var(--cds-border-strong);
+}
+
+.cds-switcher__item:last-child span {
+	border-right: 0;
+}
+
+.cds-switcher__item input:checked + span {
+	background: var(--cds-button-secondary);
+	color: #ffffff;
+}
+
+.cds-switcher__item input:focus-visible + span {
+	outline: 2px solid #0f62fe;
+	outline-offset: -2px;
+}
+
+.cds-timeout-row + .cds-timeout-row {
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+/* Notifications EVENT / ENABLED / SILENT matrix. Each switch keeps its own
+   accessible name; only the visible duplicate of it is hidden, since the
+   row's EVENT cell already carries that text on screen. */
+.cds-matrix {
+	margin-top: 16px;
+}
+
+.cds-matrix__head,
+.cds-matrix__row {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) 64px 64px;
+	align-items: center;
+	gap: 8px;
+}
+
+.cds-matrix__head {
+	height: 40px;
+	padding: 0 8px;
+	background: var(--cds-table-header);
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.32px;
+	text-transform: uppercase;
+}
+
+.cds-matrix__row {
+	min-height: 44px;
+	padding: 4px 8px;
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-matrix__row:first-of-type {
+	border-top: 0;
+}
+
+.cds-matrix__label {
+	min-width: 0;
+	font-size: 14px;
+}
+
+.cds-matrix .cds-toggle {
+	margin-top: 0;
+}
+
+.cds-matrix .cds-toggle__label {
+	min-height: 44px;
+	gap: 0;
+}
+
+.cds-matrix .cds-toggle__label-text {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	overflow: hidden;
+	white-space: nowrap;
+}
+
+.cds-details {
+	margin-top: 24px;
+	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-details > summary {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-height: 44px;
+	cursor: pointer;
+	font-size: 14px;
+	font-weight: 600;
+}
+
+@media (max-width: 672px) {
+	/* The switcher's visual box is a <span>, not a .cds-btn, so it needs
+	   its own bump to keep the shared 44px tap target. */
+	.cds-switcher__item span {
 		min-height: 44px;
 	}
 }

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from quasarr.providers.auth import is_auth_enabled, is_browser_authenticated
 from quasarr.providers.carbon_icons import render_icon
+from quasarr.providers.html_images import logo
 from quasarr.providers.log import warn
 from quasarr.providers.static_assets import asset_url
 from quasarr.providers.version import get_version
@@ -35,7 +36,9 @@ _NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     ("settings", "Settings", "/settings", "settings"),
 )
 
-_ALLOWED_TILE_CLASS_TOKENS = frozenset({"is-compact", "is-wide", "is-metric"})
+_ALLOWED_TILE_CLASS_TOKENS = frozenset(
+    {"is-compact", "is-wide", "is-metric", "is-status"}
+)
 _ALLOWED_TABLE_COLUMN_CLASS_TOKENS = frozenset(
     {"is-num", "is-status", "is-mono", "is-right", "is-center"}
 )
@@ -201,7 +204,13 @@ def _ensure_page_header(
     return page_header(eyebrow, title, subtitle) + content
 
 
-def tile(content: str, *, heading: str | None = None, classes: str = "") -> str:
+def tile(
+    content: str,
+    *,
+    heading: str | None = None,
+    classes: str = "",
+    help_text: str = "",
+) -> str:
     safe_classes = _validate_classes(classes, _ALLOWED_TILE_CLASS_TOKENS, "tile")
     class_attr = (
         f" cds-tile--{safe_classes.replace(' ', ' cds-tile--')}" if safe_classes else ""
@@ -211,9 +220,10 @@ def tile(content: str, *, heading: str | None = None, classes: str = "") -> str:
         if heading is not None
         else ""
     )
+    help_html = f'<p class="cds-tile__help">{_h(help_text)}</p>' if help_text else ""
     return (
         f'<section class="cds-tile{class_attr}">'
-        f'{heading_html}<div class="cds-tile__content">{content}</div>'
+        f'{heading_html}{help_html}<div class="cds-tile__content">{content}</div>'
         "</section>"
     )
 
@@ -222,6 +232,102 @@ def tag(text: str, tone: str = "gray") -> str:
     if tone not in _ALLOWED_TAG_TONES:
         raise ValueError("Unsupported tag tone")
     return f'<span class="cds-tag cds-tag--{tone}">{_h(text)}</span>'
+
+
+_ALLOWED_STATUS_TONES = frozenset({"success", "warning", "error", "info", "neutral"})
+_ALLOWED_GRID_VARIANTS = {
+    "dashboard": "cds-grid--dashboard",
+    "2": "cds-grid--2",
+    "3": "cds-grid--3",
+    "settings": "cds-grid--settings",
+    "stack": "cds-stack",
+}
+
+
+def _data_attributes(data: Mapping[str, str] | None) -> str:
+    return "".join(
+        f' data-{_h(key)}="{_h(value)}"' for key, value in (data or {}).items()
+    )
+
+
+def status(
+    text: str,
+    tone: str = "neutral",
+    *,
+    strong: bool = False,
+    tinted: bool = False,
+    as_button: bool = False,
+    action: str = "",
+    data: Mapping[str, str] | None = None,
+) -> str:
+    """The design's status indicator: a colored dot plus its label.
+
+    ``as_button=True`` renders the same children inside a real button for
+    the rows whose status opens a detail dialog, so a keyboard user reaches
+    it without a synthetic click target.
+    """
+    if tone not in _ALLOWED_STATUS_TONES:
+        raise ValueError("Unsupported status tone")
+    classes = f"cds-status cds-status--{tone}"
+    if strong:
+        classes += " cds-status--strong"
+    if tinted:
+        classes += " cds-status--tinted"
+    inner = f'<span class="cds-status__dot" aria-hidden="true"></span>{_h(text)}'
+    if not as_button:
+        return f'<span class="{classes}">{inner}</span>'
+    return (
+        f'<button type="button" class="{classes} cds-status--link" '
+        f'data-action="{_h(action)}"{_data_attributes(data)}>'
+        f"{inner}</button>"
+    )
+
+
+def grid(children: Sequence[str], variant: str) -> str:
+    css_class = _ALLOWED_GRID_VARIANTS.get(variant)
+    if css_class is None:
+        raise ValueError("Unsupported grid variant")
+    return f'<div class="{css_class}">{"".join(children)}</div>'
+
+
+def kv_rows(rows: Sequence[tuple[str, str]]) -> str:
+    return "".join(
+        f'<div class="cds-kv__row"><span class="cds-kv__label">{_h(label)}</span>'
+        f'<span class="cds-kv__value">{_h(value)}</span></div>'
+        for label, value in rows
+    )
+
+
+def metric_tile(
+    label: str, value: str, sub: str = "", *, sub_success: bool = False
+) -> str:
+    sub_class = (
+        "cds-metric__sub cds-metric__sub--success" if sub_success else "cds-metric__sub"
+    )
+    sub_html = f'<p class="{sub_class}">{_h(sub)}</p>' if sub else ""
+    return tile(
+        f'<p class="cds-metric__value">{_h(value)}</p>{sub_html}',
+        heading=label,
+        classes="is-status is-metric",
+    )
+
+
+def icon_button(
+    icon: str,
+    label: str,
+    *,
+    action: str,
+    data: Mapping[str, str] | None = None,
+    danger: bool = False,
+) -> str:
+    classes = "cds-icon-button cds-icon-button--sm" + (
+        " cds-icon-button--danger" if danger else ""
+    )
+    return (
+        f'<button class="{classes}" type="button" aria-label="{_h(label)}" '
+        f'title="{_h(label)}" data-action="{_h(action)}"{_data_attributes(data)}>'
+        f"{render_icon(icon)}</button>"
+    )
 
 
 def field(
@@ -445,9 +551,11 @@ def render_carbon_error_page(
     Closed to the three status codes Quasarr's browser surface actually
     raises to a visitor (Basic-auth challenges, missing resources). Reused
     for the "package not found" case by passing a specific ``message``.
-    ``show_classic_switch=False`` reproduces the login page's exemption for
-    an unauthenticated 401 challenge - no ``/ui/classic`` escape hatch shown
-    before the visitor has proven who they are.
+    ``show_classic_switch=False`` is the Basic-auth 401 challenge's
+    exemption - no ``/ui/classic`` escape hatch shown before the visitor has
+    proven who they are. The login page does not share this exemption: it
+    always shows a Classic UI link, and renders its own standalone document
+    rather than calling this function.
     """
     if status_code not in _ERROR_PAGE_DEFAULTS:
         raise ValueError("Unsupported error status code")
@@ -482,6 +590,11 @@ def render_carbon_html(
     safe_title = _h(title)
     version = _h(get_version())
     notification_label = f"Notifications, {captcha_count} CAPTCHA items"
+    badge_html = (
+        f'<span class="cds-header__badge" aria-hidden="true">{captcha_count}</span>'
+        if captcha_count
+        else ""
+    )
     page_content = _ensure_page_header(
         content,
         title=title,
@@ -492,8 +605,8 @@ def render_carbon_html(
     nav_items = []
     for key, label, href, icon in _NAV_ITEMS:
         active_attr = ' aria-current="page"' if key == page_key else ""
-        if key == "captcha":
-            label_html = f"{_h(label)} {tag(str(captcha_count), tone='gray')}"
+        if key == "captcha" and badge_html:
+            label_html = f"{_h(label)} {badge_html}"
         else:
             label_html = _h(label)
 
@@ -533,17 +646,13 @@ def render_carbon_html(
         '<div class="cds-shell">'
         '<a class="cds-skip-link" href="#main-content">Skip to main content</a>'
         '<header class="cds-header">'
-        '<div class="cds-header__brand">'
         '<button class="cds-icon-button" type="button" data-action="nav-open" aria-controls="cds-side-nav" aria-expanded="false" aria-label="Open navigation" title="Open navigation">'
         f"{render_icon('menu', class_name='cds-icon cds-icon--sm')}"
         "</button>"
-        '<span class="cds-product">Quasarr</span>'
-        "</div>"
-        '<div class="cds-header__status">'
-        '<span class="cds-captcha-count" aria-label="CAPTCHA items">'
-        "CAPTCHA "
-        f"<strong>{captcha_count}</strong>"
-        "</span></div>"
+        '<a class="cds-header__brand" href="/">'
+        f'<img src="{logo}" width="24" height="24" alt="">'
+        '<span class="cds-product"><strong>Quasarr</strong> Web UI</span>'
+        "</a>"
         '<div class="cds-header__controls">'
         '<button class="cds-icon-button" type="button" data-action="theme-toggle" aria-label="Toggle theme" title="Toggle theme">'
         '<span class="cds-theme-icon cds-theme-icon--light">'
@@ -555,7 +664,7 @@ def render_carbon_html(
         "</button>"
         f'<a class="cds-icon-button" href="/captcha" aria-label="{notification_label}" title="{notification_label}">'
         f"{render_icon('notification', class_name='cds-icon cds-icon--sm')}"
-        f'<span class="cds-header__badge" aria-hidden="true">{captcha_count}</span>'
+        f"{badge_html}"
         "</a>"
         f"{user_controls}"
         "</div>"
@@ -566,8 +675,10 @@ def render_carbon_html(
         "</div>"
         '<nav><ul class="cds-nav__list">' + "".join(nav_items) + "</ul></nav>"
         '<div class="cds-nav__footer">'
-        f'<a class="cds-classic-link" href="/ui/classic?next={current_href}">Switch to Classic UI</a>'
-        f'<p class="cds-version">v{version}</p>'
+        f'<a class="cds-nav__link cds-nav__link--footer" href="/ui/classic?next={current_href}">'
+        f"{render_icon('launch', class_name='cds-icon cds-icon--sm')}"
+        "Switch to Classic UI</a>"
+        f'<p class="cds-nav__version">Quasarr v{version}</p>'
         "</div>"
         "</aside>"
         '<div class="cds-nav-backdrop" id="cds-nav-backdrop" data-action="nav-close" hidden></div>'
@@ -580,7 +691,8 @@ def render_carbon_html(
         '<section id="cds-modal" class="cds-modal" role="dialog" aria-modal="true" aria-labelledby="cds-modal-title" tabindex="-1" hidden>'
         '<div class="cds-modal__surface">'
         '<div class="cds-modal__header">'
-        '<h2 id="cds-modal-title">Dialog</h2>'
+        '<div><p id="cds-modal-eyebrow" class="cds-modal__eyebrow" hidden></p>'
+        '<h2 id="cds-modal-title" class="cds-modal__title"></h2></div>'
         '<button class="cds-icon-button" type="button" data-action="modal-close" aria-label="Close dialog" title="Close dialog">'
         f"{render_icon('close', class_name='cds-icon cds-icon--sm')}"
         "</button>"
@@ -604,6 +716,11 @@ __all__ = [
     "protected_captcha_count",
     "tile",
     "tag",
+    "status",
+    "grid",
+    "kv_rows",
+    "metric_tile",
+    "icon_button",
     "field",
     "toggle",
     "data_table",
