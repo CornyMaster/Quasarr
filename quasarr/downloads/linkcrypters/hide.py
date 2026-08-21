@@ -13,7 +13,19 @@ from quasarr.providers.log import debug, info
 from quasarr.providers.statistics import StatsHelper
 
 
-def unhide_links(shared_state, url, session):
+def unhide_links(shared_state, url, session, outcome=None):
+    """Decrypt one hide.cx container into its final hoster links.
+
+    `outcome` is an optional dict the caller may pass to learn WHY an empty
+    result came back. It is set to `{"gone": True}` only when hide.cx itself
+    answers 404 - its explicit "container not found or invalid" - because
+    that is the one failure a human cannot beat either: there is nothing left
+    to solve. Every other failure (5xx, an unreadable body, an unexpected
+    shape) stays unmarked, so the caller keeps demoting those to a manual
+    CAPTCHA where a person may still succeed.
+    """
+    if outcome is None:
+        outcome = {}
     try:
         links = []
 
@@ -48,15 +60,33 @@ def unhide_links(shared_state, url, session):
                 timeout=DOWNLOAD_REQUEST_TIMEOUT_SECONDS,
             )
 
+            if resp.status_code == 404:
+                # hide.cx's own answer, verbatim: "container not found or
+                # invalid". Logged at INFO because the operator otherwise
+                # only sees "Could not decrypt any links" and is left to
+                # guess whether the link is dead or the solve merely failed.
+                outcome["gone"] = True
+                info(
+                    f"hide.cx reports container {container_id} as gone "
+                    f"(HTTP 404); it can no longer be solved by anyone"
+                )
+                return []
+
             try:
                 resolved = resp.json()
             except Exception:
-                debug(f"Failed to resolve foreign container {container_id}")
+                info(
+                    f"Failed to resolve foreign container {container_id} "
+                    f"(HTTP {resp.status_code}, unreadable body)"
+                )
                 return []
 
             canonical_id = resolved.get("id")
             if not canonical_id:
-                debug(f"No canonical container ID found for {container_id}")
+                info(
+                    f"No canonical container ID for {container_id} "
+                    f"(HTTP {resp.status_code})"
+                )
                 return []
 
             container_id = canonical_id
@@ -73,6 +103,14 @@ def unhide_links(shared_state, url, session):
             headers=headers,
             timeout=DOWNLOAD_REQUEST_TIMEOUT_SECONDS,
         )
+        if response.status_code == 404:
+            outcome["gone"] = True
+            info(
+                f"hide.cx reports container {container_id} as gone "
+                f"(HTTP 404); it can no longer be solved by anyone"
+            )
+            return []
+
         data = response.json()
 
         link_ids = [link.get("id") for link in data.get("links", []) if link.get("id")]
@@ -178,11 +216,16 @@ def decrypt_links_if_hide(shared_state: Any, items: List[List[str]]) -> Dict[str
 
     info(f"Found {len(hide_urls)} hide.cx URLs; decrypting...")
     decrypted_links: List[str] = []
+    gone_count = 0
     for url in hide_urls:
         try:
-            links = unhide_links(shared_state, url, session)
+            outcome: Dict[str, Any] = {}
+            links = unhide_links(shared_state, url, session, outcome=outcome)
             if not links:
-                debug(f"No links decrypted for {url}")
+                if outcome.get("gone"):
+                    gone_count += 1
+                else:
+                    debug(f"No links decrypted for {url}")
                 continue
             decrypted_links.extend(links)
         except Exception as e:
@@ -190,6 +233,12 @@ def decrypt_links_if_hide(shared_state: Any, items: List[List[str]]) -> Dict[str
             continue
 
     if not decrypted_links:
+        # "gone" only when EVERY container was reported missing. If even one
+        # failed for another reason it may still be solvable by hand, and the
+        # package must keep its manual CAPTCHA route.
+        if gone_count and gone_count == len(hide_urls):
+            info("Every hide.cx container is gone; nothing left to solve.")
+            return {"status": "gone", "results": []}
         info("Could not decrypt any links from hide.cx URLs.")
         return {"status": "error", "results": []}
 

@@ -503,6 +503,16 @@ def handle_auto_decrypt_links(shared_state, links, title, password, package_id):
     """Decrypt hide.cx links and send to JDownloader."""
     result = decrypt_links_if_hide(shared_state, links)
 
+    if result.get("status") == "gone":
+        # The crypter itself reports the container as missing, so no manual
+        # CAPTCHA can rescue it either. Told apart from an ordinary failure
+        # so process_links() can end the package instead of parking it.
+        return {
+            "success": False,
+            "container_gone": True,
+            "reason": "Linkcrypter reports the container as no longer available",
+        }
+
     if result.get("status") != "success":
         return {"success": False, "reason": "Auto-decrypt failed"}
 
@@ -692,6 +702,19 @@ def process_links(
             return {"success": True, "title": title}
         if result.get("persisted_failure"):
             return {"success": True, "title": title, "failed": True}
+        if result.get("container_gone"):
+            # Parking this would put a package in the CAPTCHA queue that
+            # nobody - helper or human - can ever solve, where it waits
+            # forever and has to be cleared by hand.
+            return fail(
+                title,
+                package_id,
+                shared_state,
+                reason=(
+                    f'Linkcrypter container for "{title}" no longer exists on '
+                    f"{label} - nothing left to solve"
+                ),
+            )
         info(f"Auto-decrypt failed for {title}, falling back to manual CAPTCHA...")
         classified["protected"].extend(classified["auto"])
 
