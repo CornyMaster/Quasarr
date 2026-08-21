@@ -129,7 +129,7 @@ def _protected_origin(links):
     reaching back into it at module scope would be circular. Mirrors
     `_lifecycle_deferred_by_package()`'s identical lazy import above.
     """
-    from quasarr.downloads import resolve_protected_crypter_key
+    from quasarr.downloads import detect_crypter, resolve_protected_crypter_key
     from quasarr.providers.package_origin import mirror_from_url
 
     if not links:
@@ -137,7 +137,17 @@ def _protected_origin(links):
     first = links[0]
     url = first[0] if isinstance(first, (list, tuple)) and first else first
     try:
+        # resolve_protected_crypter_key() answers a different question than
+        # this one: it is the COOLDOWN-eligibility allowlist, so it rejects
+        # hide - an auto-decrypt crypter that lands here whenever its
+        # decryption failed and the grab fell back to a manual CAPTCHA. That
+        # package is still a Hide package, and /captcha calls it one, so
+        # detect_crypter() (which knows both families) decides the label. The
+        # mirror-tag resolver keeps precedence for junkies, whose key comes
+        # from the tag rather than the URL.
         crypter = resolve_protected_crypter_key(first) or ""
+        if not crypter and isinstance(url, str):
+            crypter = detect_crypter(url)[0] or ""
     except Exception:
         crypter = ""
     if not crypter:

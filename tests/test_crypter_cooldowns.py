@@ -754,6 +754,73 @@ class CoolingCryptersProjectionTests(unittest.TestCase):
 
         self.assertEqual([], cooling_crypters(self.shared_state, clock=self.clock))
 
+    def test_a_lifecycle_cooldown_is_reported_even_with_no_legacy_row(self):
+        # The version-two Filecrypt lifecycle keeps its header in
+        # filecrypt_sweep_state, NOT in crypter_cooldowns. Reading only the
+        # legacy table makes a real, active cooldown invisible - measured on
+        # a live system that had crypter_cooldowns empty while
+        # filecrypt_sweep_state held state="cooldown" with 21 hours left.
+        header = {
+            "schema_version": 1,
+            "state": "cooldown",
+            "generation_id": "a" * 32,
+            "retry_after_epoch": self.clock.now + 7200,
+            "sweep_deadline_epoch": self.clock.now - 60,
+        }
+        self.shared_state.get_db("filecrypt_sweep_state").update_store(
+            "filecrypt", json.dumps(header)
+        )
+
+        cooling = cooling_crypters(self.shared_state, clock=self.clock)
+
+        self.assertEqual(["filecrypt"], [row["crypter"] for row in cooling])
+        self.assertEqual(self.clock.now + 7200, cooling[0]["retry_after_epoch"])
+        self.assertEqual("FileCrypt", cooling[0]["label"])
+
+    def test_an_expired_lifecycle_cooldown_is_not_reported(self):
+        header = {
+            "schema_version": 1,
+            "state": "cooldown",
+            "generation_id": "a" * 32,
+            "retry_after_epoch": self.clock.now - 1,
+            "sweep_deadline_epoch": self.clock.now - 60,
+        }
+        self.shared_state.get_db("filecrypt_sweep_state").update_store(
+            "filecrypt", json.dumps(header)
+        )
+
+        self.assertEqual([], cooling_crypters(self.shared_state, clock=self.clock))
+
+    def test_the_later_of_the_two_deadlines_wins_when_both_exist(self):
+        # A crypter can carry a legacy row and a lifecycle header at once.
+        # Whichever runs longer is the one actually gating handouts.
+        self._cool("filecrypt")
+        legacy = cooling_crypters(self.shared_state, clock=self.clock)[0]
+        header = {
+            "schema_version": 1,
+            "state": "cooldown",
+            "generation_id": "a" * 32,
+            "retry_after_epoch": legacy["retry_after_epoch"] + 3600,
+            "sweep_deadline_epoch": self.clock.now - 60,
+        }
+        self.shared_state.get_db("filecrypt_sweep_state").update_store(
+            "filecrypt", json.dumps(header)
+        )
+
+        cooling = cooling_crypters(self.shared_state, clock=self.clock)
+
+        self.assertEqual(1, len(cooling))
+        self.assertEqual(
+            legacy["retry_after_epoch"] + 3600, cooling[0]["retry_after_epoch"]
+        )
+
+    def test_a_malformed_lifecycle_header_never_breaks_the_answer(self):
+        self.shared_state.get_db("filecrypt_sweep_state").update_store(
+            "filecrypt", "{not json"
+        )
+
+        self.assertEqual([], cooling_crypters(self.shared_state, clock=self.clock))
+
     def test_an_unreadable_or_unknown_row_is_skipped_instead_of_raising(self):
         self._cool("filecrypt")
         database = self.shared_state.get_db("crypter_cooldowns")

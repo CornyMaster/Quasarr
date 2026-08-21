@@ -1583,6 +1583,28 @@ class OriginProjectionTests(unittest.TestCase):
             _protected_origin([["https://filecrypt.invalid/Container/ABC123", "x"]]),
         )
 
+    def test_an_auto_decrypt_crypter_is_named_too(self):
+        # A hide link that failed auto-decryption falls back to the protected
+        # queue and waits for a manual CAPTCHA, where /captcha names it
+        # "Crypter: Hide". The table has to agree: resolve_protected_crypter_key()
+        # is the COOLDOWN-eligibility allowlist (filecrypt/tolink/keeplinks/
+        # junkies) and deliberately rejects hide, which is not the same
+        # question as "can we name this crypter".
+        from quasarr.downloads.packages import _protected_origin
+
+        self.assertEqual(
+            ("hide", "hide.invalid"),
+            _protected_origin([["https://hide.invalid/state/abc", "hide"]]),
+        )
+
+    def test_the_junkies_mirror_tag_still_resolves(self):
+        from quasarr.downloads.packages import _protected_origin
+
+        self.assertEqual(
+            ("junkies", "container.invalid"),
+            _protected_origin([["https://container.invalid/item", "junkies"]]),
+        )
+
     def test_a_still_protected_row_names_its_crypter_without_a_stored_origin(self):
         # The links of a package waiting for a CAPTCHA are right there, which
         # is how /captcha names the crypter and mirror. Packages older than

@@ -136,7 +136,7 @@ def cooling_crypters(shared_state, *, clock=time.time):
         return []
 
     service = CrypterCooldownService(shared_state, clock=clock)
-    cooling = []
+    deadlines = {}
     for row in rows or []:
         try:
             crypter = normalize_crypter_key(row[0])
@@ -150,15 +150,60 @@ def cooling_crypters(shared_state, *, clock=time.time):
         retry_after = _epoch_or_zero(snapshot, "retry_after_epoch")
         if snapshot.get("state") != "cooldown" or retry_after <= now:
             continue
-        cooling.append(
-            {
-                "crypter": crypter,
-                "label": crypter_label(crypter),
-                "retry_after_epoch": retry_after,
-            }
+        deadlines[crypter] = retry_after
+
+    lifecycle_crypter, lifecycle_retry = _lifecycle_cooldown(shared_state, now, clock)
+    if lifecycle_crypter:
+        # Whichever of the two runs longer is the one actually gating
+        # handouts, so it is the one worth announcing.
+        deadlines[lifecycle_crypter] = max(
+            deadlines.get(lifecycle_crypter, 0), lifecycle_retry
         )
+
+    cooling = [
+        {
+            "crypter": crypter,
+            "label": crypter_label(crypter),
+            "retry_after_epoch": retry_after,
+        }
+        for crypter, retry_after in deadlines.items()
+    ]
     cooling.sort(key=lambda entry: entry["retry_after_epoch"])
     return cooling
+
+
+def _lifecycle_cooldown(shared_state, now, clock):
+    """The version-two Filecrypt cooldown, if one is live.
+
+    The lifecycle generation keeps its header in `filecrypt_sweep_state`, not
+    in `crypter_cooldowns`, so a system running it shows an EMPTY legacy
+    table while a real cooldown gates every handout. Reading only the legacy
+    table made exactly that state invisible on a live install.
+
+    Lazy import: `filecrypt_lifecycle_service` pulls in `crypter_candidates`,
+    which reaches back into `quasarr.downloads` at module scope - the same
+    circularity `normalize_crypter_key()` avoids the same way.
+    """
+    try:
+        from quasarr.providers.filecrypt_lifecycle_service import (
+            FILECRYPT_CRYPTER,
+            FilecryptLifecycleService,
+        )
+
+        # The clock must be forwarded: the service defaults to time.time(),
+        # which silently ignores an injected clock and makes every synthetic
+        # deadline read as long expired.
+        decision = FilecryptLifecycleService(shared_state, clock=clock).decision()
+    except Exception as error:
+        warn(f"Reading the Filecrypt lifecycle cooldown failed: {error}")
+        return "", 0
+
+    if not isinstance(decision, dict) or decision.get("state") != "cooldown":
+        return "", 0
+    retry_after = _epoch_or_zero(decision, "retry_after_epoch")
+    if retry_after <= now:
+        return "", 0
+    return FILECRYPT_CRYPTER, retry_after
 
 
 def normalize_crypter_key(value):
