@@ -70,6 +70,15 @@ DEFAULT_SWEEP_WINDOW_MINUTES = 15
 # thrown away, so a slow but successful solve would be wasted and retried.
 OFFER_LEASE_SECONDS = 300
 RECEIPT_ADVISORY_THRESHOLD = 4096
+# Ceiling on how long one link may stay `held` while its retests keep coming
+# back BLOCKED during a live sweep-wide cooldown. Such a retest proves nothing
+# about the link itself, so it only backs the link's own hold off by one
+# cooldown period instead of retiring it - but the back-off alone would let a
+# permanently dead link be offered again every cooldown period forever. Once
+# the link has been held this long, the next such retest retires it instead,
+# which bounds the retest offers one dead link can consume at roughly this
+# value divided by the configured cooldown period (8 at the 24-hour default).
+MAXIMUM_HELD_SECONDS_BEFORE_BLACKLIST = 7 * 24 * 3600
 
 _SCHEMA_VERSION = 1
 _WINDOW_MIN = 1
@@ -1073,8 +1082,12 @@ class FilecryptLifecycleService:
                         and _now < hdr.get("retry_after_epoch", 0)
                     )
                     retry_after = ls.get("retry_after_epoch", 0)
+                    held_seconds = _now - ls.get("first_blocked_epoch", 0)
+                    held_too_long = (
+                        held_seconds >= MAXIMUM_HELD_SECONDS_BEFORE_BLACKLIST
+                    )
 
-                    if _now >= retry_after and not is_live_cooldown:
+                    if _now >= retry_after and (not is_live_cooldown or held_too_long):
                         # Retest BLOCKED → blacklisting, no receipt/counters
                         new_ls = {
                             "schema_version": _SCHEMA_VERSION,
@@ -1098,6 +1111,54 @@ class FilecryptLifecycleService:
                             member_raw,
                             encode_link_state(new_ls),
                             receipt_raw,
+                            prot_raw,
+                            events_raw,
+                        )
+
+                    if _now >= retry_after:
+                        # Retest BLOCKED while the crypter itself is cooling
+                        # down.  The block proves nothing about this link, so
+                        # it is not retired - but the report must still change
+                        # durable state: leaving the expired hold untouched
+                        # would make the very next prepare_offer() mint another
+                        # retest lease for the same link, forever.  Back the
+                        # link's own hold off by one cooldown period, clear the
+                        # spent lease, and answer the live crypter cooldown.
+                        # No counters: the link was already counted when it was
+                        # first blocked, and this is not a probe.
+                        new_ls = dict(ls)
+                        new_ls["lease"] = None
+                        new_ls["retry_after_epoch"] = _now + _cooldown
+                        response = build_lifecycle_defer_decision(
+                            instruction="cooldown",
+                            state="cooldown",
+                            hold_type="crypter_cooldown",
+                            evidence_count=1,
+                            retry_after_epoch=hdr["retry_after_epoch"],
+                            sweep_id=_sweep_id,
+                            sweep_tested=0,
+                            sweep_total=0,
+                            sweep_deadline_epoch=hdr["sweep_deadline_epoch"],
+                        )
+                        new_receipt = encode_offer_receipt(
+                            {
+                                "schema_version": _SCHEMA_VERSION,
+                                "generation_id": _sweep_id,
+                                "fingerprint": _fp,
+                                "package_id": _pkg_id,
+                                "mode": "retest",
+                                "outcome": "blocked",
+                                "response": response,
+                                "accepted_epoch": _now,
+                                "expires_epoch": _now + RECEIPT_RETENTION_SECONDS,
+                            }
+                        )
+                        result[0] = response
+                        return (
+                            hdr_raw,
+                            member_raw,
+                            encode_link_state(new_ls),
+                            new_receipt,
                             prot_raw,
                             events_raw,
                         )

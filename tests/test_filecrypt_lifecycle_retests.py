@@ -20,12 +20,14 @@ from quasarr.providers.filecrypt_lifecycle import (
     decode_sweep_header,
     decode_sweep_member,
     encode_link_state,
+    encode_sweep_header,
 )
 from quasarr.providers.filecrypt_lifecycle_decisions import (
     validate_access_response,
     validate_defer_response,
 )
 from quasarr.providers.filecrypt_lifecycle_service import (
+    MAXIMUM_HELD_SECONDS_BEFORE_BLACKLIST,
     OFFER_LEASE_SECONDS,
     FilecryptLifecycleService,
 )
@@ -1198,6 +1200,203 @@ class TestMalformedCooldownDeadlineProbe(RetestTestCase):
             self.state.get_db("protected").retrieve(pkg_id), protected_before
         )
         self.assertEqual(self.events_db().retrieve(CRYPTER_EVENT_KEY), events_before)
+
+
+# -- retest BLOCKED during a live sweep-wide cooldown -------------------------
+
+
+class TestRetestBlockedDuringLiveCooldown(RetestTestCase):
+    """A retest BLOCKED whose own hold expired while the crypter is cooling.
+
+    The link's own hold has run out, so prepare_offer() hands it out as a
+    retest - but by the time the report lands, a fresh fully blocked sweep has
+    re-armed the sweep-wide cooldown. That block proves nothing about the link
+    itself, so it is not retired; the report must still change durable state
+    though, because an answer that writes nothing leaves the link held with an
+    already expired retry deadline. The very next prepare_offer() then mints
+    another retest lease for the same link, which during an ongoing IP ban
+    repeats without bound: held -> retest offered -> nothing -> held.
+    """
+
+    def _arm_global_cooldown(self, now):
+        """Install the cooldown header a fresh fully blocked sweep leaves."""
+        self.sweep_db().store(
+            FILECRYPT_SWEEP_KEY,
+            encode_sweep_header(
+                {
+                    "schema_version": 1,
+                    "state": "cooldown",
+                    "generation_id": "c" * 32,
+                    "sweep_deadline_epoch": now + WINDOW_SECONDS,
+                    "retry_after_epoch": now + COOLDOWN_SECONDS,
+                }
+            ),
+        )
+
+    def _held_link(self):
+        """One Filecrypt link, blocked once, so it is held for one cooldown."""
+        svc = self.service()
+        rows = self.protected_rows(range(1))
+        offer = svc.prepare_offer(rows)
+        self.assertIsNotNone(offer)
+        self.assertEqual(offer["mode"], "individual")
+        self.assertIsNotNone(svc.record_blocked(_report_blocked(offer), rows))
+        return offer["link_fingerprint"], rows
+
+    def _race(self, rows):
+        """Offer a retest, then re-arm the cooldown before the report lands."""
+        retest_offer = self.service().prepare_offer(rows)
+        self.assertIsNotNone(retest_offer)
+        self.assertEqual(retest_offer["mode"], "retest")
+        self._arm_global_cooldown(self.clock.now)
+        return retest_offer
+
+    def test_blocked_report_is_never_a_no_op(self):
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = self._race(rows)
+        raw_before = self.ls_db().retrieve(fingerprint)
+
+        result = self.service().record_blocked(_report_blocked(retest_offer), rows)
+
+        self.assertIsNotNone(result)
+        self.assertNotEqual(self.ls_db().retrieve(fingerprint), raw_before)
+
+    def test_answer_is_the_live_crypter_cooldown(self):
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = self._race(rows)
+
+        result = self.service().record_blocked(_report_blocked(retest_offer), rows)
+
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(result["fingerprint"], fingerprint)
+        response = _response_of(result)
+        # The wire contract is closed: the helper accepts only hold, cooldown,
+        # legacy_failure, stale and blacklist, and silently drops anything
+        # else - which would leave the same loop running.
+        validate_defer_response(response)
+        self.assertEqual(response["instruction"], "cooldown")
+        self.assertEqual(response["state"], "cooldown")
+        self.assertEqual(response["hold_type"], "crypter_cooldown")
+        self.assertEqual(response["sweep_id"], retest_offer["sweep_id"])
+        self.assertEqual(
+            response["retry_after_epoch"], self.clock.now + COOLDOWN_SECONDS
+        )
+
+    def test_hold_is_backed_off_by_one_cooldown_period(self):
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = self._race(rows)
+
+        self.service().record_blocked(_report_blocked(retest_offer), rows)
+
+        ls = self.link_state(fingerprint)
+        self.assertEqual(ls["state"], "held")
+        self.assertIsNone(ls["lease"])
+        # The anchor the retirement bound measures from is never rewritten.
+        self.assertEqual(ls["first_blocked_epoch"], NOW)
+        self.assertEqual(ls["retry_after_epoch"], self.clock.now + COOLDOWN_SECONDS)
+
+    def test_link_is_not_immediately_reofferable(self):
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = self._race(rows)
+        self.service().record_blocked(_report_blocked(retest_offer), rows)
+
+        # Lift the sweep-wide cooldown so nothing but the link's own hold can
+        # suppress a new offer.
+        self.sweep_db().rows.pop(FILECRYPT_SWEEP_KEY, None)
+
+        self.assertIsNone(self.service().prepare_offer(rows))
+        self.assertEqual(self.link_state(fingerprint)["state"], "held")
+
+    def test_header_member_and_counters_are_untouched(self):
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = self._race(rows)
+        header_before = self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY)
+        member_before = self.members_db().retrieve(fingerprint)
+
+        self.service().record_blocked(_report_blocked(retest_offer), rows)
+
+        self.assertEqual(self.sweep_db().retrieve(FILECRYPT_SWEEP_KEY), header_before)
+        self.assertEqual(self.members_db().retrieve(fingerprint), member_before)
+        events = self.pending_events()
+        # The link was already counted when it was first blocked, and this is
+        # not a probe: no counter may move.
+        self.assertEqual(events["observations"], 1)
+        self.assertEqual(events["cooldowns"], 0)
+        self.assertEqual(events["probes"], 0)
+
+    def test_receipt_replays_the_same_answer(self):
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+        retest_offer = self._race(rows)
+
+        first = self.service().record_blocked(_report_blocked(retest_offer), rows)
+        rcpt = self.receipt(retest_offer["offer_id"])
+        self.assertIsNotNone(rcpt)
+        self.assertEqual(rcpt["mode"], "retest")
+        self.assertEqual(rcpt["outcome"], "blocked")
+        self.assertEqual(rcpt["fingerprint"], fingerprint)
+
+        raw_before = self.ls_db().retrieve(fingerprint)
+        second = self.service().record_blocked(_report_blocked(retest_offer), rows)
+        self.assertEqual(first, second)
+        self.assertEqual(self.ls_db().retrieve(fingerprint), raw_before)
+
+    def test_a_permanently_blocked_link_reaches_blacklisting(self):
+        """The property under test: offers for a dead link are bounded.
+
+        Every round is the exact production race - the hold has expired, a
+        retest is offered, an ongoing IP ban re-arms the sweep-wide cooldown
+        before the report lands. Answering `stale` and writing nothing leaves
+        the link re-offerable in exactly the state it was already in, so the
+        next round offers it again and the loop never ends.
+        """
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + COOLDOWN_SECONDS + 1
+
+        offers = 0
+        terminal = None
+        for _ in range(20):
+            retest_offer = self._race(rows)
+            offers += 1
+            result = self.service().record_blocked(_report_blocked(retest_offer), rows)
+            self.assertIsNotNone(result, "a BLOCKED report must change state")
+            if result.get("terminal_required"):
+                terminal = result
+                break
+            self.clock.now += COOLDOWN_SECONDS + 1
+
+        self.assertIsNotNone(terminal, "a permanently blocked link must be retired")
+        self.assertLessEqual(
+            offers, MAXIMUM_HELD_SECONDS_BEFORE_BLACKLIST // COOLDOWN_SECONDS + 1
+        )
+        self.assertEqual(self.link_state(fingerprint)["state"], "blacklisting")
+
+    def test_retirement_bound_is_measured_from_the_first_block(self):
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + MAXIMUM_HELD_SECONDS_BEFORE_BLACKLIST
+        retest_offer = self._race(rows)
+
+        result = self.service().record_blocked(_report_blocked(retest_offer), rows)
+
+        self.assertTrue(result["terminal_required"])
+        ls = self.link_state(fingerprint)
+        self.assertEqual(ls["state"], "blacklisting")
+        self.assertEqual(ls["first_blocked_epoch"], NOW)
+
+    def test_below_the_bound_the_link_is_still_only_backed_off(self):
+        fingerprint, rows = self._held_link()
+        self.clock.now = NOW + MAXIMUM_HELD_SECONDS_BEFORE_BLACKLIST - 1
+        retest_offer = self._race(rows)
+
+        result = self.service().record_blocked(_report_blocked(retest_offer), rows)
+
+        self.assertFalse(result["terminal_required"])
+        self.assertEqual(self.link_state(fingerprint)["state"], "held")
 
 
 if __name__ == "__main__":
