@@ -232,6 +232,25 @@ class SetupHostnamesCarbonRenderTests(unittest.TestCase):
         self.assertIn('value="ga-fixture.invalid"', html)
         self.assertIn('value="gb-fixture.invalid"', html)
 
+    def test_row_status_is_dot_only_but_stays_accessible(self):
+        """This step shares `_hostname_row_html()` with the main Hostnames
+        page, so its inert (non-button) status must get the same dot-only
+        treatment: the label moves to `title` and a visually-hidden text
+        node, never disappearing down to colour alone.
+        """
+        html = self._render()
+        self.assertIn('id="hostname-status-tag-ga"', html)
+        row_start = html.index('id="hostname-status-tag-ga"')
+        segment = html[
+            row_start : html.index("</span></span>", row_start) + len("</span></span>")
+        ]
+        self.assertIn("cds-status--dot-only", segment)
+        self.assertIn('title="Working normally"', segment)
+        self.assertIn(
+            '<span class="cds-visually-hidden">Working normally</span>', segment
+        )
+        self.assertNotIn('aria-hidden="true"></span>Working normally<', segment)
+
     def test_rows_are_wrapped_in_the_scroll_container(self):
         """Regression pin: without this wrapper, carbon.css's narrow-
         viewport rule (a forced 760px min-width on every

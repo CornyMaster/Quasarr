@@ -202,10 +202,14 @@ def _hostname_row_html(
             as_button=True,
             action=status_action,
             data={"hostname-id": row["id"]},
+            dot_only=True,
         )
     else:
         status_html = status(
-            row["status_title"], tone, tinted=tone in {"error", "warning", "neutral"}
+            row["status_title"],
+            tone,
+            tinted=tone in {"error", "warning", "neutral"},
+            dot_only=True,
         )
     wrapper_id_attr = f' id="{_h(status_wrapper_id)}"' if status_wrapper_id else ""
 

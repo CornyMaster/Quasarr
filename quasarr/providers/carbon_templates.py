@@ -240,6 +240,7 @@ _ALLOWED_GRID_VARIANTS = {
     "2": "cds-grid--2",
     "3": "cds-grid--3",
     "settings": "cds-grid--settings",
+    "auto": "cds-grid--auto",
     "stack": "cds-stack",
 }
 
@@ -259,12 +260,23 @@ def status(
     as_button: bool = False,
     action: str = "",
     data: Mapping[str, str] | None = None,
+    dot_only: bool = False,
 ) -> str:
     """The design's status indicator: a colored dot plus its label.
 
     ``as_button=True`` renders the same children inside a real button for
     the rows whose status opens a detail dialog, so a keyboard user reaches
     it without a synthetic click target.
+
+    ``dot_only=True`` drops the visible label and shows only the dot (the
+    dense Hostnames table, whose 150px status column used to wrap two-word
+    labels onto two lines). The label never disappears from the accessible
+    tree: it moves into a ``title`` attribute, so it still appears on
+    hover/focus, and into a visually-hidden text node inside the control,
+    so a screen reader still announces it - a dot whose only carrier of
+    meaning is its colour is not acceptable. The wrapping element also gets
+    a fixed 24x24 box (``cds-status--dot-only``) so the clickable/hoverable
+    area stays comfortably above the 10px dot itself.
     """
     if tone not in _ALLOWED_STATUS_TONES:
         raise ValueError("Unsupported status tone")
@@ -273,11 +285,20 @@ def status(
         classes += " cds-status--strong"
     if tinted:
         classes += " cds-status--tinted"
-    inner = f'<span class="cds-status__dot" aria-hidden="true"></span>{_h(text)}'
+    if dot_only:
+        classes += " cds-status--dot-only"
+        inner = (
+            '<span class="cds-status__dot" aria-hidden="true"></span>'
+            f'<span class="cds-visually-hidden">{_h(text)}</span>'
+        )
+        title_attr = f' title="{_h(text)}"'
+    else:
+        inner = f'<span class="cds-status__dot" aria-hidden="true"></span>{_h(text)}'
+        title_attr = ""
     if not as_button:
-        return f'<span class="{classes}">{inner}</span>'
+        return f'<span class="{classes}"{title_attr}>{inner}</span>'
     return (
-        f'<button type="button" class="{classes} cds-status--link" '
+        f'<button type="button" class="{classes} cds-status--link"{title_attr} '
         f'data-action="{_h(action)}"{_data_attributes(data)}>'
         f"{inner}</button>"
     )

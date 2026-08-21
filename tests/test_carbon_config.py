@@ -431,12 +431,30 @@ class HostnamesRenderTests(_HostnamesTestCase):
         row = html[row_start : html.index("</div></div>", row_start)]
         self.assertIn('<span class="cds-hostname-table__code">FF</span>', row)
         self.assertIn(
-            'class="cds-status cds-status--success cds-status--link" '
+            'class="cds-status cds-status--success cds-status--dot-only '
+            'cds-status--link" title="Working normally" '
             'data-action="hostname-status" data-hostname-id="ff"',
             row,
         )
         self.assertNotIn("Details", row)
         self.assertNotIn("cds-hostname-row__status", html)
+
+    def test_hostname_status_dot_carries_its_label_to_assistive_tech(self):
+        """The status cell drops its visible text down to a dot alone (a
+        150px column wrapping "Hostname not configured" onto two lines for
+        21 of 22 sources), but colour must never be the only carrier of
+        that status: the label is still readable on hover (`title`) and by
+        a screen reader (a visually-hidden text node inside the control).
+        """
+        html = self._render_hostnames()
+        row_start = html.index('data-hostname-id="ff"')
+        row = html[row_start : html.index("</div></div>", row_start)]
+        self.assertIn('<span class="cds-visually-hidden">Working normally</span>', row)
+        # The label must be wrapped in its own visually-hidden span, never
+        # sitting as a bare, sighted-visible text node right after the dot
+        # (the pre-change markup: `...aria-hidden="true"></span>Working
+        # normally</button>`).
+        self.assertNotIn('aria-hidden="true"></span>Working normally<', row)
 
     def test_capability_chip_colours_follow_the_design(self):
         html = self._render_hostnames()
@@ -1451,6 +1469,25 @@ class CarbonConfigCssContractTests(unittest.TestCase):
         self.assertNotIn(
             "\t.cds-hostname-table__head,\n\t.cds-hostname-table__row { min-width: 760px; }",
             css,
+        )
+
+    def test_hostname_table_columns_are_separated_by_a_gap(self):
+        """Regression pin: with a 48px status column and zero column-gap,
+        the status header text sat flush against the hostname header text
+        (measured live: "Status" ends and "Hostname" starts at the exact
+        same x-coordinate), reading as one run-on label instead of two
+        column headings. `.cds-hostname-table__head` and
+        `.cds-hostname-table__row` share one selector on purpose - both
+        must carry the identical `grid-template-columns`/`column-gap` pair
+        or the header stops lining up with the columns below it.
+        """
+        css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
+        self.assertRegex(
+            css,
+            r"\.cds-hostname-table__head,\n\.cds-hostname-table__row \{"
+            r"[^}]*grid-template-columns:\s*"
+            r"56px 48px minmax\(200px, 1\.2fr\) minmax\(260px, 1\.6fr\);"
+            r"[^}]*column-gap:\s*16px;",
         )
 
     def test_skip_banner_never_uses_warning_yellow_as_text_color(self):

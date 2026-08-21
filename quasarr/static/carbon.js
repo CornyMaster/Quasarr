@@ -3097,18 +3097,23 @@
 				}
 				var tag = byId('hostname-status-tag-' + id);
 				if (tag) {
-					// Matches the row builder's plain (non-button) status
-					// component (quasarr.providers.carbon_templates.status())
-					// - a colored dot plus text, not a .cds-tag pill, which
-					// the dense-row redesign replaced everywhere else.
+					// Matches the row builder's plain (non-button) dot-only
+					// status component
+					// (quasarr.providers.carbon_templates.status(dot_only=True))
+					// - a colored dot alone, its label reachable via title
+					// and a visually-hidden text node, never a .cds-tag pill.
 					tag.innerHTML = '';
 					var statusEl = document.createElement('span');
-					statusEl.className = 'cds-status cds-status--success';
+					statusEl.className = 'cds-status cds-status--success cds-status--dot-only';
+					statusEl.title = 'Working normally';
 					var dot = document.createElement('span');
 					dot.className = 'cds-status__dot';
 					dot.setAttribute('aria-hidden', 'true');
 					statusEl.appendChild(dot);
-					statusEl.appendChild(document.createTextNode('Working normally'));
+					var label = document.createElement('span');
+					label.className = 'cds-visually-hidden';
+					label.textContent = 'Working normally';
+					statusEl.appendChild(label);
 					tag.appendChild(statusEl);
 				}
 				var banner = byId('hostname-skip-banner-' + id);

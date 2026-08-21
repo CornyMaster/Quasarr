@@ -6,13 +6,15 @@
 
 Renders the same 37 values as the Classic statistics page
 (``quasarr.api.statistics._classic_statistics``) - never more, never fewer -
-as four top KPI metric tiles (32px values) followed by detail tiles: a
-2-column grid (CAPTCHA decryptions, Cached metadata) and a 3-column grid
-(Linkcrypter blocks, Filecrypt cohort, Terminal operations). CAPTCHA
-decryption volume and the Filecrypt cohort tested/total ratio additionally
-render as ``.cds-progress`` bars, with every underlying number kept visible
-as text alongside or inside each bar. No provider value is renamed,
-dropped, or recomputed; no trend, chart, or blacklist counter is added.
+as four top KPI metric tiles (32px values) followed by five detail tiles
+(CAPTCHA decryptions, Cached metadata, Linkcrypter blocks, Filecrypt
+cohort, Terminal operations) in one self-arranging ``cds-grid--auto`` grid,
+so the tiles fill available rows instead of leaving a ragged gap under the
+shorter CAPTCHA tile. CAPTCHA decryption volume and the Filecrypt cohort
+tested/total ratio additionally render as ``.cds-progress`` bars, with
+every underlying number kept visible as text alongside or inside each bar.
+No provider value is renamed, dropped, or recomputed; no trend, chart, or
+blacklist counter is added.
 """
 
 from __future__ import annotations
@@ -256,10 +258,8 @@ def render_statistics(shared_state) -> str:
         help_text="SponsorsHelper hand-offs by phase.",
     )
 
-    content = (
-        metrics
-        + grid([captcha_tile, cached_tile], "2")
-        + grid([blocks_tile, cohort_tile, terminal_tile], "3")
+    content = metrics + grid(
+        [captcha_tile, cached_tile, blocks_tile, cohort_tile, terminal_tile], "auto"
     )
 
     return render_carbon_html(

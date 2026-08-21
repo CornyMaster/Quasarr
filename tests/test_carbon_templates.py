@@ -590,6 +590,49 @@ class CarbonTemplateHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             status("x", "pink")
 
+    def test_status_dot_only_hides_visible_text_but_keeps_it_accessible(self):
+        """dot_only=True must never leave colour as the only carrier of
+        meaning: the label moves to `title` (hover) and a visually-hidden
+        text node (screen readers), and the dot itself is unchanged.
+        """
+        html = status("Hostname not configured", "neutral", tinted=True, dot_only=True)
+        self.assertEqual(
+            html,
+            '<span class="cds-status cds-status--neutral cds-status--tinted '
+            'cds-status--dot-only" title="Hostname not configured">'
+            '<span class="cds-status__dot" aria-hidden="true"></span>'
+            '<span class="cds-visually-hidden">Hostname not configured</span>'
+            "</span>",
+        )
+        self.assertNotIn(
+            ">Hostname not configured<", html.split("cds-visually-hidden")[0]
+        )
+
+    def test_status_dot_only_as_button_stays_keyboard_reachable(self):
+        html = status(
+            "Working normally",
+            "success",
+            as_button=True,
+            action="hostname-status",
+            data={"hostname-id": "nx"},
+            dot_only=True,
+        )
+        self.assertEqual(
+            html,
+            '<button type="button" class="cds-status cds-status--success '
+            'cds-status--dot-only cds-status--link" title="Working normally" '
+            'data-action="hostname-status" data-hostname-id="nx">'
+            '<span class="cds-status__dot" aria-hidden="true"></span>'
+            '<span class="cds-visually-hidden">Working normally</span>'
+            "</button>",
+        )
+
+    def test_status_dot_only_escapes_text_in_title_and_hidden_node(self):
+        html = status("<b>bad</b>", "error", dot_only=True)
+        self.assertNotIn("<b>bad</b>", html)
+        self.assertIn('title="&lt;b&gt;bad&lt;/b&gt;"', html)
+        self.assertIn("&lt;b&gt;bad&lt;/b&gt;</span>", html)
+
     def test_grid_variants(self):
         self.assertEqual(
             grid(["<a></a>", "<b></b>"], "dashboard"),
@@ -597,6 +640,10 @@ class CarbonTemplateHelperTests(unittest.TestCase):
         )
         self.assertEqual(
             grid(["<a></a>"], "stack"), '<div class="cds-stack"><a></a></div>'
+        )
+        self.assertEqual(
+            grid(["<a></a>", "<b></b>"], "auto"),
+            '<div class="cds-grid--auto"><a></a><b></b></div>',
         )
         with self.assertRaises(ValueError):
             grid([], "4")
@@ -881,10 +928,12 @@ class CarbonStaticContractsTests(unittest.TestCase):
         self.assertNotIn("https://", css)
 
     def test_carbon_css_kpi_row_layout_contract(self):
-        """The statistics KPI row: a 4-column hairline grid at
-        desktop width, matching the file's `repeat(4, minmax(0, 1fr))`/1px
-        gap conventions, collapsing to 2 columns at the existing 1056px
-        breakpoint and 1 column at the existing 672px breakpoint.
+        """The statistics KPI row: a 4-column grid at desktop width,
+        matching the file's `repeat(4, minmax(0, 1fr))`/16px gap
+        conventions (a deliberate override of the design's original 1px
+        hairline gap - separate tiles read as separate tiles), collapsing
+        to 2 columns at the existing 1056px breakpoint and 1 column at the
+        existing 672px breakpoint.
         """
         css = self._read_static("carbon.css")
 
@@ -892,12 +941,19 @@ class CarbonStaticContractsTests(unittest.TestCase):
             css,
             r"\.cds-kpi-row\s*\{[^}]*display:\s*grid;"
             r"[^}]*grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\);"
-            r"[^}]*gap:\s*1px;",
+            r"[^}]*gap:\s*16px;",
         )
         # Status dot component + page grids exist
         self.assertRegex(
             css,
             r"\.cds-status__dot\s*\{[^}]*width:\s*10px;[^}]*height:\s*10px;[^}]*border-radius:\s*50%;",
+        )
+        # The Hostnames table's dot-only status keeps the 10px dot itself
+        # but pads its clickable/hoverable box out to 24px - a 10px target
+        # alone is too small.
+        self.assertRegex(
+            css,
+            r"\.cds-status--dot-only\s*\{[^}]*width:\s*24px;[^}]*height:\s*24px;",
         )
         self.assertRegex(
             css, r"\.cds-grid--dashboard\s*\{[^}]*grid-template-columns:\s*1\.4fr 1fr;"
@@ -905,6 +961,17 @@ class CarbonStaticContractsTests(unittest.TestCase):
         self.assertRegex(
             css,
             r"\.cds-grid--settings\s*\{[^}]*repeat\(auto-fit,\s*minmax\(400px,\s*1fr\)\);",
+        )
+        # Statistics' single self-arranging detail-tile grid: auto-fit
+        # columns and align-items: stretch so tiles sharing a visual row
+        # share a height instead of leaving a ragged gap under a shorter
+        # tile (the "start" every other grid variant uses).
+        self.assertRegex(
+            css,
+            r"\.cds-grid--auto\s*\{[^}]*display:\s*grid;"
+            r"[^}]*grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(300px,\s*1fr\)\);"
+            r"[^}]*gap:\s*16px;"
+            r"[^}]*align-items:\s*stretch;",
         )
         self.assertRegex(
             css,
@@ -1235,7 +1302,7 @@ class SetupHostnameCredentialsPanelWidthTests(unittest.TestCase):
     of `.cds-hostname-table__row` inside `.cds-hostname-table`, so the
     guard now asserts that structure against the rendered HTML instead of
     a CSS declaration that no longer exists. `.cds-hostname-table__row` is
-    a four-column grid (`56px 150px minmax(200px,1.2fr)
+    a four-column grid (`56px 48px minmax(200px,1.2fr)
     minmax(260px,1.6fr)`), so a panel nested inside one would be squeezed
     into a single track exactly as before.
     """

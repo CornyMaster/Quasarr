@@ -3,12 +3,12 @@
 """Contracts for the Carbon statistics view.
 
 Pins the 37-value coverage of ``StatsHelper.get_stats()`` against the Carbon
-renderer's four top KPI metric tiles plus its 2-column and 3-column detail
-tile grids, the two pinned headings ("Filecrypt cohort", "Terminal
-operations"), the Filecrypt lifecycle state rendered as a status badge, the
-tested/total ratio bar, the ``<time data-epoch>`` deadline contract, and the
-structural/privacy guards (no emoji, no identifier-shaped lifecycle data, no
-remote resources, no inline handlers/scripts).
+renderer's four top KPI metric tiles plus its five detail tiles in one
+self-arranging ``cds-grid--auto`` grid, the two pinned headings ("Filecrypt
+cohort", "Terminal operations"), the Filecrypt lifecycle state rendered as a
+status badge, the tested/total ratio bar, the ``<time data-epoch>`` deadline
+contract, and the structural/privacy guards (no emoji, no identifier-shaped
+lifecycle data, no remote resources, no inline handlers/scripts).
 """
 
 import importlib
@@ -363,19 +363,37 @@ class CarbonStatisticsCoverageTests(unittest.TestCase):
         )
 
     def test_detail_tiles_replace_tables(self):
+        """The five detail tiles used to split across a ragged 2-column-
+        plus-3-column pair (a hole under the short CAPTCHA tile whenever a
+        row didn't fill evenly); they now all sit inside one self-arranging
+        `cds-grid--auto` grid instead, so the headings are asserted both
+        present AND in their original left-to-right/top-to-bottom order
+        inside that one container - not merely present anywhere on the
+        page, since "CAPTCHA decryptions" is also a top KPI tile heading
+        that renders earlier in the document.
+        """
         html = self._render()
         self.assertNotIn("<table", html)
-        self.assertIn('<div class="cds-grid--2">', html)
-        self.assertIn('<div class="cds-grid--3">', html)
-        for heading in (
+        self.assertNotIn("cds-grid--2", html)
+        self.assertNotIn("cds-grid--3", html)
+        grid_start = html.index('<div class="cds-grid--auto">')
+        grid_html = html[grid_start : html.index("</main>", grid_start)]
+
+        headings = (
             "CAPTCHA decryptions",
             "Cached metadata",
             "Linkcrypter blocks",
             "Filecrypt cohort",
             "Terminal operations",
-        ):
+        )
+        positions = []
+        for heading in headings:
             with self.subTest(heading=heading):
-                self.assertIn(f'<h2 class="cds-tile__heading">{heading}</h2>', html)
+                marker = f'<h2 class="cds-tile__heading">{heading}</h2>'
+                self.assertIn(marker, grid_html)
+                positions.append(grid_html.index(marker))
+        self.assertEqual(positions, sorted(positions))
+
         # automatic, manual, cohort tested - the thick modifier class always
         # rides alongside the base class, matching `_bar()`'s literal markup.
         self.assertEqual(html.count('class="cds-progress cds-progress--thick"'), 3)
@@ -385,12 +403,12 @@ class CarbonStatisticsCoverageTests(unittest.TestCase):
         so carbon.css's grid layout applies to them instead of the default
         vertical tile stack. Each tile itself nests a `.cds-tile__content`
         div, so the wrapper's own close tag is found by slicing up to the
-        immediately following 2-column detail grid rather than matching the
+        immediately following detail-tile grid rather than matching the
         first (nested) `</div>`.
         """
         html = self._render()
         start = html.index('<div class="cds-kpi-row">')
-        end = html.index('<div class="cds-grid--2">', start)
+        end = html.index('<div class="cds-grid--auto">', start)
         row_html = html[start:end]
 
         self.assertTrue(row_html.endswith("</div>"))

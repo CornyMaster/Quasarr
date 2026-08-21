@@ -366,9 +366,12 @@ a {
 	padding: 32px;
 }
 
-.cds-main__inner {
-	max-width: 1280px;
-}
+/* .cds-main__inner deliberately carries no max-width: content fills the
+   window at any width, so a wide monitor's `.cds-main` padding is the
+   only margin, not a third of the screen left empty. `.cds-page--narrow`
+   (the CAPTCHA flow) and the login page's standalone `.cds-auth__card`
+   keep their own fixed max-widths regardless, since neither depends on
+   this rule. */
 
 .cds-eyebrow,
 .cds-subtitle {
@@ -570,7 +573,7 @@ a {
 .cds-kpi-row {
 	display: grid;
 	grid-template-columns: repeat(4, minmax(0, 1fr));
-	gap: 1px;
+	gap: 16px;
 	margin-bottom: 24px;
 }
 
@@ -600,6 +603,13 @@ a {
 	grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
 	gap: 16px;
 	align-items: start;
+}
+
+.cds-grid--auto {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+	gap: 16px;
+	align-items: stretch;
 }
 
 .cds-stack {
@@ -648,6 +658,18 @@ a {
 	cursor: pointer;
 	text-decoration: underline dotted;
 	text-underline-offset: 3px;
+}
+
+/* The dense Hostnames table's dot-only status: a fixed 24x24 box centers
+   the 10px dot so its clickable/hoverable area stays comfortably above
+   the dot itself, while the label (never removed from the accessible
+   tree - see carbon_templates.status()) stays visually hidden. */
+.cds-status--dot-only {
+	width: 24px;
+	height: 24px;
+	justify-content: center;
+	gap: 0;
+	padding: 0;
 }
 
 .cds-kv__row {
@@ -1198,7 +1220,8 @@ a {
 	.cds-grid--dashboard,
 	.cds-grid--2,
 	.cds-grid--3,
-	.cds-grid--settings {
+	.cds-grid--settings,
+	.cds-grid--auto {
 		grid-template-columns: minmax(0, 1fr);
 	}
 
@@ -1276,7 +1299,16 @@ a {
 .cds-hostname-table__head,
 .cds-hostname-table__row {
 	display: grid;
-	grid-template-columns: 56px 150px minmax(200px, 1.2fr) minmax(260px, 1.6fr);
+	/* The status column holds only a centred 24px dot now (see
+	   .cds-status--dot-only), so it is narrow; the space that freed up
+	   from its old 150px flows into the two flexible fr columns. Both
+	   selectors share this declaration on purpose - head and rows must
+	   stay pixel-identical or the header stops lining up with the
+	   columns below it. column-gap matches the 16px used everywhere
+	   else in this UI: without it the fixed-width code/status columns
+	   sit flush against their neighbour with no visual separation. */
+	grid-template-columns: 56px 48px minmax(200px, 1.2fr) minmax(260px, 1.6fr);
+	column-gap: 16px;
 	align-items: center;
 	padding: 0 16px;
 }
