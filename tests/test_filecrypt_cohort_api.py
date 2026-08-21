@@ -2460,6 +2460,31 @@ class LifecycleRouteTests(CohortApiTestCase):
         payload.update(extra)
         return self.call(DECRYPT_RULE, payload)["to_decrypt"]
 
+    def test_a_scrub_that_empties_the_queue_answers_404(self):
+        """The handout route re-reads `protected` after the blacklist scrub.
+
+        `retrieve_all_titles()` answers `None` for an empty table, not an
+        empty list, and everything after that re-read iterates the value. A
+        scrub that retires the last protected package therefore used to
+        raise TypeError - an HTTP 500 on the one endpoint the helper polls
+        continuously.
+        """
+        self.store(filecrypt_rows(5))
+        db = self.state.databases["protected"]
+        original = db.retrieve_all_titles
+
+        def emptied_by_the_scrub():
+            value = original()
+            # The first read feeds the migration and the scrub; the second is
+            # the one the route iterates, and by then the queue is gone.
+            return None if db.enumerations >= 2 else value
+
+        with mock.patch.object(db, "retrieve_all_titles", emptied_by_the_scrub):
+            with self.assertRaises(HTTPError) as raised:
+                self.lifecycle_to_decrypt()
+
+        self.assertEqual(404, raised.exception.status_code)
+
     def lifecycle_blocked_payload(self, offer, package_id):
         from quasarr.providers.terminal_operations import (
             terminal_operation_id as top_id,

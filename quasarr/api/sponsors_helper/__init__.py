@@ -1554,6 +1554,13 @@ def setup_sponsors_helper_routes(app):
                     )
                 scrub_blacklisted_owners(lifecycle_service, protected)
                 protected = shared_state.get_db("protected").retrieve_all_titles()
+                if not protected:
+                    # The scrub can retire the last protected package. The store
+                    # answers `None` rather than an empty list for an empty
+                    # table, and everything below iterates this value, so an
+                    # unguarded re-read turns an emptied queue into a 500 on the
+                    # endpoint the helper polls continuously.
+                    return abort(404, "No encrypted packages found")
                 preferred_fp = None
                 probe_occurrence = filecrypt_probe_occurrence(
                     enumerate_filecrypt_lifecycle_candidates(protected), protected
