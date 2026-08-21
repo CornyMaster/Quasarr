@@ -18,7 +18,10 @@ from quasarr.downloads import (
 from quasarr.providers.crypter_cooldowns import (
     CrypterCooldownService,
     cooling_crypters,
+    decode_package_defer,
     normalize_crypter_key,
+    package_defer_covers_fingerprint,
+    package_defer_is_active,
     validate_link_fingerprint,
 )
 from quasarr.providers.log import _contexts_to_str
@@ -830,6 +833,125 @@ class CoolingCryptersProjectionTests(unittest.TestCase):
         cooling = cooling_crypters(self.shared_state, clock=self.clock)
 
         self.assertEqual(["filecrypt"], [row["crypter"] for row in cooling])
+
+
+class LifecycleHeldOperatorActionsTests(unittest.TestCase):
+    """ "Check now" and "Remove" must reach a package the LIFECYCLE holds.
+
+    A version-two hold lives in `filecrypt_link_states`, keyed by link
+    fingerprint - the protected blob carries no `deferred` block at all. Both
+    operator actions used to gate on that block, so on a lifecycle install
+    (where no package has one) every request was rejected `not_deferred` and
+    the two buttons did nothing whatsoever. Measured on a live instance: 0 of
+    413 protected packages carried the legacy key while 101 link-state rows
+    held them.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock(1_700_000_000)
+        self.shared_state = FakeSharedState()
+        self.shared_state.values["crypter_block_mode"] = "defer"
+        self.service = CrypterCooldownService(self.shared_state, clock=self.clock)
+        # A protected package with links but WITHOUT any defer block.
+        self.shared_state.get_db("protected").update_store(
+            PACKAGE_A,
+            json.dumps(
+                {
+                    "title": "Synthetic.Release.2031",
+                    "links": [["https://filecrypt.invalid/Container/ABC123", "x"]],
+                    "password": "",
+                    "size_mb": 1,
+                }
+            ),
+        )
+
+    def _hold_the_link(self):
+        """Put the package's only link under a lifecycle hold."""
+        from quasarr.providers.crypter_candidates import link_fingerprint
+
+        fingerprint = link_fingerprint(
+            "filecrypt", "https://filecrypt.invalid/Container/ABC123"
+        )
+        self.shared_state.get_db("filecrypt_link_states").update_store(
+            fingerprint,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "state": "held",
+                    "first_blocked_epoch": self.clock.now - 3600,
+                    "retry_after_epoch": self.clock.now + 7200,
+                    "lease": None,
+                }
+            ),
+        )
+        return fingerprint
+
+    def _defer_block(self):
+        raw = self.shared_state.get_db("protected").rows[PACKAGE_A]
+        return json.loads(raw).get("deferred")
+
+    def test_a_lifecycle_held_package_accepts_a_probe_request(self):
+        self._hold_the_link()
+
+        answer = self.service.request_probe([PACKAGE_A])
+
+        self.assertEqual([PACKAGE_A], answer["requested"])
+        self.assertEqual([], answer["rejected"])
+        self.assertTrue(self._defer_block()["probe_requested"])
+
+    def test_the_queued_marker_never_holds_or_displays_the_package_itself(self):
+        # The marker exists only so the handout can see a queued probe. If it
+        # also read as an active hold it would outrank the lifecycle
+        # projection and replace the row's real evidence and sweep figures.
+        self._hold_the_link()
+        self.service.request_probe([PACKAGE_A])
+
+        block = self._defer_block()
+        self.assertEqual(0, block["retry_after_epoch"])
+        decoded = decode_package_defer({"deferred": block})
+        self.assertFalse(package_defer_is_active(decoded, None, now=self.clock.now))
+
+    def test_the_marker_covers_the_packages_link_so_a_probe_can_be_offered(self):
+        fingerprint = self._hold_the_link()
+        self.service.request_probe([PACKAGE_A])
+
+        decoded = decode_package_defer({"deferred": self._defer_block()})
+        self.assertTrue(package_defer_covers_fingerprint(decoded, fingerprint))
+
+    def test_requesting_a_probe_twice_stays_idempotent(self):
+        self._hold_the_link()
+        self.service.request_probe([PACKAGE_A])
+        first = self.shared_state.get_db("protected").rows[PACKAGE_A]
+
+        answer = self.service.request_probe([PACKAGE_A])
+
+        self.assertEqual([PACKAGE_A], answer["requested"])
+        self.assertEqual(first, self.shared_state.get_db("protected").rows[PACKAGE_A])
+
+    def test_a_package_nothing_holds_is_still_rejected(self):
+        # No lifecycle hold and no legacy block: there is nothing to probe.
+        answer = self.service.request_probe([PACKAGE_A])
+
+        self.assertEqual([], answer["requested"])
+        self.assertEqual(
+            [{"package_id": PACKAGE_A, "reason": "not_deferred"}], answer["rejected"]
+        )
+        self.assertIsNone(self._defer_block())
+
+    def test_a_lifecycle_held_package_can_be_deleted(self):
+        self._hold_the_link()
+
+        self.assertEqual("deleted", self.service.delete_deferred_package(PACKAGE_A))
+        self.assertNotIn(PACKAGE_A, self.shared_state.get_db("protected").rows)
+
+    def test_a_package_nothing_holds_is_not_deletable_through_this_path(self):
+        self.assertEqual(
+            "not_deferred", self.service.delete_deferred_package(PACKAGE_A)
+        )
+        self.assertIn(PACKAGE_A, self.shared_state.get_db("protected").rows)
+
+    def test_a_missing_package_still_reports_not_found(self):
+        self.assertEqual("not_found", self.service.delete_deferred_package(PACKAGE_B))
 
 
 if __name__ == "__main__":

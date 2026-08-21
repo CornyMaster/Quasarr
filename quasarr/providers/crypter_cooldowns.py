@@ -1602,6 +1602,45 @@ class CrypterCooldownService:
         decision = decode_decision_record(current_value, now=now)
         return None if decision is None else decision_snapshot(decision, now=now)
 
+    def _lifecycle_hold_crypter(self, package_id):
+        """The crypter holding this package through the version-two lifecycle.
+
+        A lifecycle hold lives in `filecrypt_link_states`, keyed by link
+        fingerprint - the protected blob carries no defer block at all. Both
+        operator actions below used to gate purely on that block, so on an
+        install running the lifecycle (where NO package has one) every "Check
+        now" and every deferred "Remove" was rejected `not_deferred` and the
+        buttons did nothing at all.
+
+        Read OUTSIDE the protected-row transaction on purpose: a mutator
+        callback may not touch storage (`reject_locked_calls_from_callback`),
+        so the answer is gathered first and handed in. It can therefore go
+        stale between the read and the commit - which is safe, because it only
+        ever widens what the caller may act on, and the transaction still
+        re-reads the row it changes.
+        """
+        try:
+            from quasarr.providers.filecrypt_lifecycle_service import (
+                FilecryptLifecycleService,
+            )
+
+            protected = self._shared_state.get_db("protected").retrieve(package_id)
+            if protected is None:
+                return None
+            holds = FilecryptLifecycleService(
+                self._shared_state, clock=self._clock
+            ).project_deferred_holds([[package_id, protected]])
+        except Exception as error:
+            warn(
+                f'Reading the lifecycle hold of package "{package_id}" failed: {error}'
+            )
+            return None
+        hold = holds.get(package_id) if isinstance(holds, dict) else None
+        if not isinstance(hold, dict):
+            return None
+        crypter = hold.get("crypter")
+        return crypter if isinstance(crypter, str) and crypter else None
+
     def _mutate_deferred_package(self, package_id, decide, count_events=None):
         """Run one atomic protected-row transaction gated on live defer metadata.
 
@@ -1611,8 +1650,10 @@ class CrypterCooldownService:
         `count_events()` reports the transition deltas the same transaction must
         add to the durable event ledger, so the decision and its accounting can
         never be committed apart. Returns "not_found", "not_deferred", or
-        "deferred".
+        "deferred". A package the version-two lifecycle holds counts as
+        deferred even without a defer block - see `_lifecycle_hold_crypter()`.
         """
+        lifecycle_crypter = self._lifecycle_hold_crypter(package_id)
         outcome = {"status": "not_found", "invalid": False}
 
         def update_package(current_value):
@@ -1625,8 +1666,23 @@ class CrypterCooldownService:
                 outcome["invalid"] = True
                 deferred = None
             if deferred is None:
-                outcome["status"] = "not_deferred"
-                return current_value
+                if lifecycle_crypter is None:
+                    outcome["status"] = "not_deferred"
+                    return current_value
+                # Held by the lifecycle instead. Stand in an INERT legacy-shape
+                # block so the caller has something to decide on: legacy shape
+                # because it covers every link of the package without inventing
+                # a generation binding, and `retry_after_epoch: 0` so
+                # package_defer_is_active() answers False - the block must never
+                # outrank the lifecycle projection that owns this row's display.
+                deferred = {
+                    "crypter": lifecycle_crypter,
+                    "reason_code": next(iter(SUPPORTED_REASON_CODES)),
+                    "since_epoch": int(self._clock()),
+                    "retry_after_epoch": 0,
+                    "probe_requested": False,
+                    "observation_holds": 0,
+                }
             outcome["status"] = "deferred"
             return decide(current_value, package, deferred)
 
