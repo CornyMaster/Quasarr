@@ -21,10 +21,11 @@ from quasarr.providers.hostname_issues import mark_hostname_issue
 from quasarr.providers.log import debug, info
 from quasarr.providers.utils import (
     NAVIGATION_CHAIN_READ_JS,
-    NAVIGATION_CHAIN_RECORDER_JS,
     detect_crypter_type,
     first_crypter_in_chain,
     is_flaresolverr_available,
+    navigation_chain_recorder_js,
+    new_navigation_chain_token,
 )
 
 
@@ -201,18 +202,24 @@ def _resolve_wd_redirect(shared_state, url, session_id=None):
     """
     # Try FlareSolverr first if available and session_id is provided
     if session_id and is_flaresolverr_available(shared_state):
+        # Each redirect gets its own chain identity; the solver session
+        # reuses one tab, so an unstamped chain would carry the previous
+        # link's crypter forward and every mirror would collapse into one.
+        chain_token = new_navigation_chain_token()
         try:
             r = flaresolverr_get(
                 shared_state,
                 url,
                 timeout=DOWNLOAD_REQUEST_TIMEOUT_SECONDS,
                 session_id=session_id,
-                document_start_js=NAVIGATION_CHAIN_RECORDER_JS,
+                document_start_js=navigation_chain_recorder_js(chain_token),
                 execute_js=NAVIGATION_CHAIN_READ_JS,
             )
             # The solver browser may have followed the chain past the real crypter
             # into a hostile ad; take the first crypter it walked and ignore the rest.
-            crypter_url = first_crypter_in_chain(getattr(r, "execute_js_result", None))
+            crypter_url = first_crypter_in_chain(
+                getattr(r, "execute_js_result", None), token=chain_token
+            )
             if crypter_url is not None:
                 return crypter_url
             if r.url.endswith("/404.html"):

@@ -11,9 +11,10 @@ from quasarr.providers.hostname_issues import mark_hostname_issue
 from quasarr.providers.log import debug, warn
 from quasarr.providers.utils import (
     NAVIGATION_CHAIN_READ_JS,
-    NAVIGATION_CHAIN_RECORDER_JS,
     detect_crypter_type,
     first_crypter_in_chain,
+    navigation_chain_recorder_js,
+    new_navigation_chain_token,
 )
 
 
@@ -29,7 +30,7 @@ def resolve_crypter_redirect(
     In the browser case the tab can be pushed *past* the real crypter container onto
     a hostile ad (Quasarr#419: an aliexpress affiliate page). The browser reports
     only its final URL, so we also read the recorded navigation chain
-    (``NAVIGATION_CHAIN_RECORDER_JS`` / ``first_crypter_in_chain``) and take the first
+    (``navigation_chain_recorder_js`` / ``first_crypter_in_chain``) and take the first
     crypter the browser walked, ignoring anything after it.
 
     ``accept_offsite`` returns a non-crypter URL that has left the source domain (a
@@ -43,6 +44,11 @@ def resolve_crypter_redirect(
     current_url = url
     visited = set()
     session = requests.Session()
+    # One identity for this whole resolution: the hop loop can drive the
+    # browser several times and those hops share one chain, while a LATER
+    # resolution in the same solver session must never inherit it.
+    chain_token = new_navigation_chain_token()
+    recorder_js = navigation_chain_recorder_js(chain_token)
 
     for _hop in range(8):
         if current_url in visited:
@@ -64,7 +70,7 @@ def resolve_crypter_redirect(
                     timeout=timeout,
                     headers=headers,
                 ),
-                document_start_js=NAVIGATION_CHAIN_RECORDER_JS,
+                document_start_js=recorder_js,
                 execute_js=NAVIGATION_CHAIN_READ_JS,
             )
         except Exception as e:
@@ -79,7 +85,9 @@ def resolve_crypter_redirect(
         # When the request went through the solver browser (Cloudflare-gated host),
         # it may have followed the chain past the real crypter into a hostile ad.
         # Take the first crypter the browser walked and stop; ignore anything after.
-        crypter_url = first_crypter_in_chain(getattr(r, "execute_js_result", None))
+        crypter_url = first_crypter_in_chain(
+            getattr(r, "execute_js_result", None), token=chain_token
+        )
         if crypter_url is not None:
             debug(
                 f"{label} resolved to crypter via navigation chain: <d>{crypter_url}</d>"

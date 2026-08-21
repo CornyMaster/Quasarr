@@ -941,12 +941,18 @@ class NavigationChainResolutionTests(unittest.TestCase):
                 document_start_js=None,
                 execute_js=None,
             ):
+                # A real solver tab runs the recorder, which stamps the chain
+                # with the token this resolution supplied; report it back the
+                # same way so the caller can recognise its own chain.
+                token = json.loads(
+                    document_start_js.split("var t=", 1)[1].split(";", 1)[0]
+                )
                 return FlareSolverrResponse(
                     url="https://www.aliexpress.com/p/popular-landing/aliexpress.html",
                     status_code=200,
                     headers={},
                     text="ad page",
-                    execute_js_result=chain,
+                    execute_js_result=json.dumps({"t": token, "c": json.loads(chain)}),
                 )
 
         for accept_offsite in (True, False):

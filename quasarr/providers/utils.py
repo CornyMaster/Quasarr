@@ -5,6 +5,7 @@
 import html
 import json
 import re
+import secrets
 import socket
 import sys
 import traceback
@@ -339,28 +340,75 @@ def detect_crypter_type(url):
 # onto an affiliate page (Quasarr#419: aliexpress), we can still recover the crypter
 # and ignore everything after it. Builds without documentStartJs support ignore it
 # and the chain is simply unavailable (callers fall back to their header/URL logic).
-NAVIGATION_CHAIN_RECORDER_JS = (
-    "try{var c=[];try{c=JSON.parse(window.name||'[]');}catch(e){c=[];}"
-    "if(!Array.isArray(c))c=[];c.push(location.href);"
-    "window.name=JSON.stringify(c);}catch(e){}"
-)
 NAVIGATION_CHAIN_READ_JS = "return window.name;"
 
 
-def first_crypter_in_chain(execute_js_result):
+def new_navigation_chain_token():
+    """A fresh identity for one resolution's navigation chain."""
+    return secrets.token_hex(8)
+
+
+def navigation_chain_recorder_js(token):
+    """Document-start script recording one resolution's navigation chain.
+
+    ``window.name`` is the carrier because it survives cross-origin navigation -
+    but it also survives every OTHER navigation in the same tab, and a
+    FlareSolverr session reuses one tab for every request made through it. The
+    first version of this recorder appended unconditionally, so the chain grew
+    across resolutions and ``first_crypter_in_chain()`` kept answering the very
+    first crypter the session had ever walked. Measured on a live instance: four
+    distinct link-protection redirects of one release, leading to four distinct
+    containers, all resolved to the first one - so every alternative container
+    was lost and the stored link did not even match the mirror the whitelist had
+    selected.
+
+    Each resolution therefore stamps its own ``token``. A stored chain carrying a
+    different one belongs to an earlier resolution and is discarded rather than
+    extended, which makes the isolation self-healing: a resolution that dies
+    before its chain is ever read cannot leak into the next one, because the next
+    one arrives with a token of its own. It also means a page that writes
+    ``window.name`` itself cannot inject a chain, since it cannot know the token.
+    """
+    return (
+        "try{var t=" + json.dumps(str(token)) + ";"
+        "var s=null;try{s=JSON.parse(window.name||'null');}catch(e){s=null;}"
+        "if(!s||typeof s!=='object'||s.t!==t||!Array.isArray(s.c)){s={t:t,c:[]};}"
+        "s.c.push(location.href);"
+        "window.name=JSON.stringify(s);}catch(e){}"
+    )
+
+
+def first_crypter_in_chain(execute_js_result, token=None):
     """Return the first crypter URL in a recorded navigation chain, or None.
 
     ``execute_js_result`` is the JSON string produced by
-    ``NAVIGATION_CHAIN_READ_JS`` (the browser's ordered list of visited URLs). The
-    first entry whose ``detect_crypter_type`` is not None is the real container link;
-    anything after it (e.g. a hostile ad redirect) is ignored. Returns None when no
-    chain is available (non-browser resolution / FlareSolverr build without support)
-    or no crypter was walked, so callers keep their existing behavior.
+    ``NAVIGATION_CHAIN_READ_JS``. The first entry whose ``detect_crypter_type`` is
+    not None is the real container link; anything after it (e.g. a hostile ad
+    redirect) is ignored. Returns None when no chain is available (non-browser
+    resolution / FlareSolverr build without support) or no crypter was walked, so
+    callers keep their existing behavior.
+
+    When ``token`` is given, only a chain stamped with that exact token is read -
+    anything else belongs to another resolution, or to nobody we trust, and
+    answers None. Without a token the bare-list shape is still accepted, which is
+    what a caller that does not record a chain of its own would see.
     """
     try:
-        chain = json.loads(execute_js_result) if execute_js_result else []
+        parsed = json.loads(execute_js_result) if execute_js_result else None
     except (ValueError, TypeError):
         return None
+
+    if isinstance(parsed, dict):
+        if token is not None and parsed.get("t") != token:
+            return None
+        chain = parsed.get("c")
+    elif token is None:
+        chain = parsed
+    else:
+        # A token was expected but the chain carries no identity, so its owner
+        # cannot be established. Refusing it keeps a stale or planted chain out.
+        return None
+
     if not isinstance(chain, list):
         return None
     for hop_url in chain:
