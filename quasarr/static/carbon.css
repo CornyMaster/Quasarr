@@ -1651,6 +1651,14 @@ a {
 	text-align: center;
 }
 
+/* A release name is one unbroken token; inside the 440px status card it
+   would otherwise run past the edge. Only this card needs it - the
+   dashboard and statistics rows it shares the component with are short. */
+.cds-status-card .cds-kv__value {
+	overflow-wrap: anywhere;
+	text-align: right;
+}
+
 .cds-status-card .cds-btn {
 	margin-top: 16px;
 }

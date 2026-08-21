@@ -86,6 +86,41 @@ def is_junkies_link(sj, dj, link):
     return bool((sj and sj in url) or (dj and dj in url))
 
 
+def _render_captcha_outcome(
+    page_id,
+    classic_fn,
+    *,
+    status,
+    heading,
+    message="",
+    package_id="",
+    rows=(),
+    actions=(),
+):
+    """Dispatch one end-of-flow CAPTCHA page between Carbon and Classic.
+
+    `/captcha/quick-transfer`, `/captcha/delete/<package_id>` and
+    `POST /captcha/bypass-submit` are where a solve ends, and they used to
+    answer in Classic markup whichever UI the visitor had chosen. The
+    Classic body every caller passes here is the one it always rendered,
+    unchanged; only the Carbon branch is new.
+    """
+
+    def carbon():
+        from quasarr.api.captcha.carbon import render_outcome
+
+        return render_outcome(
+            status,
+            heading,
+            message,
+            package_id=package_id,
+            rows=rows,
+            actions=actions,
+        )
+
+    return render_page(page_id, carbon, classic_fn, shared_state=shared_state)
+
+
 def setup_captcha_routes(app):
     @app.get("/captcha")
     def check_captcha():
@@ -257,13 +292,31 @@ def setup_captcha_routes(app):
         else:
             solve_button = "<b>No more CAPTCHAs</b>"
 
-        return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+        carbon_actions = (("Solve another CAPTCHA", "/captcha", "secondary"),)
+        if not remaining_protected:
+            carbon_actions = ()
+
+        return _render_captcha_outcome(
+            "captcha-solved",
+            lambda: (
+                render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
         <p><b>✅ CAPTCHA solved and submitted to JDownloader.</b></p>
         <p style="word-break: break-all;"><b>Package:</b> {title}</p>
         <p>{link_count} link(s) processed.</p>
         <p>{solve_button}</p>
         <p>{render_button("Back", "secondary", {"onclick": "location.href='/'"})}</p>
         <script>localStorage.removeItem('captcha_attempts_{package_id}');</script>''')
+            ),
+            status="success",
+            heading="CAPTCHA solved",
+            message="The links were submitted to JDownloader.",
+            package_id=package_id,
+            rows=(
+                ("Package", str(title)),
+                ("Links", f"{link_count} processed"),
+            ),
+            actions=carbon_actions,
+        )
 
     def render_userscript_section(
         url, package_id, title, password, provider_type="junkies"
@@ -1026,11 +1079,20 @@ def setup_captcha_routes(app):
             compressed_links = request.query.get("links", "")
 
             if not package_id or not compressed_links:
-                return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                return _render_captcha_outcome(
+                    "captcha-quick-transfer",
+                    lambda: (
+                        render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                 <p><b>Error:</b> Missing parameters</p>
                 <p>
                     {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                 </p>''')
+                    ),
+                    status="error",
+                    heading="Transfer failed",
+                    message="Missing parameters.",
+                    actions=(("Back", "/", "secondary"),),
+                )
 
             # Decode the compressed links using urlsafe_b64decode
             # Add padding if needed
@@ -1041,12 +1103,22 @@ def setup_captcha_routes(app):
             try:
                 decoded = urlsafe_b64decode(compressed_links)
             except Exception as e:
+                failure_detail = str(e)
                 info(f"Base64 decode error: {e}")
-                return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
-                <p><b>Error:</b> Failed to decode data: {str(e)}</p>
+                return _render_captcha_outcome(
+                    "captcha-quick-transfer",
+                    lambda: (
+                        render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                <p><b>Error:</b> Failed to decode data: {failure_detail}</p>
                 <p>
                     {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                 </p>''')
+                    ),
+                    status="error",
+                    heading="Transfer failed",
+                    message=f"Failed to decode data: {failure_detail}",
+                    actions=(("Back", "/", "secondary"),),
+                )
 
             # Decompress using zlib - use raw deflate format (no header)
             try:
@@ -1054,17 +1126,27 @@ def setup_captcha_routes(app):
                     decoded, -15
                 )  # -15 = raw deflate, no zlib header
             except Exception as e:
+                failure_detail = str(e)
                 trace(f"Decompression error: {e}, trying with header...")
                 try:
                     # Fallback: try with zlib header
                     decompressed = zlib.decompress(decoded)
                 except Exception as e2:
                     info(f"Decompression failed without and with header: {e2}")
-                    return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
-                    <p><b>Error:</b> Failed to decompress data: {str(e)}</p>
+                    return _render_captcha_outcome(
+                        "captcha-quick-transfer",
+                        lambda: (
+                            render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                    <p><b>Error:</b> Failed to decompress data: {failure_detail}</p>
                     <p>
                         {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                     </p>''')
+                        ),
+                        status="error",
+                        heading="Transfer failed",
+                        message=f"Failed to decompress data: {failure_detail}",
+                        actions=(("Back", "/", "secondary"),),
+                    )
 
             links_text = decompressed.decode("utf-8")
 
@@ -1085,11 +1167,20 @@ def setup_captcha_routes(app):
             # Get package info
             raw_data = shared_state.get_db("protected").retrieve(package_id)
             if not raw_data:
-                return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                return _render_captcha_outcome(
+                    "captcha-quick-transfer",
+                    lambda: (
+                        render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                 <p><b>Error:</b> Package not found</p>
                 <p>
                     {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                 </p>''')
+                    ),
+                    status="error",
+                    heading="Package not found",
+                    message="This package is no longer waiting for a CAPTCHA.",
+                    actions=(("Back", "/", "secondary"),),
+                )
 
             data = json.loads(raw_data)
             title = data.get("title", "Unknown")
@@ -1119,25 +1210,53 @@ def setup_captcha_routes(app):
             else:
                 StatsHelper(shared_state).increment_failed_decryptions_manual()
                 if submit_result.get("persisted_failure"):
-                    return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                    return _render_captcha_outcome(
+                        "captcha-quick-transfer",
+                        lambda: (
+                            render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                     <p><b>Package marked as failed.</b></p>
                     <p>{submit_result["reason"]}</p>
                     <p>
                         {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                     </p>''')
-                return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                        ),
+                        status="warning",
+                        heading="Package marked as failed",
+                        message=str(submit_result["reason"]),
+                        actions=(("Back", "/", "secondary"),),
+                    )
+                return _render_captcha_outcome(
+                    "captcha-quick-transfer",
+                    lambda: (
+                        render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                 <p><b>Error:</b> Failed to submit package to JDownloader</p>
                 <p>
                     {render_button("Try Again", "secondary", {"onclick": "location.href='/captcha'"})}
                 </p>''')
+                    ),
+                    status="error",
+                    heading="Handover failed",
+                    message="The links could not be submitted to JDownloader.",
+                    actions=(("Try Again", "/captcha", "secondary"),),
+                )
 
         except Exception as e:
+            failure_detail = str(e)
             error(f"Quick transfer error: {e}")
-            return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
-            <p><b>Error:</b> {str(e)}</p>
+            return _render_captcha_outcome(
+                "captcha-quick-transfer",
+                lambda: (
+                    render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+            <p><b>Error:</b> {failure_detail}</p>
             <p>
                 {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
             </p>''')
+                ),
+                status="error",
+                heading="Transfer failed",
+                message=failure_detail,
+                actions=(("Back", "/", "secondary"),),
+            )
 
     @app.get("/captcha/delete/<package_id>")
     def delete_captcha_package(package_id):
@@ -1159,8 +1278,15 @@ def setup_captcha_routes(app):
         else:
             solve_button = "<b>No more CAPTCHAs</b>"
 
+        carbon_actions = (("Solve another CAPTCHA", "/captcha", "secondary"),)
+        if not has_more_captchas:
+            carbon_actions = ()
+
         if success:
-            return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+            return _render_captcha_outcome(
+                "captcha-deleted",
+                lambda: (
+                    render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
             <p>Package successfully deleted!</p>
             <p>
                 {solve_button}
@@ -1169,8 +1295,18 @@ def setup_captcha_routes(app):
                 {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
             </p>
             <script>localStorage.removeItem('captcha_attempts_{package_id}');</script>''')
+                ),
+                status="success",
+                heading="Package deleted",
+                message="The package and its CAPTCHA were removed.",
+                package_id=package_id,
+                actions=carbon_actions,
+            )
         else:
-            return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+            return _render_captcha_outcome(
+                "captcha-deleted",
+                lambda: (
+                    render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
             <p>Failed to delete package!</p>
             <p>
                 {solve_button}
@@ -1178,6 +1314,13 @@ def setup_captcha_routes(app):
             <p>
                 {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
             </p>''')
+                ),
+                status="error",
+                heading="Delete failed",
+                message="The package could not be deleted.",
+                package_id=package_id,
+                actions=carbon_actions,
+            )
 
     @app.post("/captcha/bypass-submit")
     def handle_bypass_submit():
@@ -1189,11 +1332,20 @@ def setup_captcha_routes(app):
             links_input = request.forms.get("links", "").strip()
 
             if not package_id or not title:
-                return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                return _render_captcha_outcome(
+                    "captcha-bypass-submit",
+                    lambda: (
+                        render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                 <p><b>Error:</b> Missing package information.</p>
                 <p>
                     {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                 </p>''')
+                    ),
+                    status="error",
+                    heading="Submission failed",
+                    message="Missing package information.",
+                    actions=(("Back", "/", "secondary"),),
+                )
 
             check_package_exists(package_id)
 
@@ -1214,11 +1366,20 @@ def setup_captcha_routes(app):
                     f"(from <y>{len(raw_links)}</y> provided)"
                 )
             else:
-                return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                return _render_captcha_outcome(
+                    "captcha-bypass-submit",
+                    lambda: (
+                        render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                 <p><b>Error:</b> Please provide the download links.</p>
                 <p>
                     {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                 </p>''')
+                    ),
+                    status="error",
+                    heading="Submission failed",
+                    message="Please provide the download links.",
+                    actions=(("Back", "/", "secondary"),),
+                )
 
             # Download the package
             if links:
@@ -1242,28 +1403,65 @@ def setup_captcha_routes(app):
                 else:
                     StatsHelper(shared_state).increment_failed_decryptions_manual()
                     if submit_result.get("persisted_failure"):
-                        return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                        return _render_captcha_outcome(
+                            "captcha-bypass-submit",
+                            lambda: (
+                                render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                         <p><b>Package marked as failed.</b></p>
                         <p>{submit_result["reason"]}</p>
                         <p>
                             {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                         </p>''')
-                    return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                            ),
+                            status="warning",
+                            heading="Package marked as failed",
+                            message=str(submit_result["reason"]),
+                            actions=(("Back", "/", "secondary"),),
+                        )
+                    return _render_captcha_outcome(
+                        "captcha-bypass-submit",
+                        lambda: (
+                            render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                     <p><b>Error:</b> Failed to submit package to JDownloader.</p>
                     <p>
                         {render_button("Try Again", "secondary", {"onclick": "location.href='/captcha'"})}
                     </p>''')
+                        ),
+                        status="error",
+                        heading="Handover failed",
+                        message="The links could not be submitted to JDownloader.",
+                        actions=(("Try Again", "/captcha", "secondary"),),
+                    )
             else:
-                return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+                return _render_captcha_outcome(
+                    "captcha-bypass-submit",
+                    lambda: (
+                        render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
                 <p><b>Error:</b> No valid links found.</p>
                 <p>
                     {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
                 </p>''')
+                    ),
+                    status="error",
+                    heading="Submission failed",
+                    message="No valid links found.",
+                    actions=(("Back", "/", "secondary"),),
+                )
 
         except Exception as e:
+            failure_detail = str(e)
             info(f"Bypass submission error: {e}")
-            return render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
-            <p><b>Error:</b> {str(e)}</p>
+            return _render_captcha_outcome(
+                "captcha-bypass-submit",
+                lambda: (
+                    render_centered_html(f'''<h1><img src="{images.logo}" type="image/webp" alt="Quasarr logo" class="logo"/>Quasarr</h1>
+            <p><b>Error:</b> {failure_detail}</p>
             <p>
                 {render_button("Back", "secondary", {"onclick": "location.href='/'"})}
             </p>''')
+                ),
+                status="error",
+                heading="Submission failed",
+                message=failure_detail,
+                actions=(("Back", "/", "secondary"),),
+            )

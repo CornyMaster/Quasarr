@@ -54,10 +54,12 @@ from quasarr.providers.auth import show_logout_link
 from quasarr.providers.carbon_icons import render_icon
 from quasarr.providers.carbon_templates import (
     grid,
+    kv_rows,
     notification,
     page_header,
     protected_captcha_count,
     render_carbon_html,
+    render_carbon_simple_page,
     tile,
 )
 from quasarr.storage.config import Config
@@ -419,4 +421,67 @@ def render_captcha(shared_state, provider):
     )
 
 
-__all__ = ["render_captcha"]
+_OUTCOME_STATUSES = frozenset({"success", "warning", "error"})
+_OUTCOME_BUTTON_KINDS = frozenset({"primary", "secondary", "ghost", "danger-ghost"})
+
+
+def render_outcome(
+    status: str,
+    heading: str,
+    message: str = "",
+    *,
+    package_id: str = "",
+    rows: tuple = (),
+    actions: tuple = (),
+) -> str:
+    """Carbon page for a CAPTCHA flow that has ended.
+
+    The three routes that finish a solve - ``/captcha/quick-transfer``,
+    ``/captcha/delete/<package_id>`` and ``POST /captcha/bypass-submit`` -
+    all end on one of these, in success and in failure alike. They are
+    standalone status cards rather than full dashboard pages because they
+    are reached inside the provider popup ``openProvider()`` opens: there is
+    no queue to navigate from there, only an outcome to read and a window to
+    close.
+
+    ``package_id`` is what retires that package's ``captcha_attempts_``
+    counter. Classic does that with an inline ``<script>``; the Carbon CSP
+    forbids one, so the id travels as a data attribute and ``carbon.js``
+    reads it on load - along with ``data-captcha-result``, which decides
+    whether the window that opened this one is told to refresh its queue.
+    """
+    if status not in _OUTCOME_STATUSES:
+        raise ValueError("Unsupported CAPTCHA outcome status")
+
+    buttons = []
+    for label, href, kind in actions:
+        if kind not in _OUTCOME_BUTTON_KINDS:
+            raise ValueError("Unsupported CAPTCHA outcome button kind")
+        buttons.append(
+            f'<a class="cds-btn cds-btn--{kind}" href="{_h(href)}">{_h(label)}</a>'
+        )
+    # Hidden until carbon.js finds an opener: a window nothing opened cannot
+    # be closed by script, and offering the control anyway would promise
+    # something the browser refuses to do.
+    close_button = (
+        '<button type="button" class="cds-btn cds-btn--primary" '
+        'data-action="captcha-result-close" hidden>Close window</button>'
+    )
+
+    rows_html = kv_rows(rows) if rows else ""
+    body = rows_html + (
+        f'<div class="cds-cta-row">{close_button}{"".join(buttons)}</div>'
+    )
+
+    content = (
+        f'<div data-captcha-result="{_h(status)}" '
+        f'data-package-id="{_h(package_id)}">'
+        + page_header("Link protection", heading)
+        + notification(status, heading, message)
+        + tile(body)
+        + "</div>"
+    )
+    return render_carbon_simple_page(content, title=heading)
+
+
+__all__ = ["render_captcha", "render_outcome"]

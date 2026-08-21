@@ -922,13 +922,42 @@ class CaptchaCarbonJsCssStructureTests(unittest.TestCase):
         body = self._function_body("openProvider")
         self.assertIn("getElementById('captcha-tutorial-content')", body)
         self.assertIn("window.showModal(", body)
-        self.assertIn("window.incrementCaptchaAttempts()", body)
+        # Both exits from the tutorial - straight through and after the
+        # countdown - go through the one window opener, which is what
+        # counts the attempt.
+        self.assertIn("openProviderWindow(url)", body)
 
     def test_open_provider_skips_tutorial_when_already_seen(self):
         body = self._function_body("openProvider")
         seen_index = body.index("tutorialSeen(storageKey)")
-        navigate_index = body.index("window.location.href = url")
-        self.assertLess(seen_index, navigate_index)
+        open_index = body.index("openProviderWindow(url)")
+        self.assertLess(seen_index, open_index)
+
+    def test_provider_opens_in_a_named_popup_not_the_current_window(self):
+        """The CAPTCHA page must survive the solve.
+
+        The userscript posts its links back to /captcha/quick-transfer in
+        whichever window the provider was opened in. Navigating this one
+        away threw the package selector, the attempt counter and the
+        visitor's place in the queue away with it.
+        """
+        body = self._function_body("openProviderWindow")
+        self.assertIn("window.incrementCaptchaAttempts()", body)
+        self.assertIn(
+            "window.open(url, PROVIDER_WINDOW_NAME, PROVIDER_WINDOW_FEATURES)", body
+        )
+        # A reused name re-focuses one popup instead of stacking one per click.
+        self.assertIn("var PROVIDER_WINDOW_NAME = 'quasarrCaptchaProvider';", self.js)
+        self.assertIn("popup=yes", self.js)
+        # `noopener` would sever window.opener, and the result page needs it
+        # to refresh the queue behind it.
+        self.assertNotIn("noopener", self.js.split("PROVIDER_WINDOW_FEATURES")[1][:200])
+
+    def test_blocked_popup_falls_back_to_navigating_this_window(self):
+        """A popup blocker may not strand the visitor mid-solve."""
+        body = self._function_body("openProviderWindow")
+        self.assertIn("if (!popup) {", body)
+        self.assertIn("window.location.href = url;", body)
 
     def test_manual_submit_increments_attempts_without_blocking_submission(self):
         body = self._function_body("onCaptchaSubmit")
@@ -1046,6 +1075,176 @@ class CaptchaCarbonJsCssStructureTests(unittest.TestCase):
             self.css,
             r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important;",
         )
+
+
+class CaptchaOutcomePageTests(_CaptchaCarbonTestHelpers, unittest.TestCase):
+    """The three routes a solve ends on.
+
+    `/captcha/quick-transfer`, `/captcha/delete/<package_id>` and
+    `POST /captcha/bypass-submit` rendered Classic markup under both UIs
+    until they were put behind the same dispatcher every other page uses.
+    They are reached inside the provider popup, so they also carry what
+    that popup needs: the package id whose attempt counter is now spent,
+    and the marker carbon.js reads to refresh the window behind it.
+    """
+
+    def _delete(self, app, package_id, query="ui=carbon"):
+        return self._request(app, f"/captcha/delete/{package_id}", query)
+
+    def test_delete_success_renders_the_carbon_status_card(self):
+        package = build_package(
+            "pkg-fc",
+            "https://filecrypt.example.invalid/Container/abc.html",
+            "filecrypt",
+        )
+        app = self._serve([package])
+
+        with patch.object(captcha_init, "delete_package", return_value=True):
+            status, headers, body = self._delete(app, "pkg-fc")
+
+        self.assertEqual("200 OK", status)
+        self.assertIn("Content-Security-Policy", headers)
+        self.assertIn("cds-status-card", body)
+        self.assertIn('data-captcha-result="success"', body)
+        self.assertIn('data-package-id="pkg-fc"', body)
+        self.assertIn("Package deleted", body)
+
+    def test_delete_failure_renders_an_error_card_that_refreshes_nothing(self):
+        package = build_package(
+            "pkg-fc",
+            "https://filecrypt.example.invalid/Container/abc.html",
+            "filecrypt",
+        )
+        app = self._serve([package])
+
+        with patch.object(captcha_init, "delete_package", return_value=False):
+            _, _, body = self._delete(app, "pkg-fc")
+
+        self.assertIn('data-captcha-result="error"', body)
+        self.assertIn("Delete failed", body)
+
+    def test_outcome_pages_carry_no_inline_script(self):
+        """Classic retired the attempt counter with an inline <script>.
+
+        The Carbon CSP forbids one, so the package id travels as a data
+        attribute and carbon.js clears the counter on load instead.
+        """
+        package = build_package(
+            "pkg-fc",
+            "https://filecrypt.example.invalid/Container/abc.html",
+            "filecrypt",
+        )
+        app = self._serve([package])
+
+        with patch.object(captcha_init, "delete_package", return_value=True):
+            _, _, body = self._delete(app, "pkg-fc")
+
+        self.assertNotIn("localStorage.removeItem", body)
+        self.assertNotIn("<script>", body)
+        self.assertNotIn("onclick=", body)
+
+    def test_close_window_button_ships_hidden(self):
+        """Only a popup can be closed by script.
+
+        carbon.js reveals the button once it finds an opener; a page
+        reached by ordinary navigation must not offer a control the
+        browser will refuse.
+        """
+        package = build_package(
+            "pkg-fc",
+            "https://filecrypt.example.invalid/Container/abc.html",
+            "filecrypt",
+        )
+        app = self._serve([package])
+
+        with patch.object(captcha_init, "delete_package", return_value=True):
+            _, _, body = self._delete(app, "pkg-fc")
+
+        self.assertIn('data-action="captcha-result-close" hidden>Close window', body)
+
+    def test_classic_delete_body_is_unchanged(self):
+        """The Classic branch is the body it always rendered."""
+        package = build_package(
+            "pkg-fc",
+            "https://filecrypt.example.invalid/Container/abc.html",
+            "filecrypt",
+        )
+        app = self._serve([package])
+
+        with patch.object(captcha_init, "delete_package", return_value=True):
+            _, _, body = self._delete(app, "pkg-fc", query="ui=classic")
+
+        self.assertIn("Package successfully deleted!", body)
+        self.assertIn(
+            "localStorage.removeItem('captcha_attempts_pkg-fc');",
+            body,
+        )
+        self.assertNotIn("cds-status-card", body)
+
+    def test_quick_transfer_missing_parameters_renders_carbon_error(self):
+        package = build_package(
+            "pkg-fc",
+            "https://filecrypt.example.invalid/Container/abc.html",
+            "filecrypt",
+        )
+        app = self._serve([package])
+
+        status, _, body = self._request(app, "/captcha/quick-transfer", "ui=carbon")
+
+        self.assertEqual("200 OK", status)
+        self.assertIn('data-captcha-result="error"', body)
+        self.assertIn("Transfer failed", body)
+        self.assertIn("Missing parameters.", body)
+
+    def test_render_outcome_rejects_an_unknown_status(self):
+        with self.assertRaises(ValueError):
+            captcha_carbon.render_outcome("info", "Heading")
+
+    def test_render_outcome_rejects_an_unknown_button_kind(self):
+        with self.assertRaises(ValueError):
+            captcha_carbon.render_outcome(
+                "success", "Heading", actions=(("Back", "/", "cta"),)
+            )
+
+    def test_render_outcome_escapes_the_package_title(self):
+        html = captcha_carbon.render_outcome(
+            "success",
+            "CAPTCHA solved",
+            "The links were submitted to JDownloader.",
+            package_id="pkg-fc",
+            rows=(("Package", '<img src=x onerror="alert(1)">'),),
+        )
+
+        self.assertNotIn("<img src=x", html)
+        self.assertIn("&lt;img src=x", html)
+
+
+class CaptchaResultScriptTests(unittest.TestCase):
+    """carbon.js's side of the outcome pages."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = (STATIC_ROOT / "carbon.js").read_text(encoding="utf-8")
+
+    def test_result_page_clears_the_spent_attempt_counter(self):
+        self.assertIn("bootstrapCarbonCaptchaResult", self.js)
+        self.assertIn(
+            "localStorage.removeItem('captcha_attempts_' + packageId)", self.js
+        )
+
+    def test_only_a_success_refreshes_the_window_behind_the_popup(self):
+        marker = self.js.index("bootstrapCarbonCaptchaResult")
+        body = self.js[marker : self.js.index("})();", marker)]
+        guard = body.index("data-captcha-result') === 'success'")
+        reload_call = body.index("opener.location.reload()")
+        self.assertLess(guard, reload_call)
+
+    def test_close_button_is_revealed_only_with_an_opener(self):
+        marker = self.js.index("bootstrapCarbonCaptchaResult")
+        body = self.js[marker : self.js.index("})();", marker)]
+        opener_index = body.index("var opener = openerWindow();")
+        reveal_index = body.index('captcha-result-close"]')
+        self.assertLess(opener_index, reveal_index)
 
 
 if __name__ == "__main__":

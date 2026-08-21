@@ -2667,10 +2667,39 @@
 		}
 	}
 
+	// The provider is opened in a named popup so this page survives the
+	// solve: the userscript posts its links back to /captcha/quick-transfer
+	// inside that popup, and the package selector, the attempt counter and
+	// the visitor's place in the queue all stay exactly where they were.
+	// The name is reused, so a second click re-focuses the same window
+	// instead of stacking one popup per attempt.
+	var PROVIDER_WINDOW_NAME = 'quasarrCaptchaProvider';
+	var PROVIDER_WINDOW_FEATURES = 'popup=yes,width=1180,height=920,scrollbars=yes,resizable=yes';
+
+	function openProviderWindow(url) {
+		window.incrementCaptchaAttempts();
+		var popup = null;
+		try {
+			popup = window.open(url, PROVIDER_WINDOW_NAME, PROVIDER_WINDOW_FEATURES);
+		} catch (_error) {
+			popup = null;
+		}
+		if (!popup) {
+			// A blocked popup may not strand the visitor mid-flow: the
+			// same-window navigation this replaced is still a working solve.
+			window.location.href = url;
+			return;
+		}
+		try {
+			popup.focus();
+		} catch (_error) {
+			// Focus is a courtesy; the popup is open either way.
+		}
+	}
+
 	function openProvider(url, storageKey) {
 		if (tutorialSeen(storageKey)) {
-			window.incrementCaptchaAttempts();
-			window.location.href = url;
+			openProviderWindow(url);
 			return;
 		}
 
@@ -2704,8 +2733,7 @@
 					if (typeof window.closeModal === 'function') {
 						window.closeModal();
 					}
-					window.incrementCaptchaAttempts();
-					window.location.href = url;
+					openProviderWindow(url);
 				});
 			} else {
 				btn.textContent = 'Wait ' + count + 's...';
@@ -2807,6 +2835,82 @@
 		// 'toggle' does not bubble in every browser - capture phase still
 		// reaches document regardless, so delegation stays reliable.
 		document.addEventListener('toggle', onCaptchaToggle, true);
+	});
+})();
+
+(function bootstrapCarbonCaptchaResult() {
+	'use strict';
+
+	// The pages that end a solve - quick-transfer, delete and the manual
+	// bypass submit - are reached inside the provider popup openProvider()
+	// opened, so they own two things the CAPTCHA page cannot do for them:
+	// retiring that package's attempt counter, and telling the window that
+	// opened them that its queue has changed. Both are page-load side
+	// effects driven entirely by server-rendered data attributes, because
+	// the Carbon CSP forbids the inline <script> Classic used here.
+
+	function clearAttempts(packageId) {
+		if (!packageId) {
+			return;
+		}
+		try {
+			localStorage.removeItem('captcha_attempts_' + packageId);
+		} catch (_error) {
+			// Nothing stored to remove.
+		}
+	}
+
+	function openerWindow() {
+		try {
+			var opener = window.opener;
+			return opener && !opener.closed ? opener : null;
+		} catch (_error) {
+			// A cross-origin or discarded opener answers nothing useful.
+			return null;
+		}
+	}
+
+	function onResultClick(event) {
+		var eventTarget = event.target instanceof Element ? event.target : null;
+		var actionElement = eventTarget ? eventTarget.closest('[data-action]') : null;
+		if (!actionElement || actionElement.getAttribute('data-action') !== 'captcha-result-close') {
+			return;
+		}
+		try {
+			window.close();
+		} catch (_error) {
+			// A window this script did not open cannot be closed; the other
+			// actions on the page still work.
+		}
+	}
+
+	document.addEventListener('DOMContentLoaded', function onReady() {
+		var marker = document.querySelector('[data-captcha-result]');
+		if (!marker) {
+			return;
+		}
+
+		clearAttempts(String(marker.getAttribute('data-package-id') || ''));
+
+		var opener = openerWindow();
+		if (opener) {
+			// Only a popup can be closed again, so the button stays hidden
+			// when this page was reached by ordinary navigation.
+			document.querySelectorAll('[data-action="captcha-result-close"]').forEach(function (button) {
+				button.hidden = false;
+			});
+			if (marker.getAttribute('data-captcha-result') === 'success') {
+				// The package this solve retired is gone from the queue behind
+				// us; an unrefreshed selector would offer it again.
+				try {
+					opener.location.reload();
+				} catch (_error) {
+					// Same-origin only; nothing to do when it is not.
+				}
+			}
+		}
+
+		document.addEventListener('click', onResultClick);
 	});
 })();
 
