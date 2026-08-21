@@ -116,6 +116,40 @@ def _lifecycle_deferred_by_package(shared_state, protected_rows):
         return {}
 
 
+def _protected_origin(links):
+    """The crypter key and host a still-protected package points at.
+
+    The same two values `/captcha` shows in its "Crypter · Mirror · Links"
+    line, read from the same stored links - so a package waiting for a
+    CAPTCHA can name its crypter in the Downloads table without depending on
+    the `package_origin` row, which only exists for packages grabbed since
+    that table was introduced.
+
+    Lazy import: `quasarr.downloads.__init__` imports this module, so
+    reaching back into it at module scope would be circular. Mirrors
+    `_lifecycle_deferred_by_package()`'s identical lazy import above.
+    """
+    from quasarr.downloads import resolve_protected_crypter_key
+    from quasarr.providers.package_origin import mirror_from_url
+
+    if not links:
+        return "", ""
+    first = links[0]
+    url = first[0] if isinstance(first, (list, tuple)) and first else first
+    try:
+        crypter = resolve_protected_crypter_key(first) or ""
+    except Exception:
+        crypter = ""
+    if not crypter:
+        # The host only leaves this function once it is known to BE a
+        # linkcrypter's host - that is the whole of the exception the
+        # Downloads contract grants. An unrecognized link could be a hoster
+        # or a source, and publishing its host would widen the exception
+        # into exactly what the contract forbids.
+        return "", ""
+    return crypter, mirror_from_url(url)
+
+
 def package_comment_id(comment):
     """The Quasarr identity a JDownloader comment names.
 
@@ -769,6 +803,7 @@ def _collect_packages(shared_state, cache, get_active_device, auto_start):
                 package_id = package["comment"]
                 category = get_download_category_from_package_id(package_id)
                 package_type = "linkgrabber"
+                live_crypter, live_mirror = "", ""
                 package_uuid = package["uuid"]
 
             elif package["type"] == "downloader":
@@ -797,6 +832,7 @@ def _collect_packages(shared_state, cache, get_active_device, auto_start):
                 package_id = package["comment"]
                 category = get_download_category_from_package_id(package_id)
                 package_type = "downloader"
+                live_crypter, live_mirror = "", ""
                 package_uuid = package["uuid"]
 
             else:  # protected
@@ -814,6 +850,13 @@ def _collect_packages(shared_state, cache, get_active_device, auto_start):
                 category = get_download_category_from_package_id(package_id)
                 package_type = "protected"
                 package_uuid = None
+                # A still-protected package carries its crypter links right
+                # here, which is how the CAPTCHA page names the crypter and
+                # mirror it is about to open. Deriving them from the same
+                # links means every waiting package shows them immediately,
+                # including the ones that predate the package_origin table -
+                # no backfill, and no stored value to go stale.
+                live_crypter, live_mirror = _protected_origin(details.get("urls"))
 
             # Use package_id if available, otherwise use uuid as fallback for non-Quasarr packages
             effective_id = package_id or package_uuid
@@ -840,6 +883,8 @@ def _collect_packages(shared_state, cache, get_active_device, auto_start):
                     "uuid": package_uuid,
                     "is_archive": package.get("is_archive", False),
                     "storage": storage,
+                    "crypter": live_crypter,
+                    "mirror": live_mirror,
                 }
                 if package.get("deferred"):
                     queue_item["deferred"] = package["deferred"]

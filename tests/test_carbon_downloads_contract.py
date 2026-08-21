@@ -1169,7 +1169,11 @@ class PackageListProjectionTests(unittest.TestCase):
         assert_valid_package_list_response(self, response)
         serialized = json.dumps(response)
         self.assertNotIn("super-secret-credential", serialized)
-        self.assertNotIn("filecrypt.invalid", serialized)
+        # The crypter's bare host is the one allowed exception; the link
+        # itself - scheme, path, container token - is not.
+        self.assertEqual("filecrypt.invalid", response["queue"][0]["mirror"])
+        self.assertNotIn("://", serialized)
+        self.assertNotIn("/c/leak", serialized)
 
     # -- Latest-commit Filecrypt terminal-blacklist outcomes (c294f65) -----
 
@@ -1550,6 +1554,88 @@ class OriginProjectionTests(unittest.TestCase):
             }
         }
         row = _history_row({"nzo_id": PACKAGE_A, "name": "Synthetic.Release"}, origins)
+
+        self.assertEqual("", row["mirror"])
+
+    def test_an_unrecognized_link_publishes_no_host_at_all(self):
+        # The contract's exception is the host of a LINKCRYPTER. A link that
+        # resolves to no known crypter could be a hoster or a source, so its
+        # host must not leave the projection - publishing it would widen the
+        # exception into exactly what the contract forbids. Caught by the
+        # blacklist-scrub simulation before this rule existed.
+        from quasarr.downloads.packages import _protected_origin
+
+        for links in (
+            [["https://unknown-host.invalid/c/2", "filecrypt"]],
+            [["https://hoster.invalid/file/1", "rapidgator"]],
+            [["not-a-url", "filecrypt"]],
+            [],
+            None,
+        ):
+            with self.subTest(links=links):
+                self.assertEqual(("", ""), _protected_origin(links))
+
+    def test_a_recognized_crypter_link_yields_its_key_and_bare_host(self):
+        from quasarr.downloads.packages import _protected_origin
+
+        self.assertEqual(
+            ("filecrypt", "filecrypt.invalid"),
+            _protected_origin([["https://filecrypt.invalid/Container/ABC123", "x"]]),
+        )
+
+    def test_a_still_protected_row_names_its_crypter_without_a_stored_origin(self):
+        # The links of a package waiting for a CAPTCHA are right there, which
+        # is how /captcha names the crypter and mirror. Packages older than
+        # the package_origin table have no stored row at all, so this live
+        # value is the only thing that can fill the column for them.
+        row = carbon._build_queue_row(
+            {
+                "nzo_id": PACKAGE_A,
+                "filename": "[CAPTCHA not solved!] Synthetic.Release",
+                "crypter": "filecrypt",
+                "mirror": "filecrypt.invalid",
+            },
+            {},
+        )
+
+        self.assertEqual("filecrypt", row["crypter"])
+        self.assertEqual("FileCrypt", row["crypter_label"])
+        self.assertEqual("filecrypt.invalid", row["mirror"])
+        # Nothing ever recorded when these were accepted, so this one stays 0.
+        self.assertEqual(0, row["added_epoch"])
+
+    def test_the_live_link_wins_over_a_stale_stored_origin(self):
+        origins = {
+            PACKAGE_A: {
+                "crypter": "junkies",
+                "mirror": "old.invalid",
+                "added_epoch": NOW,
+            }
+        }
+        row = carbon._build_queue_row(
+            {
+                "nzo_id": PACKAGE_A,
+                "filename": "x",
+                "crypter": "filecrypt",
+                "mirror": "filecrypt.invalid",
+            },
+            origins,
+        )
+
+        self.assertEqual("filecrypt", row["crypter"])
+        self.assertEqual("filecrypt.invalid", row["mirror"])
+        self.assertEqual(NOW, row["added_epoch"])
+
+    def test_a_live_mirror_carrying_a_url_is_still_rejected(self):
+        row = carbon._build_queue_row(
+            {
+                "nzo_id": PACKAGE_A,
+                "filename": "x",
+                "crypter": "filecrypt",
+                "mirror": "https://filecrypt.invalid/Container/ABC123",
+            },
+            {},
+        )
 
         self.assertEqual("", row["mirror"])
 

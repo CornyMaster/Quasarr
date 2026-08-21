@@ -166,20 +166,23 @@ def _scrub_protected_links(text):
     return _BARE_HOST_PATTERN.sub(_redact_bare_host, scrubbed)
 
 
-def _origin_fields(package_id, origins, *, crypter_override=""):
+def _origin_fields(package_id, origins, *, crypter_override="", mirror_override=""):
     """The four origin fields of one row.
 
-    `crypter_override` exists for the deferred projection: a live hold names
-    the crypter that is actually blocking right now, which is authoritative
-    over whatever the package was first accepted through. The stored origin
-    still supplies the host and the acceptance time, which no hold carries.
+    Live values win over the stored record. A still-protected package carries
+    its crypter links right now (`downloads/packages._protected_origin()`
+    derives them exactly as `/captcha` does), and a live hold names the
+    crypter that is actually blocking - both are better answers than whatever
+    the package was first accepted through, and both are available for
+    packages older than the `package_origin` table. The stored row remains
+    the only source of `added_epoch`, which nothing else records.
     """
     origin = origins.get(package_id) or _EMPTY_ORIGIN
     crypter = crypter_override or str(origin.get("crypter") or "")
     return {
         "crypter": crypter,
         "crypter_label": _origin_crypter_label(crypter),
-        "mirror": safe_mirror(origin.get("mirror")),
+        "mirror": safe_mirror(mirror_override) or safe_mirror(origin.get("mirror")),
         "added_epoch": _nonneg_int(origin.get("added_epoch")),
     }
 
@@ -305,7 +308,12 @@ def _build_queue_row(item, origins):
         "category": str(item.get("cat", "not_quasarr")),
         "size_label": size_label,
         "size_bytes": max(0, size_bytes),
-        **_origin_fields(str(item.get("nzo_id", "")), origins),
+        **_origin_fields(
+            str(item.get("nzo_id", "")),
+            origins,
+            crypter_override=str(item.get("crypter") or ""),
+            mirror_override=str(item.get("mirror") or ""),
+        ),
         "eta": eta,
         "eta_unknown": eta_unknown,
         "percentage": _clamp_percentage(item.get("percentage", 0)),
@@ -357,7 +365,10 @@ def _build_deferred_row(item, origins):
         **_origin_fields(
             str(item.get("nzo_id", "")),
             origins,
-            crypter_override=str(deferred.get("crypter") or ""),
+            # The live hold outranks the link's own crypter; the link still
+            # supplies the host, which no hold carries.
+            crypter_override=str(deferred.get("crypter") or item.get("crypter") or ""),
+            mirror_override=str(item.get("mirror") or ""),
         ),
         "reason_label": _label(deferred.get("reason_code"), _REASON_LABELS),
         "evidence_count": _nonneg_int(deferred.get("evidence_count")),
@@ -527,11 +538,7 @@ def _deferred_table_skeleton():
         '<section class="cds-tile" id="downloads-deferred-section" data-state="loading">'
         '<div class="cds-section-header">'
         '<h2 class="cds-tile__heading">Deferred linkcrypter checks</h2>'
-        # Sits in the header row like the Queue and History fields, not on a
-        # line of its own: the same control in the same place on all three
-        # tiles.
-        + _table_search_field("deferred-search", "Filter deferred packages")
-        + '<div class="cds-bulk-toolbar" id="deferred-bulk-toolbar">'
+        '<div class="cds-bulk-toolbar" id="deferred-bulk-toolbar">'
         '<span id="deferred-selection-count" class="cds-field__help">0 selected</span>'
         '<button class="cds-btn cds-btn--tertiary cds-btn--compact" type="button" '
         'data-action="deferred-probe-selected" disabled title="Check selected packages now" '
@@ -543,7 +550,12 @@ def _deferred_table_skeleton():
         'aria-label="Remove selected pending packages">'
         f"{render_icon('trash-can', class_name='cds-icon cds-icon--sm')}"
         "<span>Remove selected</span></button>"
-        "</div></div>"
+        "</div>"
+        # Last child, so it lands at the far right exactly like the Queue
+        # and History fields - the same control in the same place on every
+        # tile.
+        + _table_search_field("deferred-search", "Filter deferred packages")
+        + "</div>"
         '<div id="deferred-action-status" class="cds-field__help" aria-live="polite"></div>'
         '<div class="cds-table-wrap">'
         '<table class="cds-table cds-table--sticky-col" id="deferred-table" '

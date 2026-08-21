@@ -77,7 +77,7 @@ def safe_mirror(value):
     return candidate
 
 
-def _mirror_from_url(url):
+def mirror_from_url(url):
     """The host of a link, without scheme, credentials, path, or query.
 
     Parsed by hand rather than through urlsplit() so the authority is cut at
@@ -111,7 +111,7 @@ def record_package_origin(shared_state, package_id, crypter, url, *, now=None):
         {
             "schema_version": ORIGIN_SCHEMA_VERSION,
             "crypter": crypter,
-            "mirror": _mirror_from_url(url),
+            "mirror": mirror_from_url(url),
             "added_epoch": int(now if now is not None else time.time()),
         }
     )
@@ -179,6 +179,7 @@ __all__ = [
     "PACKAGE_ORIGIN_TABLE",
     "crypter_label",
     "forget_package_origin",
+    "mirror_from_url",
     "read_package_origins",
     "record_package_origin",
     "safe_mirror",

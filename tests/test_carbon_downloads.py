@@ -376,6 +376,25 @@ class DownloadsSkeletonRenderTests(unittest.TestCase):
                 label_open = html.rindex("<label", 0, start)
                 self.assertIn("cds-visually-hidden", html[label_open:start])
 
+    def test_every_search_field_is_the_last_element_of_its_header(self):
+        # Same control in the same place on every tile: the field hugs the
+        # right edge, so it must be the last child of the header it sits in.
+        html = self._render()
+        for section_id, field_id in (
+            ("downloads-deferred-section", "deferred-search"),
+            ("downloads-queue-section", "downloads-search"),
+            ("downloads-history-section", "history-search"),
+        ):
+            with self.subTest(field_id=field_id):
+                start = html.index(f'id="{section_id}"')
+                header_end = html.index("cds-table-wrap", start)
+                header = html[start:header_end]
+                field_at = header.index(f'id="{field_id}"')
+                # No other header control may follow the field.
+                for later in ("cds-bulk-toolbar", "cds-tile__heading"):
+                    if later in header:
+                        self.assertLess(header.index(later), field_at)
+
     def test_sortable_heads_declare_a_key_and_start_unsorted(self):
         html = self._render()
         for sort_key in (
@@ -950,7 +969,14 @@ class BlacklistScrubSimulationTests(unittest.TestCase):
         serialized = json.dumps(response)
         self.assertIsNone(re.search(r"\b[0-9a-f]{32}\b", serialized))
         self.assertIsNone(re.search(r"\b[0-9a-f]{64}\b", serialized))
-        self.assertNotIn("filecrypt.invalid", serialized)
+        # The crypter's bare host is the one deliberate exception - it is
+        # what /captcha shows too. Everything that would turn it back into a
+        # usable protected link (scheme, path, container token) must still be
+        # absent, and the host only appears at all because the link resolved
+        # to a known crypter.
+        self.assertEqual("filecrypt.invalid", response["deferred"][0]["mirror"])
+        self.assertNotIn("://", serialized)
+        self.assertNotIn("/c/1", serialized)
 
 
 # ---------------------------------------------------------------------------

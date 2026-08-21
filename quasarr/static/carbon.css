@@ -534,11 +534,6 @@ a {
 	margin: 0;
 }
 
-.cds-tile__head-row .cds-field {
-	margin-top: 0;
-	flex: 1 1 200px;
-}
-
 .cds-mono {
 	font-family: "IBM Plex Mono", monospace;
 }
@@ -1768,13 +1763,21 @@ a {
 	margin: 0;
 }
 
-/* The per-table search field sits between the heading and the bulk toolbar
-   and takes the room left over, exactly like the one in .cds-tile__head-row
-   on the Queue and History tiles. */
+/* The per-table search field is the last child of the header and hugs its
+   right edge on every tile, so the same control is always in the same place.
+   The heading's auto margin - not justify-content - is what pushes the
+   toolbar and the field over as one group; auto margins consume the free
+   space before space-between ever distributes it. */
 
-.cds-section-header .cds-field {
+.cds-section-header .cds-tile__heading {
+	margin-right: auto;
+}
+
+.cds-section-header .cds-field,
+.cds-tile__head-row .cds-field {
 	margin-top: 0;
-	flex: 1 1 200px;
+	flex: 0 1 360px;
+	min-width: 200px;
 }
 
 .cds-bulk-toolbar {
