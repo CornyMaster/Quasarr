@@ -12,15 +12,18 @@ MINIMUM_CONCLUSIVE_COHORT_SIZE = 5
 MAXIMUM_COHORT_SIZE = 100
 MAXIMUM_COHORT_OCCURRENCES = 1000
 HEALTHY_SUPPRESSION_SECONDS = 15 * 60
-OFFER_LEASE_SECONDS = 2 * 60
+# The lease has to outlast the helper's worst-case browser solve of one
+# container: a report that arrives after it expires is answered `stale` and
+# thrown away, so a slow but successful solve would be wasted and retried.
+OFFER_LEASE_SECONDS = 5 * 60
 MAXIMUM_COHORT_RECORD_BYTES = 256 * 1024
 # "More than the bounded maximum", never a claim that exactly 101 exist.
 OVERSIZED_COHORT_SENTINEL = MAXIMUM_COHORT_SIZE + 1
 # One accepted result per frozen fingerprint, so the replay history can never
 # outgrow the cohort it belongs to.
 MAXIMUM_ACCEPTED_OFFERS = MAXIMUM_COHORT_SIZE
-# A slot may be re-leased once per two-minute lease inside a fifteen-minute
-# window, so a full cohort needs 100 * 8 identities; the flat ceiling adds room
+# A slot may be re-leased once per five-minute lease inside a fifteen-minute
+# window, so a full cohort needs 100 * 3 identities; the flat ceiling adds room
 # for the record-level probe leases a long cooldown issues and fails closed.
 MAXIMUM_GENERATION_OFFER_IDS = 1000
 MAXIMUM_OFFER_ID_ATTEMPTS = 8

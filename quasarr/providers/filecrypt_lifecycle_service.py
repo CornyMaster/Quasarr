@@ -65,7 +65,10 @@ from quasarr.providers.terminal_operations import (
 FILECRYPT_LINK_LIFECYCLE_CAPABILITY = "filecrypt_link_lifecycle_v1"
 FILECRYPT_CRYPTER = "filecrypt"
 DEFAULT_SWEEP_WINDOW_MINUTES = 15
-OFFER_LEASE_SECONDS = 120
+# The lease has to outlast the helper's worst-case browser solve of one
+# container: a report that arrives after it expires is answered `stale` and
+# thrown away, so a slow but successful solve would be wasted and retried.
+OFFER_LEASE_SECONDS = 300
 RECEIPT_ADVISORY_THRESHOLD = 4096
 
 _SCHEMA_VERSION = 1

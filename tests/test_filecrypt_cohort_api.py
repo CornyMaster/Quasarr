@@ -34,6 +34,7 @@ from quasarr.providers.crypter_candidates import (
 )
 from quasarr.providers.crypter_cooldowns import CrypterCooldownService
 from quasarr.providers.crypter_sweeps import (
+    OFFER_LEASE_SECONDS,
     OVERSIZED_COHORT_SENTINEL,
     bypass_decision,
 )
@@ -1904,7 +1905,8 @@ class ProvenOwnershipTests(CohortApiTestCase):
 
     def test_a_disproven_report_never_even_prunes_the_decision(self):
         """A report that proved nothing may not decide the row has expired."""
-        self.clock.now = NOW + 121  # the unanswered lease of setUp has expired
+        # the unanswered lease of setUp has expired
+        self.clock.now = NOW + OFFER_LEASE_SECONDS + 1
         self.drive_blocked(5)
         self.assertEqual("cooldown", self.decision_row()["state"])
         self.clock.now = NOW + COOLDOWN_SECONDS + 200

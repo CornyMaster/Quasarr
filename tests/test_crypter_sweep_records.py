@@ -263,7 +263,7 @@ class DecisionRecordCodecTests(unittest.TestCase):
         self.assertEqual(100, MAXIMUM_COHORT_SIZE)
         self.assertEqual(1000, MAXIMUM_COHORT_OCCURRENCES)
         self.assertEqual(15 * 60, HEALTHY_SUPPRESSION_SECONDS)
-        self.assertEqual(2 * 60, OFFER_LEASE_SECONDS)
+        self.assertEqual(5 * 60, OFFER_LEASE_SECONDS)
         self.assertEqual(256 * 1024, MAXIMUM_COHORT_RECORD_BYTES)
         self.assertEqual(101, OVERSIZED_COHORT_SENTINEL)
         self.assertEqual(MAXIMUM_COHORT_SIZE, MAXIMUM_ACCEPTED_OFFERS)

@@ -1162,5 +1162,25 @@ class TestScale(LifecycleServiceTestCase):
         self.assertEqual(count, len(all_members))
 
 
+class OfferLeaseDurationTests(unittest.TestCase):
+    """The lease has to outlast the helper's worst-case browser solve.
+
+    A result reported after the lease expired is answered `stale` and thrown
+    away, so a slow but successful solve is wasted and retried on a loop. Both
+    definitions of the lease must therefore stay at the same, long-enough
+    value.
+    """
+
+    def test_lease_outlasts_a_slow_browser_solve(self):
+        self.assertEqual(300, OFFER_LEASE_SECONDS)
+
+    def test_both_definitions_agree(self):
+        from quasarr.providers.crypter_sweeps import (
+            OFFER_LEASE_SECONDS as SWEEP_OFFER_LEASE_SECONDS,
+        )
+
+        self.assertEqual(OFFER_LEASE_SECONDS, SWEEP_OFFER_LEASE_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()
