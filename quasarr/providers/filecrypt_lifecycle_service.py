@@ -215,6 +215,107 @@ class FilecryptLifecycleService:
         result.sort()
         return tuple(result)
 
+    def project_deferred_holds(self, protected_rows):
+        """Legacy-shaped deferred blocks for every package a lifecycle hold covers.
+
+        `providers/crypter_cooldowns.py` owns the legacy `PACKAGE_DEFER_KEY`
+        block `downloads/packages/__init__.py::_project_package_defer` reads;
+        this is that generation's counterpart for a link this service holds,
+        which never writes that key. Reads `FILECRYPT_LINK_STATES_TABLE`
+        exactly once - never once per package, since the Downloads deferred
+        table renders for the whole queue and a per-row read here would be a
+        query storm - matching `active_blacklisted_fingerprints()`'s pattern
+        above. `protected_rows` is the caller's already-enumerated protected
+        DB rows, so building the owning-package inventory costs no further
+        storage read either.
+
+        A `blacklisted` (terminal) link is excluded: it carries no
+        `retry_after_epoch` and is leaving the queue entirely, not waiting on
+        anything a countdown could describe.
+
+        Returns `{package_id: deferred_dict}`, one entry per package a held
+        or blacklisting fingerprint occurs in (a package naming two such
+        fingerprints reports the first one `enumerate_filecrypt_lifecycle_candidates()`
+        enumerates, deterministically but not necessarily fingerprint-sorted).
+        The caller decides precedence against any legacy hold on the same
+        package; this method knows nothing about that layer.
+        """
+        db = self._shared_state.get_db(FILECRYPT_LINK_STATES_TABLE)
+        all_rows = db.retrieve_all_titles()
+        if not all_rows:
+            return {}
+
+        held_by_fingerprint = {}
+        for fingerprint, raw in all_rows:
+            record = decode_link_state(raw)
+            if record is None:
+                continue
+            state = record["state"]
+            if state == "held":
+                held_by_fingerprint[fingerprint] = {
+                    "state": "held",
+                    "retry_after_epoch": record["retry_after_epoch"],
+                    "since_epoch": record["first_blocked_epoch"],
+                }
+            elif state == "blacklisting":
+                held_by_fingerprint[fingerprint] = {
+                    "state": "blacklisting",
+                    "retry_after_epoch": 0,
+                    "since_epoch": record["first_blocked_epoch"],
+                }
+            # blacklisted -> terminal, excluded (see docstring)
+
+        if not held_by_fingerprint:
+            return {}
+
+        inventory = enumerate_filecrypt_lifecycle_candidates(protected_rows)
+        result = {}
+        for candidate in inventory.candidates:
+            projected = held_by_fingerprint.get(candidate.fingerprint)
+            if projected is None:
+                continue
+            for occurrence in candidate.occurrences:
+                # A package naming two held fingerprints reports the first
+                # one only, never overwriting it with a later one.
+                result.setdefault(
+                    occurrence.package_id,
+                    {
+                        "crypter": FILECRYPT_CRYPTER,
+                        # The only reason code this build supports for any
+                        # confirmed Filecrypt block, legacy or lifecycle.
+                        "reason_code": "ip_block_suspected",
+                        "since_epoch": projected["since_epoch"],
+                        "retry_after_epoch": projected["retry_after_epoch"],
+                        # This layer tracks no per-package probe request or
+                        # provisional-hold budget - both are legacy-only
+                        # concepts, so both stay at their inactive default.
+                        "probe_requested": False,
+                        "observation_holds": 0,
+                        "state": projected["state"],
+                        # A lifecycle hold comes from exactly one accepted
+                        # BLOCKED report, not the legacy 3-observation
+                        # accumulator; reporting "1 / 3" here would
+                        # misleadingly suggest an evidence-gathering state
+                        # this hold is already past, so this stays 0 rather
+                        # than fake a number the lifecycle model never counts.
+                        "evidence_count": 0,
+                        # "crypter_cooldown" is the only hold_type either
+                        # renderer maps to the "Cooldown" label - correct
+                        # here since the link carries a real, already-
+                        # confirmed retry deadline, not a provisional one.
+                        "hold_type": "crypter_cooldown",
+                        "active": True,
+                        # No lifecycle sweep concept applies to an already-
+                        # held link (it exits sweep membership once held), so
+                        # sweep progress stays empty rather than fabricated.
+                        "cohort_tested": 0,
+                        "cohort_total": 0,
+                        "cohort_deadline_epoch": 0,
+                        "cohort_retest_depth": 0,
+                    },
+                )
+        return result
+
     # ── offer preparation ──────────────────────────────────────────────────────
 
     def prepare_offer(

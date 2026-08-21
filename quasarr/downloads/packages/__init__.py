@@ -86,6 +86,35 @@ def _project_package_defer(service, package_data, projections):
     )
 
 
+def _lifecycle_deferred_by_package(shared_state, protected_rows):
+    """Every lifecycle-held Filecrypt link, projected onto its owning package(s).
+
+    `_project_package_defer()` above is the sole reader of the legacy
+    `PACKAGE_DEFER_KEY` block; a link held by the `filecrypt_link_lifecycle_v1`
+    generation (`providers/filecrypt_lifecycle_service.py`) never writes that
+    key, so without this a helper that only negotiates the lifecycle
+    capability would leave every accepted block invisible on this page. Reads
+    the lifecycle tables exactly once for the whole request via
+    `FilecryptLifecycleService.project_deferred_holds()`, mirroring
+    `cooldown_projections`'s one-read-per-crypter rule below.
+
+    Lazy import: `FilecryptLifecycleService` pulls in `crypter_candidates.py`,
+    which reaches back into `quasarr.downloads` at module scope; importing it
+    eagerly here would be circular, since `quasarr.downloads.__init__` itself
+    imports this module. Mirrors `crypter_cooldowns.normalize_crypter_key()`'s
+    identical lazy import for the identical reason.
+    """
+    from quasarr.providers.filecrypt_lifecycle_service import FilecryptLifecycleService
+
+    try:
+        return FilecryptLifecycleService(shared_state).project_deferred_holds(
+            protected_rows
+        )
+    except Exception as e:
+        debug(f"Failed to project lifecycle-held Filecrypt links: {e}")
+        return {}
+
+
 def package_comment_id(comment):
     """The Quasarr identity a JDownloader comment names.
 
@@ -437,6 +466,13 @@ def _collect_packages(shared_state, cache, get_active_device, auto_start):
             else None
         )
         cooldown_projections = {}
+        # Same block-mode gate as the legacy path above, so `fail` mode stays
+        # a pure bypass for both sources and neither builds a service.
+        lifecycle_deferred_by_package = (
+            _lifecycle_deferred_by_package(shared_state, protected_packages)
+            if cooldown_service is not None
+            else {}
+        )
         for package in protected_packages:
             package_id = package[0]
             try:
@@ -453,11 +489,27 @@ def _collect_packages(shared_state, cache, get_active_device, auto_start):
                     "type": "protected",
                     "package_id": package_id,
                 }
-                deferred = (
+                legacy_deferred = (
                     _project_package_defer(cooldown_service, data, cooldown_projections)
                     if cooldown_service is not None
                     else None
                 )
+                if legacy_deferred and legacy_deferred.get("active"):
+                    # An active legacy hold is metadata already attached to
+                    # this exact row (including any operator-queued probe),
+                    # so it always wins unchanged - a package deferred
+                    # through CrypterCooldownService must keep projecting
+                    # exactly as it does today.
+                    deferred = legacy_deferred
+                else:
+                    # No active legacy hold (none stored, or one that has
+                    # expired): fall through to a lifecycle-sourced hold on
+                    # this package's own link(s) if one exists, else keep
+                    # whatever the legacy path answered (None, or an inactive
+                    # dict - both already the existing projection).
+                    deferred = (
+                        lifecycle_deferred_by_package.get(package_id) or legacy_deferred
+                    )
                 if deferred:
                     entry["deferred"] = deferred
                 packages.append(entry)

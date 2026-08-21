@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 from quasarr.downloads import store_protected_links
 from quasarr.downloads.packages import delete_database_packages, get_packages
 from quasarr.providers import shared_state as provider_shared_state
+from quasarr.providers.crypter_candidates import link_fingerprint
 from quasarr.providers.crypter_cooldowns import CrypterCooldownService
+from quasarr.providers.filecrypt_lifecycle import (
+    FILECRYPT_LINK_STATES_TABLE,
+    encode_link_state,
+)
 from quasarr.storage.sqlite_database import DataBase
 
 PACKAGE_A = "Quasarr_movies_00000000000000000000000000000000"
@@ -709,6 +714,161 @@ class DeferredQueueProjectionTests(unittest.TestCase):
             "[CAPTCHA not solved!] Synthetic.Release.Example", item["filename"]
         )
         self.assertNotIn("deferred", item)
+
+
+class LifecycleHeldDeferredProjectionTests(unittest.TestCase):
+    """Pins the `filecrypt_link_lifecycle_v1` fallback in
+    `_lifecycle_deferred_by_package()`/its call site in
+    `_collect_packages()`: a Filecrypt link the lifecycle service holds -
+    which never writes the legacy `PACKAGE_DEFER_KEY`
+    `DeferredQueueProjectionTests` above exercises - must still surface in
+    the queue projection with its own state and next-check time, and a
+    package that also carries an active legacy hold must keep projecting
+    through that path completely unchanged.
+    """
+
+    LINK_URL = "https://filecrypt.invalid/container/1"
+
+    def setUp(self):
+        self.clock = FakeClock(NOW)
+        self.shared_state = FakeSharedState()
+        self.protected = self.shared_state.databases["protected"]
+        self.link_states = self.shared_state.get_db(FILECRYPT_LINK_STATES_TABLE)
+        self.protected.update_store(PACKAGE_A, json.dumps(protected_blob()))
+        self.fingerprint = link_fingerprint("filecrypt", self.LINK_URL)
+
+    def _hold_link(self, *, retry_after_epoch, first_blocked_epoch=NOW):
+        record = {
+            "schema_version": 1,
+            "state": "held",
+            "first_blocked_epoch": first_blocked_epoch,
+            "retry_after_epoch": retry_after_epoch,
+            "lease": None,
+        }
+        self.link_states.update_store(self.fingerprint, encode_link_state(record))
+
+    def _blacklisting_link(self, *, first_blocked_epoch=NOW - 1000):
+        record = {
+            "schema_version": 1,
+            "state": "blacklisting",
+            "first_blocked_epoch": first_blocked_epoch,
+            "recheck_offer_id": "a" * 32,
+            "recheck_package_id": PACKAGE_A,
+            "recheck_sweep_id": "b" * 32,
+            "terminal_operation_id": "c" * 64,
+        }
+        self.link_states.update_store(self.fingerprint, encode_link_state(record))
+
+    def _get_packages(self):
+        def build_service(shared_state):
+            return CrypterCooldownService(shared_state, clock=self.clock)
+
+        with (
+            patch(
+                "quasarr.downloads.packages.JDPackageCache", return_value=FakeCache()
+            ),
+            patch(
+                "quasarr.downloads.packages.get_download_category_from_package_id",
+                return_value="movies",
+            ),
+            patch("quasarr.downloads.packages.CrypterCooldownService", build_service),
+        ):
+            return get_packages(self.shared_state, auto_start=False)
+
+    def test_lifecycle_held_link_appears_in_the_projection(self):
+        # FAILS on current code: quasarr/downloads/packages/__init__.py has
+        # no awareness of the lifecycle tables at all, so this package would
+        # carry no `deferred` key and never leave the ordinary protected
+        # queue, even though the lifecycle service has already accepted and
+        # recorded a block on its exact link.
+        self._hold_link(retry_after_epoch=NOW + 6 * 3600)
+
+        item = self._get_packages()["queue"][0]
+
+        self.assertIn("deferred", item)
+        deferred = item["deferred"]
+        self.assertTrue(deferred["active"])
+        self.assertEqual("held", deferred["state"])
+        self.assertEqual("crypter_cooldown", deferred["hold_type"])
+        self.assertEqual(NOW + 6 * 3600, deferred["retry_after_epoch"])
+        self.assertEqual(NOW, deferred["since_epoch"])
+        self.assertEqual(
+            "[Waiting for linkcrypter retry] Synthetic.Release.Example",
+            item["filename"],
+        )
+        # Never a raw link, hostname, or fingerprint anywhere in the row.
+        serialized = json.dumps(deferred)
+        self.assertNotIn("filecrypt.invalid", serialized)
+        self.assertNotIn(self.fingerprint, serialized)
+
+    def test_lifecycle_blacklisting_link_has_no_retry_deadline(self):
+        self._blacklisting_link()
+
+        deferred = self._get_packages()["queue"][0]["deferred"]
+
+        self.assertTrue(deferred["active"])
+        self.assertEqual("blacklisting", deferred["state"])
+        self.assertEqual(0, deferred["retry_after_epoch"])
+
+    def test_legacy_deferred_package_still_projects_unchanged(self):
+        # The same package also carries an active legacy hold; it must win
+        # and project byte-for-byte as DeferredQueueProjectionTests pins it,
+        # even though its own link is simultaneously lifecycle-held.
+        service = CrypterCooldownService(self.shared_state, clock=self.clock)
+        service.defer_package(
+            PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
+        )
+        self._hold_link(retry_after_epoch=NOW + 6 * 3600)
+
+        item = self._get_packages()["queue"][0]
+
+        self.assertEqual(
+            {
+                "crypter": "filecrypt",
+                "reason_code": REASON,
+                "since_epoch": NOW,
+                "retry_after_epoch": NOW + PROVISIONAL_WINDOW,
+                "probe_requested": False,
+                "observation_holds": 1,
+                "state": "available",
+                "evidence_count": 0,
+                "hold_type": "provisional",
+                "active": True,
+                "cohort_tested": 0,
+                "cohort_total": 0,
+                "cohort_deadline_epoch": 0,
+                "cohort_retest_depth": 0,
+            },
+            item["deferred"],
+        )
+
+    def test_expired_legacy_hold_falls_through_to_a_live_lifecycle_hold(self):
+        # An inactive (expired) legacy hold no longer wins: the package's
+        # currently-live lifecycle hold takes over instead of the package
+        # silently reverting to the ordinary protected queue.
+        service = CrypterCooldownService(self.shared_state, clock=self.clock)
+        service.defer_package(
+            PACKAGE_A, "filecrypt", REASON, NOW + PROVISIONAL_WINDOW, 1
+        )
+        self._hold_link(retry_after_epoch=NOW + PROVISIONAL_WINDOW + 6 * 3600)
+        self.clock.now = NOW + PROVISIONAL_WINDOW + 1
+
+        item = self._get_packages()["queue"][0]
+
+        deferred = item["deferred"]
+        self.assertTrue(deferred["active"])
+        self.assertEqual("held", deferred["state"])
+        self.assertEqual(
+            NOW + PROVISIONAL_WINDOW + 6 * 3600, deferred["retry_after_epoch"]
+        )
+
+    def test_no_lifecycle_hold_keeps_the_normal_projection(self):
+        item = self._get_packages()["queue"][0]
+
+        self.assertNotIn("deferred", item)
+        self.assertEqual(
+            "[CAPTCHA not solved!] Synthetic.Release.Example", item["filename"]
+        )
 
 
 class DatabasePackageDeletionTests(unittest.TestCase):
