@@ -12,6 +12,7 @@ from bottle import Bottle, HTTPError
 import quasarr.api.sponsors_helper as sponsors_helper_api
 from quasarr.api.sponsors_helper import setup_sponsors_helper_routes
 from quasarr.providers.terminal_operations import (
+    TERMINAL_OPERATION_MARKER,
     TERMINAL_OPERATION_TABLE,
     operation_evidence,
     submission_comment,
@@ -1870,6 +1871,161 @@ class ReGrabbedPackageTerminalTests(TerminalConfirmationTestCase):
         self.assertTrue(first["success"])
         self.assertIsNone(self.protected_row())
         self.assertEqual(2, self.statistic("packages_downloaded"))
+
+
+class ReboundTerminalOutcomeTests(TerminalConfirmationTestCase):
+    """A closed life may not bind the next one to the outcome it ended in.
+
+    The operation identity is derived from the package ID, so the record of a
+    life that already closed is what an ordinary admission finds when the same
+    release is grabbed again - and the next life does not have to end the way
+    the last one did. While that record still describes the world it stays the
+    one binding answer; once its package is protected again under none of it,
+    admitting the report in front of it is the only thing that is true.
+    """
+
+    def complete_download(self):
+        payload = self.version_two(self.download_payload())
+        self.assertTrue(self.call(DOWNLOAD_RULE, payload)["success"])
+
+    def fail_payload(self):
+        return self.version_two({"package_id": package(), "name": TITLE})
+
+    def test_a_re_grabbed_package_may_fail_after_the_last_life_downloaded(self):
+        self.complete_download()
+        retired = self.current_evidence()
+        self.notifications.reset_mock()
+        self.store_protected()
+
+        result = self.call(FAIL_RULE, self.fail_payload())
+
+        self.assertEqual(TERMINAL_BODY_KEYS, set(result))
+        self.assertTrue(result["success"])
+        self.assertEqual("failed", result["terminal_state"])
+        self.assertTrue(result["package_removed"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual("failed", self.operation_row()["terminal_state"])
+        self.assertEqual("complete", self.operation_row()["state"])
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+        self.assertEqual(1, self.statistic("failed_decryptions_automatic"))
+        self.assertNotEqual(retired, self.failed_blob()[TERMINAL_OPERATION_MARKER])
+        self.assertEqual(
+            self.current_evidence(), self.failed_blob()[TERMINAL_OPERATION_MARKER]
+        )
+        # The life that closed is not repeated on the way to the new one.
+        self.assertEqual(1, len(self.state.device.add_links_calls))
+        self.assertEqual(1, self.statistic("packages_downloaded"))
+
+    def test_the_rebound_life_then_replays_on_its_own_terms(self):
+        self.complete_download()
+        self.store_protected()
+        payload = self.fail_payload()
+        second = self.call(FAIL_RULE, payload)
+        self.notifications.reset_mock()
+
+        replay = self.call(FAIL_RULE, payload)
+
+        self.assertEqual(second, replay)
+        self.assertEqual([], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
+
+    def test_a_package_that_never_came_back_still_conflicts(self):
+        self.complete_download()
+        self.notifications.reset_mock()
+        stored = dict(self.operation_row())
+
+        self.expect_status(FAIL_RULE, self.fail_payload(), 409)
+
+        self.assertEqual(stored, self.operation_row())
+        self.assertIsNone(self.failed_row())
+        self.assertEqual([], self.notification_cases())
+
+    def test_an_operation_in_flight_under_another_outcome_still_conflicts(self):
+        for state, effect_state in (
+            ("prepared", "not_started"),
+            ("prepared", "attempting"),
+            ("submitted", "applied"),
+        ):
+            with self.subTest(state=state, effect_state=effect_state):
+                self.setUp()
+                self.seed_operation(
+                    "downloaded", state=state, effect_state=effect_state
+                )
+                stored = dict(self.operation_row())
+
+                self.expect_status(FAIL_RULE, self.fail_payload(), 409)
+
+                self.assertEqual(stored, self.operation_row())
+                self.assertIsNotNone(self.protected_row())
+                self.assertIsNone(self.failed_row())
+                self.assertEqual([], self.notification_cases())
+                self.assertEqual(0, self.statistic("failed_downloads"))
+
+    def test_a_protected_store_that_cannot_be_read_still_conflicts(self):
+        self.complete_download()
+        self.store_protected()
+        self.notifications.reset_mock()
+        stored = dict(self.operation_row())
+        self.state.get_db("protected").unavailable = True
+
+        self.expect_status(FAIL_RULE, self.fail_payload(), 409)
+
+        self.state.get_db("protected").unavailable = False
+        self.assertEqual(stored, self.operation_row())
+        self.assertIsNotNone(self.protected_row())
+        self.assertIsNone(self.failed_row())
+        self.assertEqual([], self.notification_cases())
+
+    def test_a_record_that_marked_no_artifact_never_admits_another_outcome(self):
+        self.seed_operation(
+            "downloaded",
+            state="complete",
+            legacy=True,
+            created=int(time.time()),
+            package_removed=True,
+            package_terminal=True,
+        )
+        stored = dict(self.operation_row())
+
+        self.expect_status(FAIL_RULE, self.fail_payload(), 409)
+
+        self.assertEqual(stored, self.operation_row())
+        self.assertIsNotNone(self.protected_row())
+        self.assertIsNone(self.failed_row())
+
+    def test_a_package_still_carrying_its_own_disable_conflicts(self):
+        """The one complete record whose package is present on purpose."""
+        self.call(DISABLE_RULE, self.version_two({"package_id": package()}))
+        stored = dict(self.operation_row())
+        self.notifications.reset_mock()
+
+        self.expect_status(FAIL_RULE, self.fail_payload(), 409)
+
+        self.assertEqual(stored, self.operation_row())
+        self.assertTrue(self.protected_row()["disabled"])
+        self.assertIsNone(self.failed_row())
+        self.assertEqual([], self.notification_cases())
+
+    def test_two_concurrent_reports_rebind_and_fail_exactly_once(self):
+        self.complete_download()
+        self.store_protected()
+        self.notifications.reset_mock()
+        gate = SideEffectGate()
+
+        with mock.patch(
+            "quasarr.api.sponsors_helper.commit_terminal_failure",
+            gate.wrap(sponsors_helper_api.commit_terminal_failure),
+        ):
+            first, second = self.concurrently(FAIL_RULE, self.fail_payload(), gate)
+
+        self.assertFalse(gate.second.is_set())
+        self.assertEqual(1, gate.arrivals)
+        self.assertEqual(first, second)
+        self.assertTrue(first["success"])
+        self.assertIsNone(self.protected_row())
+        self.assertEqual(["failed"], self.notification_cases())
+        self.assertEqual(1, self.statistic("failed_downloads"))
 
 
 class MigratedTerminalRecordTests(TerminalConfirmationTestCase):

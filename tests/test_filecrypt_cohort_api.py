@@ -2986,6 +2986,167 @@ class LifecycleRouteTests(CohortApiTestCase):
         body = json.loads(access_resp.body)
         self.assertEqual("stale", body["instruction"])
 
+    # --- an owed blacklist report against a re-grabbed package ---------------
+
+    def owed_offer(self, index=1):
+        """The offer identity of a retest BLOCKED that still owes its report."""
+        return {
+            "link_fingerprint": fingerprint_of(filecrypt_url(index)),
+            "sweep_id": "a" * 32,
+            "offer_id": "b" * 32,
+        }
+
+    def install_owed_blacklist(self, package_id, offer):
+        from quasarr.providers.filecrypt_lifecycle import (
+            FILECRYPT_LINK_STATES_TABLE,
+            encode_link_state,
+        )
+        from quasarr.providers.terminal_operations import (
+            terminal_operation_id as top_id,
+        )
+
+        self.state.get_db(FILECRYPT_LINK_STATES_TABLE).update_store(
+            offer["link_fingerprint"],
+            encode_link_state(
+                {
+                    "schema_version": 1,
+                    "state": "blacklisting",
+                    "first_blocked_epoch": NOW - COOLDOWN_SECONDS,
+                    "recheck_offer_id": offer["offer_id"],
+                    "recheck_package_id": package_id,
+                    "recheck_sweep_id": offer["sweep_id"],
+                    "terminal_operation_id": top_id(package_id),
+                }
+            ),
+        )
+
+    def install_terminal_record(self, package_id, terminal_state, state="complete"):
+        """The operation record an earlier life of this release left behind."""
+        import time as _time
+
+        from quasarr.providers.terminal_operations import (
+            TERMINAL_OPERATION_TABLE,
+        )
+        from quasarr.providers.terminal_operations import (
+            terminal_operation_id as top_id,
+        )
+
+        applied = state != "prepared"
+        # Real time, because retention prunes complete rows by the real clock.
+        opened = int(_time.time())
+        stored = {
+            "state": state,
+            "terminal_state": terminal_state,
+            "package_id": package_id,
+            "created_epoch": opened,
+            "updated_epoch": opened,
+            "package_removed": applied,
+            "package_terminal": applied,
+            "effect_state": "applied" if applied else "not_started",
+            "failure_persisted": False,
+            "notification_state": "not_started",
+        }
+        self.state.get_db(TERMINAL_OPERATION_TABLE).update_store(
+            top_id(package_id),
+            json.dumps(stored, sort_keys=True, separators=(",", ":")),
+        )
+        return stored
+
+    def terminal_record(self, package_id):
+        from quasarr.providers.terminal_operations import (
+            TERMINAL_OPERATION_TABLE,
+        )
+        from quasarr.providers.terminal_operations import (
+            terminal_operation_id as top_id,
+        )
+
+        raw = self.state.get_db(TERMINAL_OPERATION_TABLE).retrieve(top_id(package_id))
+        return None if raw is None else json.loads(raw)
+
+    def owed_blacklist_report(self, offer, package_id):
+        """Deliver the owed report against a store that really removes rows.
+
+        This route's terminal failure removes the protected package, which the
+        module's fake store does not otherwise model, and it tells the operator
+        about it, which no unit test may really do.
+        """
+        protected = self.state.databases["protected"]
+        with (
+            mock.patch.object(
+                protected,
+                "delete",
+                lambda key: protected.rows.pop(key, None),
+                create=True,
+            ),
+            mock.patch(
+                "quasarr.api.sponsors_helper.update_release_notification", mock.Mock()
+            ),
+        ):
+            return self.call(
+                DEFER_RULE, self.lifecycle_blocked_payload(offer, package_id)
+            )
+
+    def test_an_owed_blacklist_report_survives_a_re_grabbed_package(self):
+        """The stall this route must never produce.
+
+        The release was grabbed again after an earlier life of it completed as
+        a download, so the terminal identity the report carries is already
+        bound to that closed record - under another outcome, and for a whole
+        retention window. Its package is protected again under none of it, so
+        the record is retired and the report the helper owes is delivered.
+        """
+        self.store(filecrypt_rows(1))
+        pkg_id = package(1)
+        offer = self.owed_offer()
+        self.install_owed_blacklist(pkg_id, offer)
+        self.install_terminal_record(pkg_id, "downloaded")
+
+        response = self.owed_blacklist_report(offer, pkg_id)
+
+        self.assertEqual("blacklist", response["instruction"])
+        self.assertEqual("individual", response["state"])
+        self.assertIsNone(self.state.databases["protected"].rows.get(pkg_id))
+        self.assertEqual(
+            {"state": "complete", "terminal_state": "failed"},
+            {
+                key: self.terminal_record(pkg_id)[key]
+                for key in ("state", "terminal_state")
+            },
+        )
+
+    def test_an_owed_blacklist_report_waits_for_an_operation_in_flight(self):
+        """Two outcomes may never run at once for one package."""
+        self.store(filecrypt_rows(1))
+        pkg_id = package(1)
+        offer = self.owed_offer()
+        self.install_owed_blacklist(pkg_id, offer)
+        stored = self.install_terminal_record(pkg_id, "downloaded", state="prepared")
+
+        with self.assertRaises(HTTPError) as raised:
+            self.owed_blacklist_report(offer, pkg_id)
+
+        self.assertEqual(409, raised.exception.status_code)
+        self.assertEqual(stored, self.terminal_record(pkg_id))
+        self.assertIsNotNone(self.state.databases["protected"].rows.get(pkg_id))
+
+    def test_an_owed_blacklist_report_never_guesses_from_an_unreadable_store(self):
+        self.store(filecrypt_rows(1))
+        pkg_id = package(1)
+        offer = self.owed_offer()
+        self.install_owed_blacklist(pkg_id, offer)
+        stored = self.install_terminal_record(pkg_id, "downloaded")
+        protected = self.state.databases["protected"]
+
+        with mock.patch.object(
+            protected, "retrieve", side_effect=RuntimeError("table unavailable")
+        ):
+            with self.assertRaises(HTTPError) as raised:
+                self.owed_blacklist_report(offer, pkg_id)
+
+        self.assertEqual(409, raised.exception.status_code)
+        self.assertEqual(stored, self.terminal_record(pkg_id))
+        self.assertIsNotNone(protected.rows.get(pkg_id))
+
 
 if __name__ == "__main__":
     unittest.main()

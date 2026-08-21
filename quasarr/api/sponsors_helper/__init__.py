@@ -72,6 +72,7 @@ from quasarr.providers.terminal_operations import (
     NOTIFICATION_ATTEMPTING,
     NOTIFICATION_NOT_STARTED,
     NOTIFICATION_RECORDED,
+    OPENED,
     TERMINAL_OPERATION_MARKER,
     UNREADABLE,
     TerminalOperationService,
@@ -497,7 +498,15 @@ def setup_sponsors_helper_routes(app):
             except ValueError:
                 return abort(400, "Invalid terminal operation identity")
             if opened["outcome"] == CONFLICT:
-                return abort(409, "Terminal operation identity conflict")
+                opened = readmitted_after_completed_life(
+                    service,
+                    operation_id,
+                    package_id,
+                    terminal_state,
+                    opened["record"],
+                )
+                if opened is None:
+                    return abort(409, "Terminal operation identity conflict")
             if opened["outcome"] == CAPACITY:
                 return abort(503, "Terminal operation capacity exhausted")
             if opened["outcome"] == UNREADABLE:
@@ -510,6 +519,54 @@ def setup_sponsors_helper_routes(app):
                 "operation_id": operation_id,
                 "record": opened["record"],
             }
+
+    def readmitted_after_completed_life(
+        service, operation_id, package_id, terminal_state, record
+    ):
+        """The admission a conflicting complete record no longer stands against.
+
+        The operation identity is derived from the package ID, so one identity
+        is reused by every life of that release, and a complete record binds it
+        to the single outcome the life it closed ended in. While that record
+        still describes the world - the package it removed is gone, or the
+        disable it applied is still on the package - a report naming another
+        outcome really is a conflict and stays refused.
+
+        Once the package is protected again under neither, the record belongs
+        to a life that ended and may not bind the one in front of it, which
+        would otherwise be refused for the whole retention window while the
+        helper owes exactly this report. It is retired the way a replayed
+        record is, and the operation opening in its place is admitted under the
+        state this report names. Everything that proves less stays refused: a
+        record still short of `complete` may own an unfinished side effect of
+        its own, one of a shape that marked no artifact can show neither its
+        own outcome nor the life its package is in, and a protected package
+        that cannot be read decides nothing at all.
+
+        The whole decision runs inside the `operation_lock` the caller already
+        holds, so the retirement and the operation that follows it cannot
+        interleave with another request for the same package.
+        """
+        if record is None or record["package_id"] != package_id:
+            return None
+        if record["legacy_unproven"] or record["state"] != "complete":
+            return None
+        present, package_data = read_protected_package(package_id)
+        if present is not True:
+            return None
+        if not record["package_removed"] and disabled_by_operation(
+            package_data, operation_evidence(record)
+        ):
+            return None
+        reopened = service.reopen_completed(
+            operation_id,
+            package_id,
+            terminal_state,
+            completed_state=record["terminal_state"],
+        )
+        if reopened["outcome"] != OPENED:
+            return None
+        return reopened
 
     def filecrypt_inventory(protected_rows=None):
         """The bounded Filecrypt inventory, or None when it cannot be proven.

@@ -1368,6 +1368,111 @@ class ReopenedTerminalOperationTests(unittest.TestCase):
         )
 
 
+class RetiredOtherOutcomeTests(unittest.TestCase):
+    """The next life of a release need not end the way the last one did.
+
+    A package that was downloaded and is protected again can now be failed, so
+    the record that closed the earlier life is named by `completed_state` and
+    the one replacing it opens under the outcome the current report asks for.
+    Everything the ordinary retirement refuses is still refused.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.state = GuardedSharedState()
+        self.service = TerminalOperationService(self.state, clock=self.clock)
+        self.package_id = package(1)
+        self.operation_id = terminal_operation_id(self.package_id)
+
+    def rows(self):
+        return dict(self.state.operations.rows)
+
+    def store(self, **kwargs):
+        self.state.operations.rows[self.operation_id] = record(
+            self.package_id, **kwargs
+        )
+
+    def rebind(self, terminal_state="failed", completed_state="downloaded"):
+        return self.service.reopen_completed(
+            self.operation_id,
+            self.package_id,
+            terminal_state,
+            completed_state=completed_state,
+        )
+
+    def test_a_complete_record_is_replaced_by_one_of_the_requested_outcome(self):
+        self.store(
+            state="complete", package_removed=True, package_terminal=True, created=NOW
+        )
+        self.clock.now = NOW + 500
+
+        result = self.rebind()
+
+        self.assertEqual("opened", result["outcome"])
+        self.assertEqual(
+            {
+                "state": "prepared",
+                "terminal_state": "failed",
+                "package_id": self.package_id,
+                "created_epoch": NOW + 500,
+                "updated_epoch": NOW + 500,
+                "package_removed": False,
+                "package_terminal": False,
+                "effect_state": "not_started",
+                "failure_persisted": False,
+                "notification_state": "not_started",
+            },
+            json.loads(self.rows()[self.operation_id]),
+        )
+
+    def test_the_next_outcome_never_shares_the_evidence_of_the_retired_one(self):
+        self.store(state="complete", package_removed=True, package_terminal=True)
+        retired = operation_evidence(
+            decode_operation_record(self.rows()[self.operation_id])
+        )
+
+        reopened = self.rebind()["record"]
+
+        self.assertGreater(reopened["created_epoch"], NOW)
+        self.assertNotEqual(retired, operation_evidence(reopened))
+
+    def test_a_record_short_of_complete_is_left_exactly_as_it_is(self):
+        for state, effect_state in OPERATION_PHASES[:-1]:
+            with self.subTest(state=state, effect_state=effect_state):
+                self.setUp()
+                self.store(state=state, effect_state=effect_state)
+                before = self.rows()
+                writes = self.state.operations.writes
+
+                result = self.rebind()
+
+                self.assertEqual("resumed", result["outcome"])
+                self.assertEqual("downloaded", result["record"]["terminal_state"])
+                self.assertEqual(before, self.rows())
+                self.assertEqual(writes, self.state.operations.writes)
+
+    def test_a_record_of_a_third_outcome_is_still_a_conflict(self):
+        self.store(state="complete", terminal_state="disabled")
+        before = self.rows()
+
+        result = self.rebind()
+
+        self.assertEqual("conflict", result["outcome"])
+        self.assertIsNone(result["record"])
+        self.assertEqual(before, self.rows())
+
+    def test_an_unsupported_completed_state_is_refused_before_any_write(self):
+        self.store(state="complete", package_removed=True, package_terminal=True)
+        before = self.rows()
+
+        for completed_state in ("solved", "", 2):
+            with self.subTest(completed_state=str(completed_state)):
+                with self.assertRaises(ValueError):
+                    self.rebind(completed_state=completed_state)
+
+        self.assertEqual(before, self.rows())
+
+
 class TerminalFailureBookkeepingTests(unittest.TestCase):
     """The durable ledger behind one terminal failure.
 

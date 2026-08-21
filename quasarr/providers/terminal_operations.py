@@ -637,7 +637,9 @@ class TerminalOperationService:
             },
         )
 
-    def reopen_completed(self, operation_id, package_id, terminal_state):
+    def reopen_completed(
+        self, operation_id, package_id, terminal_state, *, completed_state=None
+    ):
         """Retire a complete record whose package exists again, and open the next.
 
         The one transition that exists because a complete record is not
@@ -661,13 +663,26 @@ class TerminalOperationService:
 
         Only a complete record is retired. Any other phase may still own an
         unfinished side effect, and replacing it would authorize a second one.
+
+        `completed_state` names the terminal state of the record being retired
+        and defaults to `terminal_state`, which is the report that resumes its
+        own identity. The next life of a release does not have to end the way
+        the last one did - a package that was downloaded and is protected again
+        can now be failed - and naming the closed state is how such a report
+        retires the record it found instead of colliding with it. The record
+        that opens always carries `terminal_state`, the outcome the report in
+        front of it asked for.
         """
         self._validate(operation_id, package_id, terminal_state)
+        if completed_state is None:
+            completed_state = terminal_state
+        elif completed_state not in TERMINAL_STATES:
+            raise ValueError("Unsupported terminal state")
         now = int(self._clock())
         decided = {}
 
         def decide(current_value):
-            record = self._own(current_value, package_id, terminal_state)
+            record = self._own(current_value, package_id, completed_state)
             if record is None:
                 decided.update(outcome=CONFLICT, record=None)
                 return current_value
