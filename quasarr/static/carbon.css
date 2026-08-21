@@ -1934,8 +1934,78 @@ a {
 	outline-offset: -2px;
 }
 
-.cds-timeout-row + .cds-timeout-row {
+/* API & timeouts OPERATION / SLOW MODE / CURRENT matrix. Same idiom as
+   .cds-matrix below (shared grid on head+row keeps every switch at one x
+   position instead of trailing its own inline label), kept as a separate
+   ruleset because its CURRENT column holds a "Current: N s (normal|slow)"
+   string rather than a second switch and so needs more than 64px. */
+.cds-timeout-matrix {
+	margin-top: 16px;
+}
+
+.cds-timeout-matrix__head,
+.cds-timeout-matrix__row {
+	display: grid;
+	/* Head and every row are independent grid boxes that merely share this
+	   declaration, so every column must be a fixed size: an `auto` CURRENT
+	   column would size itself from that one row's own text ("Current: 45 s
+	   (slow)" vs "Current: 30 s (normal)" render at different widths),
+	   which would then flex the 1fr label column by a different amount per
+	   row and knock the switch column out of alignment between rows. */
+	grid-template-columns: minmax(0, 1fr) 88px 140px;
+	align-items: center;
+	gap: 8px;
+}
+
+.cds-timeout-matrix__head {
+	height: 40px;
+	padding: 0 8px;
+	background: var(--cds-table-header);
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.32px;
+	text-transform: uppercase;
+}
+
+.cds-timeout-matrix__row {
+	min-height: 44px;
+	padding: 4px 8px;
 	border-top: 1px solid var(--cds-border-subtle);
+}
+
+.cds-timeout-matrix__row:first-of-type {
+	border-top: 0;
+}
+
+.cds-timeout-matrix__label {
+	min-width: 0;
+	font-size: 14px;
+}
+
+.cds-timeout-matrix__current {
+	min-width: 0;
+	font-size: 12px;
+	color: var(--cds-helper);
+}
+
+.cds-timeout-matrix .cds-toggle {
+	margin-top: 0;
+}
+
+.cds-timeout-matrix .cds-toggle__label {
+	min-height: 44px;
+	gap: 0;
+}
+
+.cds-timeout-matrix .cds-toggle__label-text {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	margin: -1px;
+	clip: rect(0 0 0 0);
+	clip-path: inset(50%);
+	overflow: hidden;
+	white-space: nowrap;
 }
 
 /* Notifications EVENT / ENABLED / SILENT matrix. Each switch keeps its own

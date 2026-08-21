@@ -623,29 +623,48 @@ def _jdownloader_section(model: Mapping[str, Any]) -> str:
     )
 
 
-def _timeout_row(timeout_key: str, definition: Mapping[str, Any], enabled: bool) -> str:
-    """One slow-mode switch plus the timeout it currently produces.
+_TIMEOUT_ROW_LABELS = {
+    "search": "Search",
+    "feed": "Feed",
+    "download": "Download",
+    "session": "Session",
+}
 
-    Both help strings are rendered as data attributes so ``carbon.js`` can
-    swap the visible one the moment the switch is flipped (the value saves
-    on change) without re-deriving seconds client-side - the multiplier
-    stays owned by ``quasarr/constants``.
+
+def _timeout_row(timeout_key: str, definition: Mapping[str, Any], enabled: bool) -> str:
+    """One row of the timeouts matrix: operation, slow-mode switch, and the
+    timeout it currently produces.
+
+    Both help strings are rendered as data attributes on the row so
+    ``carbon.js`` can swap the visible one the moment the switch is
+    flipped (the value saves on change) without re-deriving seconds
+    client-side - the multiplier stays owned by ``quasarr/constants``. The
+    "Current" cell keeps the id ``toggle()``'s own help paragraph would
+    have used (``<checkbox id>-help``), just rendered as this row's third
+    column instead of a line under the switch, so carbon.js's
+    ``updateTimeoutHelpText()`` (``byId(input.id + '-help')``) still finds
+    it after the layout change.
     """
     base_seconds = int(definition["base_seconds"])
     slow_seconds = base_seconds * TIMEOUT_SLOW_MODE_MULTIPLIER
     normal_help = f"Current: {base_seconds} s (normal)"
     slow_help = f"Current: {slow_seconds} s (slow)"
+    toggle_id = f"settings-timeout-{timeout_key}"
+    label = _TIMEOUT_ROW_LABELS.get(timeout_key, definition["label"])
+    current_text = slow_help if enabled else normal_help
     return (
-        '<div class="cds-timeout-row" '
+        '<div class="cds-timeout-matrix__row" '
         f'data-timeout-help-normal="{_h(normal_help)}" '
         f'data-timeout-help-slow="{_h(slow_help)}">'
+        f'<span class="cds-timeout-matrix__label">{_h(label)}</span>'
         + toggle(
-            f"settings-timeout-{timeout_key}",
-            f"{definition['label']} (slow mode)",
+            toggle_id,
+            f"{label} slow mode",
             checked=enabled,
-            help_text=slow_help if enabled else normal_help,
         )
-        + "</div>"
+        + f'<span class="cds-timeout-matrix__current" id="{_h(toggle_id)}-help">'
+        f"{_h(current_text)}</span>"
+        "</div>"
     )
 
 
@@ -657,6 +676,11 @@ def _api_timeouts_section(model: Mapping[str, Any]) -> str:
     rows = "".join(
         _timeout_row(timeout_key, definition, bool(timeout_settings.get(timeout_key)))
         for timeout_key, definition in TIMEOUT_SLOW_MODE_DEFINITIONS.items()
+    )
+    timeout_matrix = (
+        '<div class="cds-timeout-matrix">'
+        '<div class="cds-timeout-matrix__head"><span>Operation</span>'
+        "<span>Slow mode</span><span>Current</span></div>" + rows + "</div>"
     )
 
     api_rows = (
@@ -690,7 +714,7 @@ def _api_timeouts_section(model: Mapping[str, Any]) -> str:
     )
 
     return tile(
-        rows
+        timeout_matrix
         + '<p id="settings-timeouts-status" class="cds-field__help" aria-live="polite"></p>'
         '<h3 class="cds-subheading">API access</h3>'
         '<p class="cds-field__help">Use this URL and key for Newznab Indexer and '

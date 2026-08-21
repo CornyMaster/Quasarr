@@ -280,21 +280,54 @@ class CarbonSettingsRenderTests(unittest.TestCase):
         self.assertNotIn('data-action="theme-select"', html)
         self.assertNotIn('id="settings-theme"', html)
 
-    def test_timeouts_use_standard_toggles_with_current_value(self):
+    def test_timeouts_render_as_an_aligned_operation_switch_current_matrix(self):
         """Timeouts save on change now, so the tile has no Save button and
-        each row states the timeout currently in force.
+        each row states the timeout currently in force. The four rows share
+        the Notifications matrix's idiom (one grid, a head row above the
+        data rows) instead of each switch trailing its own inline label -
+        that is what keeps every switch at the same x position regardless
+        of how long "Search"/"Feed"/"Download"/"Session" is.
         """
         html, _model = self._render()
         self.assertNotIn("Save Timeout Settings", html)
         self.assertNotIn('data-action="timeouts-save"', html)
-        self.assertIn("Current: ", html)
         timeouts = html[
             html.index("API &amp; timeouts") : html.index("Link protection")
         ]
         self.assertNotIn("cds-toggle--compact", timeouts)
-        # search is the one enabled slow-mode key in the fixture model.
-        self.assertIn("Current: 45 s (slow)", timeouts)
-        self.assertIn("Current: 30 s (normal)", timeouts)
+
+        # One matrix, one head row, four data rows - nothing else between
+        # the tile heading and the API-key fields can offset a row's switch
+        # into a different column.
+        self.assertEqual(timeouts.count('<div class="cds-timeout-matrix">'), 1)
+        self.assertEqual(timeouts.count('<div class="cds-timeout-matrix__head">'), 1)
+        self.assertIn(
+            '<div class="cds-timeout-matrix__head"><span>Operation</span>'
+            "<span>Slow mode</span><span>Current</span></div>",
+            timeouts,
+        )
+        self.assertEqual(timeouts.count('<div class="cds-timeout-matrix__row"'), 4)
+        for label in ("Search", "Feed", "Download", "Session"):
+            with self.subTest(label=label):
+                self.assertIn(
+                    f'<span class="cds-timeout-matrix__label">{label}</span>',
+                    timeouts,
+                )
+
+        # search is the one enabled slow-mode key in the fixture model; its
+        # "Current" cell is the matrix's third column, not a line under the
+        # switch any more.
+        self.assertIn(
+            '<span class="cds-timeout-matrix__current" '
+            'id="settings-timeout-search-help">Current: 45 s (slow)</span>',
+            timeouts,
+        )
+        self.assertIn(
+            '<span class="cds-timeout-matrix__current" '
+            'id="settings-timeout-feed-help">Current: 30 s (normal)</span>',
+            timeouts,
+        )
+        self.assertNotIn("cds-toggle__help", timeouts)
         # The two help strings for a row are rendered as data attributes so
         # carbon.js can swap them on change without re-deriving seconds.
         self.assertIn('data-timeout-help-normal="Current: 15 s (normal)"', timeouts)
@@ -1076,11 +1109,11 @@ class CarbonSettingsJsMergeBeforeSaveTests(unittest.TestCase):
 
     def test_timeout_slow_mode_keys_selector_is_scoped_to_inputs_only(self):
         """A bare `[id^="settings-timeout-"]` attribute selector would also
-        match toggle()'s own help-text `<p
-        id="settings-timeout-<key>-help">` (unused today, but a real,
-        supported toggle() option) and emit a phantom "<key>-help" entry
-        into the POST /api/timeouts/settings payload. Scoped to
-        `input[id^=...]` so only the toggle's own checkbox can ever match.
+        match the timeouts matrix's own CURRENT-column cell, which carries
+        the sibling id `settings-timeout-<key>-help`, and emit a phantom
+        "<key>-help" entry into the POST /api/timeouts/settings payload.
+        Scoped to `input[id^=...]` so only the toggle's own checkbox can
+        ever match.
         """
         body = self._function_body("timeoutSlowModeKeys")
         self.assertIn('input[id^="settings-timeout-"]', body)
@@ -1106,10 +1139,38 @@ class CarbonSettingsCssContractTests(unittest.TestCase):
         self.assertIn(".cds-visually-hidden", css)
         self.assertIn(".cds-matrix__head", css)
         self.assertIn(".cds-matrix__row", css)
+        self.assertIn(".cds-timeout-matrix__head", css)
+        self.assertIn(".cds-timeout-matrix__row", css)
         self.assertIn(".cds-details", css)
         self.assertIn(".cds-field-row__label", css)
         self.assertNotIn("http://", css)
         self.assertNotIn("https://", css)
+
+    def test_timeout_matrix_head_and_row_share_one_grid_template(self):
+        """A pin that fails if the four timeout switches ever stop sharing
+        one x position: .cds-timeout-matrix__head and
+        .cds-timeout-matrix__row must stay one combined rule (the same
+        idiom .cds-hostname-table and .cds-matrix already use below), so
+        the header and every data row are laid out against the identical
+        column boundaries - splitting them into separate declarations
+        could drift the columns apart with no visible warning in the CSS
+        text itself. The column sizes are pinned exactly, and none of them
+        may be `auto`: an `auto` CURRENT column would size itself from
+        that one row's own "Current: N s (normal|slow)" text, which
+        measurably differs in width between rows (confirmed live: 112px
+        for "Current: 45 s (slow)" versus 115px for "Current: 30 s
+        (normal)") - flexing the 1fr label column by a different amount
+        per row and knocking the switch column out of alignment between
+        rows, exactly the bug a live-browser check caught before this pin
+        existed.
+        """
+        css = (STATIC_ROOT / "carbon.css").read_text(encoding="utf-8")
+        self.assertRegex(
+            css,
+            r"\.cds-timeout-matrix__head,\s*\n\.cds-timeout-matrix__row\s*\{"
+            r"[^}]*display:\s*grid;"
+            r"[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+88px\s+140px;",
+        )
 
     def test_rules_left_with_their_last_consumer(self):
         # Two blocks lost their last renderer in the same change and are

@@ -864,11 +864,10 @@
 
 	function timeoutSlowModeKeys() {
 		// Scoped to the toggle <input> itself, never a bare `[id^=...]`
-		// attribute selector - toggle()'s own help text (unused here today,
-		// but a real option the component supports) renders a sibling
-		// <p id="settings-timeout-<key>-help">, which an unscoped selector
-		// would also match and turn into a phantom "<key>-help" entry in
-		// the POST payload.
+		// attribute selector - the timeouts matrix's own CURRENT-column
+		// cell carries a sibling id="settings-timeout-<key>-help" element,
+		// which an unscoped selector would also match and turn into a
+		// phantom "<key>-help" entry in the POST payload.
 		return Array.prototype.map.call(
 			document.querySelectorAll('input[id^="settings-timeout-"]'),
 			function (el) {
