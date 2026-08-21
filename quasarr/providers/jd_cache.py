@@ -10,6 +10,22 @@ from quasarr.providers.myjd_api import (
     TokenExpiredException,
 )
 
+# A JDownloader query either answers with data or fails, and two of its failure
+# shapes used to escape this class as an HTTP 500 on every page that reads the
+# cache. `shared_state` can hold a configured device NAME where a connected
+# client is expected, so the first attribute lookup raises `AttributeError`
+# rather than the MyJD errors below; and `query_packages()`/`query_links()`
+# answer `False` instead of a list when the device refuses the call, which makes
+# the `len()` in the success trace raise `TypeError`. Neither says anything
+# except "nothing is known right now", so neither may take a page down.
+_QUERY_FAILURES = (
+    TokenExpiredException,
+    RequestTimeoutException,
+    MYJDException,
+    AttributeError,
+    TypeError,
+)
+
 
 class JDPackageCache:
     """
@@ -47,19 +63,34 @@ class JDPackageCache:
         )
         return f"{self._api_calls} API calls | {pkg_count} packages, {link_count} links cached"
 
+    def _query(self, label, call, default):
+        """Answer one JDownloader query, or `default` when it cannot be made.
+
+        Every caller of this cache renders a page or an API response, so a
+        device that is missing, stale, or answering the wrong shape has to
+        degrade to "nothing known" instead of propagating.
+        """
+        self._api_calls += 1
+        try:
+            value = call()
+        except _QUERY_FAILURES as e:
+            trace(f"Failed to fetch {label}: {e}")
+            return default
+        if isinstance(default, list) and not isinstance(value, list):
+            trace(f"{label} answered {type(value).__name__} instead of a list")
+            return default
+        return value
+
     @property
     def linkgrabber_packages(self):
         if self._linkgrabber_packages is None:
             trace("Fetching linkgrabber_packages from API")
-            self._api_calls += 1
-            try:
-                self._linkgrabber_packages = self._device.linkgrabber.query_packages()
-                trace(
-                    f"Retrieved {len(self._linkgrabber_packages)} linkgrabber packages"
-                )
-            except (TokenExpiredException, RequestTimeoutException, MYJDException) as e:
-                trace(f"Failed to fetch linkgrabber_packages: {e}")
-                self._linkgrabber_packages = []
+            self._linkgrabber_packages = self._query(
+                "linkgrabber_packages",
+                lambda: self._device.linkgrabber.query_packages(),
+                [],
+            )
+            trace(f"Retrieved {len(self._linkgrabber_packages)} linkgrabber packages")
         else:
             self._cache_hits += 1
             trace(
@@ -71,13 +102,12 @@ class JDPackageCache:
     def linkgrabber_links(self):
         if self._linkgrabber_links is None:
             trace("Fetching linkgrabber_links from API")
-            self._api_calls += 1
-            try:
-                self._linkgrabber_links = self._device.linkgrabber.query_links()
-                trace(f"Retrieved {len(self._linkgrabber_links)} linkgrabber links")
-            except (TokenExpiredException, RequestTimeoutException, MYJDException) as e:
-                trace(f"Failed to fetch linkgrabber_links: {e}")
-                self._linkgrabber_links = []
+            self._linkgrabber_links = self._query(
+                "linkgrabber_links",
+                lambda: self._device.linkgrabber.query_links(),
+                [],
+            )
+            trace(f"Retrieved {len(self._linkgrabber_links)} linkgrabber links")
         else:
             self._cache_hits += 1
             trace(
@@ -89,13 +119,12 @@ class JDPackageCache:
     def downloader_packages(self):
         if self._downloader_packages is None:
             trace("Fetching downloader_packages from API")
-            self._api_calls += 1
-            try:
-                self._downloader_packages = self._device.downloads.query_packages()
-                trace(f"Retrieved {len(self._downloader_packages)} downloader packages")
-            except (TokenExpiredException, RequestTimeoutException, MYJDException) as e:
-                trace(f"Failed to fetch downloader_packages: {e}")
-                self._downloader_packages = []
+            self._downloader_packages = self._query(
+                "downloader_packages",
+                lambda: self._device.downloads.query_packages(),
+                [],
+            )
+            trace(f"Retrieved {len(self._downloader_packages)} downloader packages")
         else:
             self._cache_hits += 1
             trace(
@@ -107,13 +136,12 @@ class JDPackageCache:
     def downloader_links(self):
         if self._downloader_links is None:
             trace("Fetching downloader_links from API")
-            self._api_calls += 1
-            try:
-                self._downloader_links = self._device.downloads.query_links()
-                trace(f"Retrieved {len(self._downloader_links)} downloader links")
-            except (TokenExpiredException, RequestTimeoutException, MYJDException) as e:
-                trace(f"Failed to fetch downloader_links: {e}")
-                self._downloader_links = []
+            self._downloader_links = self._query(
+                "downloader_links",
+                lambda: self._device.downloads.query_links(),
+                [],
+            )
+            trace(f"Retrieved {len(self._downloader_links)} downloader links")
         else:
             self._cache_hits += 1
             trace(
@@ -125,13 +153,12 @@ class JDPackageCache:
     def is_collecting(self):
         if self._is_collecting is None:
             trace("Checking is_collecting from API")
-            self._api_calls += 1
-            try:
-                self._is_collecting = self._device.linkgrabber.is_collecting()
-                trace(f"is_collecting = {self._is_collecting}")
-            except (TokenExpiredException, RequestTimeoutException, MYJDException) as e:
-                trace(f"Failed to check is_collecting: {e}")
-                self._is_collecting = False
+            self._is_collecting = self._query(
+                "is_collecting",
+                lambda: self._device.linkgrabber.is_collecting(),
+                False,
+            )
+            trace(f"is_collecting = {self._is_collecting}")
         else:
             self._cache_hits += 1
             trace(f"Using cached is_collecting = {self._is_collecting}")
