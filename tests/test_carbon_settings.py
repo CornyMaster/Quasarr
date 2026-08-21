@@ -424,6 +424,24 @@ class CarbonSettingsRenderTests(unittest.TestCase):
             html,
         )
 
+    def test_link_protection_mode_explanation_is_short_and_accurate(self):
+        """The paragraph under the mode switcher used to run four to six
+        lines. It only needs to state the one consequence of each choice:
+        whether affected releases wait for the cooldown or fail right
+        away, and that recorded blocks are not lost either way.
+        """
+        html, _model = self._render()
+        self.assertIn(
+            "<p>Hold and retest pauses affected releases until the cooldown "
+            "ends. Fail immediately fails them at once so *arr grabs an "
+            "alternative; blocks stay recorded either way.</p>",
+            html,
+        )
+        # The old wording is gone, not merely rearranged.
+        self.assertNotIn("waiting in the queue", html)
+        self.assertNotIn("restores the legacy behavior", html)
+        self.assertNotIn("kept but ignored until you switch back", html)
+
     def test_link_protection_sweep_source_tag(self):
         html, _model = self._render()
         self.assertIn(">Default</span>", html)

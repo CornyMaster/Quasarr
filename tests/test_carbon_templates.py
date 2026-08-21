@@ -958,9 +958,24 @@ class CarbonStaticContractsTests(unittest.TestCase):
         self.assertRegex(
             css, r"\.cds-grid--dashboard\s*\{[^}]*grid-template-columns:\s*1\.4fr 1fr;"
         )
+        # Settings packs its tiles densely with CSS multi-column instead of
+        # a fixed-column grid, so a short tile can stack under another
+        # short tile instead of leaving dead space under it; each tile
+        # keeps the same 16px rhythm via its own bottom margin, and never
+        # splits across a column break.
         self.assertRegex(
             css,
-            r"\.cds-grid--settings\s*\{[^}]*repeat\(auto-fit,\s*minmax\(400px,\s*1fr\)\);",
+            r"\.cds-grid--settings\s*\{[^}]*columns:\s*380px;[^}]*column-gap:\s*16px;",
+        )
+        self.assertRegex(
+            css,
+            r"\.cds-grid--settings\s*>\s*\.cds-tile\s*\{[^}]*break-inside:\s*avoid;"
+            r"[^}]*margin-bottom:\s*16px;",
+        )
+        self.assertRegex(
+            css,
+            r"@media\s*\(max-width:\s*1056px\)[\s\S]*?\.cds-grid--settings\s*\{"
+            r"[^}]*columns:\s*1;",
         )
         # Statistics' single self-arranging detail-tile grid: auto-fit
         # columns and align-items: stretch so tiles sharing a visual row
@@ -987,6 +1002,42 @@ class CarbonStaticContractsTests(unittest.TestCase):
             css,
             r"@media\s*\(max-width:\s*672px\)[\s\S]*?\.cds-kpi-row\s*\{"
             r"[^}]*grid-template-columns:\s*repeat\(1,\s*minmax\(0,\s*1fr\)\);",
+        )
+
+    def test_cds_grid_2_fields_share_row_tracks(self):
+        """The Link Protection tile's two number fields (Cooldown hours,
+        Filecrypt sweep window) used to sit in independent grid items, so
+        a label that wraps to a second line (the sweep window's "Default"
+        tag) only pushed its own input down, leaving the two inputs
+        misaligned by the wrapped line's height.
+
+        The fix gives `.cds-grid--2` two explicit row tracks and makes
+        every `.cds-field` inside it a subgrid spanning both - the label
+        row and the input row become tracks shared by every column, sized
+        by the tallest label across all of them. That is what guarantees
+        the two inputs can never diverge vertically, for any label length:
+        nudging a single field with a fixed height could not generalize
+        the same way, and is exactly what this structure replaces.
+        """
+        css = self._read_static("carbon.css")
+
+        self.assertRegex(
+            css,
+            r"\.cds-grid--2\s*\{[^}]*display:\s*grid;"
+            r"[^}]*grid-template-rows:\s*auto auto;",
+        )
+        self.assertRegex(
+            css,
+            r"\.cds-grid--2\s*>\s*\.cds-field\s*\{[^}]*display:\s*grid;"
+            r"[^}]*grid-template-rows:\s*subgrid;"
+            r"[^}]*grid-row:\s*span 2;",
+        )
+        # A fixed height on the label (or on the field) is exactly the
+        # "nudge" anti-pattern the brief that motivated this fix rejected;
+        # only the shared subgrid track may size the row.
+        self.assertNotRegex(
+            css,
+            r"\.cds-grid--2[^{]*\.cds-field(__label)?\s*\{[^}]*height:",
         )
 
     def test_carbon_css_status_card_wide_modifier_and_credentials_panel_contract(self):

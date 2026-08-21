@@ -765,10 +765,9 @@ def _link_protection_section(model: Mapping[str, Any]) -> str:
         )
         + '<h3 class="cds-subheading">Linkcrypter access blocks</h3>'
         + mode_switcher
-        + "<p>Hold and retest keeps affected releases waiting in the queue until the "
-        "cooldown expires. Fail immediately restores the legacy behavior at once: "
-        "releases fail again so *arr grabs an alternative, and recorded blocks are "
-        "kept but ignored until you switch back.</p>"
+        + "<p>Hold and retest pauses affected releases until the cooldown ends. Fail "
+        "immediately fails them at once so *arr grabs an alternative; blocks stay "
+        "recorded either way.</p>"
         + number_fields
         + toggle(
             "settings-filecrypt-sweep-window-default",

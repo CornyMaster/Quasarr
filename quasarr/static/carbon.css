@@ -587,7 +587,23 @@ a {
 .cds-grid--2 {
 	display: grid;
 	grid-template-columns: repeat(2, minmax(0, 1fr));
-	gap: 16px;
+	grid-template-rows: auto auto;
+	column-gap: 16px;
+	align-items: start;
+}
+
+/* Each field spans both rows of the grid and subgrids into them, so the
+   label row and the input row are shared tracks rather than each field
+   sizing its own two rows independently. A field whose label wraps to a
+   second line grows the shared label row for every column at once, which
+   is what keeps every input on the same line regardless of label length -
+   nudging one field with a fixed height cannot do that for an arbitrary
+   number of wrapped words. */
+.cds-grid--2 > .cds-field {
+	display: grid;
+	grid-template-rows: subgrid;
+	grid-row: span 2;
+	row-gap: 0;
 	align-items: start;
 }
 
@@ -598,11 +614,20 @@ a {
 	align-items: start;
 }
 
+/* A dense column-flow layout instead of a fixed-column grid: short tiles
+   stack under short tiles in the same column instead of a row-aligned
+   grid leaving dead space under a short neighbor. `break-inside: avoid`
+   keeps a tile from splitting across a column break, and the 16px column
+   gap plus each tile's own bottom margin keep the same 16px rhythm the
+   fixed-column grids use. */
 .cds-grid--settings {
-	display: grid;
-	grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-	gap: 16px;
-	align-items: start;
+	columns: 380px;
+	column-gap: 16px;
+}
+
+.cds-grid--settings > .cds-tile {
+	break-inside: avoid;
+	margin-bottom: 16px;
 }
 
 .cds-grid--auto {
@@ -1220,9 +1245,15 @@ a {
 	.cds-grid--dashboard,
 	.cds-grid--2,
 	.cds-grid--3,
-	.cds-grid--settings,
 	.cds-grid--auto {
 		grid-template-columns: minmax(0, 1fr);
+	}
+
+	/* The dense multi-column layout only applies at the widths it was
+	   measured at; below this breakpoint it collapses to the same single
+	   column the fixed-column grids fall back to. */
+	.cds-grid--settings {
+		columns: 1;
 	}
 
 	.cds-nav__link {
