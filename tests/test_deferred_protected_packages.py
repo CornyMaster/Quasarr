@@ -911,6 +911,31 @@ class DatabasePackageDeletionTests(unittest.TestCase):
         self.assertIn(PACKAGE_B, self.protected.rows)
         self.assertEqual(0, self.shared_state.device_calls)
 
+    def test_batch_delete_drops_the_origin_of_every_deleted_package(self):
+        # The origin row deliberately outlives the protected blob, so deletion
+        # is the only thing that removes it - a package the user deleted must
+        # not leave its crypter and acceptance time behind forever.
+        from quasarr.providers.package_origin import (
+            PACKAGE_ORIGIN_TABLE,
+            record_package_origin,
+        )
+
+        for package_id in (PACKAGE_A, PACKAGE_B):
+            record_package_origin(
+                self.shared_state,
+                package_id,
+                "filecrypt",
+                "https://filecrypt.invalid/Container/ABC123",
+                now=NOW,
+            )
+
+        delete_database_packages(self.shared_state, [PACKAGE_A, PACKAGE_B])
+
+        origins = self.shared_state.databases[PACKAGE_ORIGIN_TABLE].rows
+        self.assertNotIn(PACKAGE_A, origins)
+        # PACKAGE_B is rejected as not_deferred, so its origin must survive.
+        self.assertIn(PACKAGE_B, origins)
+
     def test_batch_delete_verifies_each_id_against_the_database(self):
         shared_state = FakeSharedState(frozen_protected=True)
         shared_state.databases["protected"].update_store(

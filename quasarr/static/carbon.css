@@ -1768,6 +1768,15 @@ a {
 	margin: 0;
 }
 
+/* The per-table search field sits between the heading and the bulk toolbar
+   and takes the room left over, exactly like the one in .cds-tile__head-row
+   on the Queue and History tiles. */
+
+.cds-section-header .cds-field {
+	margin-top: 0;
+	flex: 1 1 200px;
+}
+
 .cds-bulk-toolbar {
 	display: flex;
 	flex-wrap: wrap;
@@ -2145,4 +2154,90 @@ a {
 	.cds-switcher__item span {
 		min-height: 44px;
 	}
+}
+
+/* Sortable column heads. The whole head reads as one control, so the button
+   fills the cell rather than sitting as a small target inside it, and it
+   inherits the head's uppercase/letter-spacing so a sortable column looks
+   identical to a plain one until it is active. The arrow is a CSS triangle,
+   never an icon file - carbon_icons.py owns a closed, reviewed icon map and
+   this must not imply an entry that is not in it. */
+
+.cds-table__sort {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	width: 100%;
+	padding: 0;
+	border: 0;
+	background: none;
+	color: inherit;
+	font: inherit;
+	letter-spacing: inherit;
+	text-transform: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.cds-table__sort:focus-visible {
+	outline: 2px solid #0f62fe;
+	outline-offset: 2px;
+}
+
+.cds-table__sort-icon {
+	width: 0;
+	height: 0;
+	border-left: 4px solid transparent;
+	border-right: 4px solid transparent;
+	opacity: 0;
+}
+
+.cds-table th[aria-sort="ascending"] .cds-table__sort-icon {
+	border-bottom: 5px solid currentColor;
+	opacity: 1;
+}
+
+.cds-table th[aria-sort="descending"] .cds-table__sort-icon {
+	border-top: 5px solid currentColor;
+	opacity: 1;
+}
+
+.cds-table__sort:hover .cds-table__sort-icon,
+.cds-table__sort:focus-visible .cds-table__sort-icon {
+	border-bottom: 5px solid currentColor;
+	opacity: 0.4;
+}
+
+.cds-table th[aria-sort="descending"] .cds-table__sort:hover .cds-table__sort-icon {
+	border-bottom: 0;
+	border-top: 5px solid currentColor;
+	opacity: 1;
+}
+
+/* Origin cell: the crypter's name over the host it was accepted on. Two
+   lines in one column instead of two columns, because the pair is read as
+   one fact and the table already carries nine columns. */
+
+.cds-origin__name {
+	display: block;
+}
+
+.cds-origin__host {
+	display: block;
+	font-size: 12px;
+	color: var(--cds-helper);
+	word-break: break-all;
+}
+
+/* One line per cooling linkcrypter, stacked inside the single
+   .cds-notification__message the --inline modifier expects. Separate
+   sibling messages would each take flex: 1 and split the banner's width
+   instead of stacking. */
+
+.cds-cooldown-line {
+	display: block;
+}
+
+.cds-cooldown-line + .cds-cooldown-line {
+	margin-top: 4px;
 }

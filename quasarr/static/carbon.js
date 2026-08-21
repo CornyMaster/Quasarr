@@ -1288,8 +1288,34 @@
 		}
 	}
 
+	// The Downloads page's countdown ticker is scoped to #downloads-content,
+	// so the Dashboard's cooldown banner needs its own. It reuses the same
+	// exported formatter rather than growing a second one. Once every
+	// deadline has passed the banner is hidden instead of left showing
+	// 00:00:00 - a spent countdown reads as a live block that no longer
+	// exists, and the Dashboard does not poll, so nothing else would clear it.
+	function startCooldownCountdown() {
+		var banner = byId('dashboard-cooldown-banner');
+		if (!banner || !window.CarbonTime) {
+			return;
+		}
+		function tick() {
+			window.CarbonTime.updateDeferredCountdowns(banner);
+			var now = window.CarbonTime.nowSeconds();
+			var live = Array.prototype.slice
+				.call(banner.querySelectorAll('.deferred-countdown'))
+				.some(function (element) {
+					return window.CarbonTime.deferredCountdownEpoch(element) > now;
+				});
+			banner.hidden = !live;
+		}
+		tick();
+		window.setInterval(tick, 1000);
+	}
+
 	document.addEventListener('DOMContentLoaded', function () {
 		loadDashboardQueue();
+		startCooldownCountdown();
 		document.addEventListener('click', onSettingsDashboardClick);
 		document.addEventListener('change', onSettingsDashboardChange);
 	});
@@ -3497,9 +3523,31 @@
 		});
 	}
 
+	// A table cell has room for "3h ago", not for a full timestamp plus a
+	// phrase - which is why this is a separate export from upgradeEpochTimes()
+	// rather than a reuse of it. The absolute time still travels along, in the
+	// cell's title attribute (see formatAbsolute).
+	function formatRelative(epoch) {
+		var value = Number.parseInt(epoch || '0', 10);
+		if (!Number.isFinite(value) || value <= 0) {
+			return '';
+		}
+		return relativePhrase(value - nowSeconds());
+	}
+
+	function formatAbsolute(epoch) {
+		var value = Number.parseInt(epoch || '0', 10);
+		if (!Number.isFinite(value) || value <= 0) {
+			return '';
+		}
+		return new Date(value * 1000).toLocaleString();
+	}
+
 	window.CarbonTime = {
 		nowSeconds: nowSeconds,
 		formatDuration: formatDuration,
+		formatRelative: formatRelative,
+		formatAbsolute: formatAbsolute,
 		deferredCountdownEpoch: deferredCountdownEpoch,
 		updateDeferredCountdowns: updateDeferredCountdowns,
 		upgradeEpochTimes: upgradeEpochTimes
@@ -3518,6 +3566,8 @@
 	var SLOW_THRESHOLD_MS = 5000;
 	var SCROLL_STORAGE_KEY = 'quasarr_downloads_scroll_y';
 	var COLLAPSE_STORAGE_KEY = 'otherPackagesOpen';
+	var SORT_STORAGE_KEY = 'quasarr_downloads_sort_v1';
+	var SEARCH_STORAGE_KEY = 'quasarr_downloads_search_v1';
 	// Mirrors EVIDENCE_THRESHOLD in quasarr/providers/crypter_cooldowns.py:
 	// a provisional hold needs three distinct observations before the
 	// crypter itself cools down. Shown so "1" reads as "1 of 3" rather than
@@ -3529,6 +3579,215 @@
 	var refreshPaused = false;
 	var modalObserver = null;
 	var lastOtherTotal = 0;
+	var sortState = {};
+	var searchState = {};
+	// The most recent successful payload, kept so a sort click can reorder
+	// the tables immediately instead of waiting for the next poll.
+	var lastPayload = null;
+
+	// ---- Sorting ---------------------------------------------------------
+	//
+	// The Downloads list used to arrive in whatever order the aggregation
+	// happened to build it: protected rows first (ordered by the SHA-256 in
+	// their package ID), then failed, then whatever JDownloader returned.
+	// Deterministic, but meaningless to read. Every table now has a default
+	// that can be stated in one sentence, and every column can be sorted.
+	//
+	// Sorting is applied to the DATA ARRAY before the DOM is built, never to
+	// the rendered rows: the 5s poll replaces every <tbody> wholesale, so a
+	// DOM-level sort would be undone on the next tick, and
+	// restoreDeferredSelection() restores checkboxes by value rather than by
+	// position and keeps working either way.
+
+	var DEFAULT_SORT = {
+		deferred: { key: 'next-check', direction: 'asc' },
+		queue: { key: 'added', direction: 'desc' },
+		history: { key: 'added', direction: 'desc' },
+		'other-queue': { key: 'added', direction: 'desc' },
+		'other-history': { key: 'added', direction: 'desc' }
+	};
+
+	// "HH:MM:SS" (or "D days, HH:MM:SS") into seconds, for the ETA column.
+	// The contract carries the formatted string, not a number - an unknown
+	// ETA is reported by eta_unknown and sorts as missing.
+	function parseEtaSeconds(value) {
+		var parts = String(value || '').split(':');
+		if (parts.length !== 3) {
+			return 0;
+		}
+		var seconds = 0;
+		for (var index = 0; index < parts.length; index += 1) {
+			var part = Number.parseInt(parts[index], 10);
+			if (!Number.isFinite(part) || part < 0) {
+				return 0;
+			}
+			seconds = seconds * 60 + part;
+		}
+		return seconds;
+	}
+
+	// One value extractor per sortable column key. The keys match the
+	// `data-sort-key` attributes api/packages/carbon.py's _sortable_th()
+	// renders; a head naming a key that is missing here is simply not
+	// sortable rather than an error.
+	var SORT_VALUES = {
+		name: function (row) {
+			return String(row.name || '');
+		},
+		crypter: function (row) {
+			return (String(row.crypter_label || '') + ' ' + String(row.mirror || '')).trim();
+		},
+		category: function (row) {
+			return String(row.category || '');
+		},
+		status: function (row) {
+			return String(row.status || '');
+		},
+		state: function (row) {
+			return String(row.state || '');
+		},
+		added: function (row) {
+			return Number(row.added_epoch) || 0;
+		},
+		size: function (row) {
+			return Number(row.size_bytes) || 0;
+		},
+		progress: function (row) {
+			return Number(row.percentage) || 0;
+		},
+		evidence: function (row) {
+			return Number(row.evidence_count) || 0;
+		},
+		sweep: function (row) {
+			return Number(row.cohort_tested) || 0;
+		},
+		'next-check': function (row) {
+			return Number(row.retry_after_epoch) || 0;
+		},
+		eta: function (row) {
+			return row.eta_unknown ? 0 : parseEtaSeconds(row.eta);
+		}
+	};
+
+	function currentSort(tableKey) {
+		return sortState[tableKey] || DEFAULT_SORT[tableKey] || { key: '', direction: 'asc' };
+	}
+
+	function sortRows(tableKey, rows) {
+		var state = currentSort(tableKey);
+		var extract = SORT_VALUES[state.key];
+		if (!extract || !Array.isArray(rows)) {
+			return rows;
+		}
+		var factor = state.direction === 'desc' ? -1 : 1;
+		// slice() first: the array belongs to the parsed response, which the
+		// count and empty-message calls around this also read.
+		return rows.slice().sort(function (left, right) {
+			var a = extract(left);
+			var b = extract(right);
+			// A missing value is not "smallest", it is unknown - so it sorts
+			// last in BOTH directions. Packages that predate the origin
+			// record have no added_epoch, and they must not push everything
+			// the user cares about off the top of a descending sort.
+			var aMissing = a === '' || a === 0;
+			var bMissing = b === '' || b === 0;
+			if (aMissing !== bMissing) {
+				return aMissing ? 1 : -1;
+			}
+			if (aMissing && bMissing) {
+				return 0;
+			}
+			if (typeof a === 'string') {
+				return (
+					factor * a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+				);
+			}
+			return factor * (a - b);
+		});
+	}
+
+	function readStoredState(storageKey) {
+		try {
+			var raw = window.localStorage.getItem(storageKey);
+			var parsed = raw ? JSON.parse(raw) : null;
+			return parsed && typeof parsed === 'object' ? parsed : {};
+		} catch (_error) {
+			return {};
+		}
+	}
+
+	function writeStoredState(storageKey, value) {
+		try {
+			window.localStorage.setItem(storageKey, JSON.stringify(value));
+		} catch (_error) {
+			// The choice simply does not persist when storage is unavailable.
+		}
+	}
+
+	function isDefaultSort(tableKey, state) {
+		var fallback = DEFAULT_SORT[tableKey];
+		return (
+			!!fallback && fallback.key === state.key && fallback.direction === state.direction
+		);
+	}
+
+	// Tri-state: ascending, then descending, then back to this table's own
+	// default - so a user can always get back to the order the page opened
+	// with without knowing what it was.
+	function nextSortState(tableKey, sortKey) {
+		var state = currentSort(tableKey);
+		if (state.key !== sortKey) {
+			return { key: sortKey, direction: 'asc' };
+		}
+		// The column that IS the table's default has no third state to fall
+		// back to - "off" and "default" are the same order - so it toggles
+		// between the two directions instead of dead-ending on itself.
+		// Without this, Added could never be sorted oldest-first, because
+		// newest-first is already the default.
+		if (isDefaultSort(tableKey, state)) {
+			return { key: sortKey, direction: state.direction === 'asc' ? 'desc' : 'asc' };
+		}
+		if (state.direction === 'asc') {
+			return { key: sortKey, direction: 'desc' };
+		}
+		return DEFAULT_SORT[tableKey] || { key: '', direction: 'asc' };
+	}
+
+	function applySortIndicators() {
+		document
+			.querySelectorAll('#downloads-content table[data-table-key]')
+			.forEach(function (table) {
+				var state = currentSort(table.getAttribute('data-table-key'));
+				table.querySelectorAll('th[data-sort-key]').forEach(function (head) {
+					var isActive = head.getAttribute('data-sort-key') === state.key;
+					head.setAttribute(
+						'aria-sort',
+						isActive ? (state.direction === 'desc' ? 'descending' : 'ascending') : 'none'
+					);
+				});
+			});
+	}
+
+	function onSortHeadClick(target) {
+		var table = target.closest('table[data-table-key]');
+		var tableKey = table ? table.getAttribute('data-table-key') : '';
+		var sortKey = target.getAttribute('data-sort-key');
+		if (!tableKey || !sortKey || !SORT_VALUES[sortKey]) {
+			return;
+		}
+		sortState[tableKey] = nextSortState(tableKey, sortKey);
+		writeStoredState(SORT_STORAGE_KEY, sortState);
+		// Re-render from the payload already in hand rather than waiting for
+		// the network. loadDownloads() returns early while a poll is in
+		// flight, so routing a sort click through it alone could leave the
+		// header looking unresponsive for a whole refresh interval.
+		if (lastPayload) {
+			renderDownloads(lastPayload);
+		} else {
+			applySortIndicators();
+			loadDownloads();
+		}
+	}
 
 	var DEFERRED_STATE_LABELS = {
 		observing: 'Observing',
@@ -3653,6 +3912,50 @@
 		var cell = document.createElement('td');
 		cell.textContent = value == null ? '' : String(value);
 		row.appendChild(cell);
+	}
+
+	// The origin cell: the crypter's name over the host it was accepted on.
+	// Both are written as text nodes, never innerHTML - `mirror` is validated
+	// server-side (api/packages/carbon.py's _origin_fields), and this side
+	// treats it as untrusted anyway rather than relying on that.
+	function appendOriginCell(row, data) {
+		var cell = document.createElement('td');
+		var label = String(data.crypter_label || '');
+		var mirror = String(data.mirror || '');
+		if (label) {
+			cell.appendChild(buildEl('span', 'cds-origin__name', label));
+		}
+		if (mirror) {
+			cell.appendChild(buildEl('span', 'cds-origin__host', mirror));
+		}
+		if (!label && !mirror) {
+			// A package Quasarr never accepted (an "other" package), or one
+			// older than the origin record. An em dash says "not known"; an
+			// empty cell reads as a rendering bug.
+			cell.textContent = '—';
+		}
+		row.appendChild(cell);
+	}
+
+	function appendAddedCell(row, epoch) {
+		var cell = document.createElement('td');
+		var relative = window.CarbonTime.formatRelative(epoch);
+		if (relative) {
+			var time = buildEl('time', 'cds-mono', relative);
+			time.setAttribute('datetime', String(epoch));
+			time.setAttribute('title', window.CarbonTime.formatAbsolute(epoch));
+			cell.appendChild(time);
+		} else {
+			cell.textContent = '—';
+		}
+		row.appendChild(cell);
+	}
+
+	// Both are also what the per-table search matches on, so they travel on
+	// the row itself rather than being re-read out of the rendered cells.
+	function markOriginDataset(tr, row) {
+		tr.dataset.crypter = String(row.crypter_label || '');
+		tr.dataset.mirror = String(row.mirror || '');
 	}
 
 	// Mirrors quasarr/providers/carbon_icons.py's reviewed "trash-can" and
@@ -3795,6 +4098,7 @@
 		var tr = document.createElement('tr');
 		tr.dataset.packageId = row.package_id;
 		tr.dataset.packageName = row.name;
+		markOriginDataset(tr, row);
 
 		var selectCell = document.createElement('td');
 		var checkbox = document.createElement('input');
@@ -3807,10 +4111,12 @@
 
 		var nameCell = document.createElement('td');
 		nameCell.appendChild(buildEl('p', 'cds-release', row.name));
-		nameCell.appendChild(
-			buildEl('p', 'cds-field__help', row.crypter_label + ' · ' + row.reason_label)
-		);
+		// The crypter moved out of this helper line into its own sortable
+		// column; the reason is what is left that belongs with the name.
+		nameCell.appendChild(buildEl('p', 'cds-field__help', row.reason_label));
 		tr.appendChild(nameCell);
+
+		appendOriginCell(tr, row);
 
 		var stateCell = document.createElement('td');
 		stateCell.appendChild(
@@ -3856,6 +4162,8 @@
 		);
 		tr.appendChild(sweepCell);
 
+		appendAddedCell(tr, row.added_epoch);
+
 		var actionsCell = document.createElement('td');
 		actionsCell.className = 'cds-row-actions';
 		actionsCell.appendChild(
@@ -3880,6 +4188,7 @@
 		var tr = document.createElement('tr');
 		tr.dataset.packageId = row.package_id;
 		tr.dataset.packageName = row.name;
+		markOriginDataset(tr, row);
 
 		// The status is a dot, not a column of repeated words. The dot is
 		// decorative, so the label lives on twice: as the cell's tooltip for
@@ -3901,6 +4210,8 @@
 			nameCell.appendChild(buildCaptchaLink(row.package_id, row.name, 'inline'));
 		}
 		tr.appendChild(nameCell);
+
+		appendOriginCell(tr, row);
 
 		var categoryCell = document.createElement('td');
 		categoryCell.appendChild(
@@ -3929,6 +4240,8 @@
 		);
 		tr.appendChild(progressCell);
 
+		appendAddedCell(tr, row.added_epoch);
+
 		var actionsCell = document.createElement('td');
 		actionsCell.className = 'cds-row-actions';
 		actionsCell.appendChild(
@@ -3947,6 +4260,7 @@
 		var tr = document.createElement('tr');
 		tr.dataset.packageId = row.package_id;
 		tr.dataset.packageName = row.name;
+		markOriginDataset(tr, row);
 
 		// History is a finished classification, not a live state, so it
 		// leads with a tag rather than a dot - and leads the row, because
@@ -3968,6 +4282,8 @@
 		}
 		tr.appendChild(nameCell);
 
+		appendOriginCell(tr, row);
+
 		var categoryCell = document.createElement('td');
 		categoryCell.appendChild(
 			buildEl(
@@ -3979,6 +4295,8 @@
 		tr.appendChild(categoryCell);
 
 		appendTextCell(tr, row.size_label);
+
+		appendAddedCell(tr, row.added_epoch);
 
 		var actionsCell = document.createElement('td');
 		actionsCell.className = 'cds-row-actions';
@@ -4049,16 +4367,58 @@
 		}
 	}
 
-	// ---- Search: the input lives outside #downloads-content (Python's
-	// _downloads_toolbar()), so its value/focus survive every poll. Filtering
-	// is reapplied after each rebuild instead of relying on it surviving the
-	// DOM replacement. ----
+	// ---- Search: one field per table. Each input lives in its tile's head
+	// row, outside the <tbody> every poll replaces, so its value and focus
+	// survive the refresh; the filter is reapplied after each rebuild rather
+	// than relying on it surviving the DOM replacement. ----
+
+	var SEARCH_SCOPES = [
+		{ field: 'deferred-search', bodies: ['deferred-table-body'] },
+		{ field: 'downloads-search', bodies: ['queue-table-body'] },
+		{ field: 'history-search', bodies: ['history-table-body'] },
+		// The two "other" tables are one collapsed section to the reader, so
+		// one field drives both; splitting it would let the two halves
+		// disagree about what is being looked for.
+		{ field: 'other-search', bodies: ['other-queue-table-body', 'other-history-table-body'] }
+	];
+
+	// Matching covers the crypter and its host as well as the release name -
+	// that is what makes "filecrypt" a usable search term, and the reason
+	// the origin columns are worth having.
+	function rowMatchesTerm(row, term) {
+		if (!term) {
+			return true;
+		}
+		return (
+			[row.dataset.packageName || '', row.dataset.crypter || '', row.dataset.mirror || '']
+				.join(' ')
+				.toLowerCase()
+				.indexOf(term) !== -1
+		);
+	}
 
 	function applySearchFilter() {
-		var input = byId('downloads-search');
-		var term = input ? input.value.trim().toLowerCase() : '';
-		document.querySelectorAll('#downloads-content tbody tr[data-package-name]').forEach(function (row) {
-			row.hidden = term.length > 0 && row.dataset.packageName.toLowerCase().indexOf(term) === -1;
+		SEARCH_SCOPES.forEach(function (scope) {
+			var input = byId(scope.field);
+			var term = input ? input.value.trim().toLowerCase() : '';
+			scope.bodies.forEach(function (bodyId) {
+				var body = byId(bodyId);
+				if (!body) {
+					return;
+				}
+				body.querySelectorAll('tr[data-package-name]').forEach(function (row) {
+					row.hidden = !rowMatchesTerm(row, term);
+				});
+			});
+		});
+	}
+
+	function restoreSearchFields() {
+		SEARCH_SCOPES.forEach(function (scope) {
+			var input = byId(scope.field);
+			if (input && typeof searchState[scope.field] === 'string') {
+				input.value = searchState[scope.field];
+			}
 		});
 	}
 
@@ -4367,6 +4727,7 @@
 		// connection) must still be captured here, not the stale pre-fetch
 		// state.
 		var selectedIds = selectedDeferredPackageIds();
+		rows = sortRows('deferred', rows);
 		tbody.textContent = '';
 		rows.forEach(function (row) {
 			tbody.appendChild(buildDeferredRow(row));
@@ -4390,6 +4751,7 @@
 		if (!tbody) {
 			return;
 		}
+		rows = sortRows('queue', rows);
 		tbody.textContent = '';
 		rows.forEach(function (row) {
 			tbody.appendChild(buildQueueRow(row));
@@ -4403,6 +4765,7 @@
 		if (!tbody) {
 			return;
 		}
+		rows = sortRows('history', rows);
 		tbody.textContent = '';
 		rows.forEach(function (row) {
 			tbody.appendChild(buildHistoryRow(row));
@@ -4421,14 +4784,14 @@
 		var otherQueueBody = byId('other-queue-table-body');
 		if (otherQueueBody) {
 			otherQueueBody.textContent = '';
-			otherQueueRows.forEach(function (row) {
+			sortRows('other-queue', otherQueueRows).forEach(function (row) {
 				otherQueueBody.appendChild(buildQueueRow(row));
 			});
 		}
 		var otherHistoryBody = byId('other-history-table-body');
 		if (otherHistoryBody) {
 			otherHistoryBody.textContent = '';
-			otherHistoryRows.forEach(function (row) {
+			sortRows('other-history', otherHistoryRows).forEach(function (row) {
 				otherHistoryBody.appendChild(buildHistoryRow(row));
 			});
 		}
@@ -4466,8 +4829,10 @@
 		}
 
 		if (!data || data.connected === false) {
+			lastPayload = null;
 			renderDisconnected();
 		} else {
+			lastPayload = data;
 			renderDeferredTable(Array.isArray(data.deferred) ? data.deferred : []);
 			renderQueueTable(Array.isArray(data.queue) ? data.queue : []);
 			renderHistoryTable(Array.isArray(data.history) ? data.history : []);
@@ -4479,6 +4844,7 @@
 
 		content.dataset.state = 'loaded';
 		window.CarbonTime.updateDeferredCountdowns(content);
+		applySortIndicators();
 		applySearchFilter();
 		restoreScrollPosition();
 		window.requestAnimationFrame(restoreScrollPosition);
@@ -4559,6 +4925,9 @@
 					confirmDeletePackage(row.dataset.packageId, rowDisplayName(row));
 				}
 				break;
+			case 'table-sort':
+				onSortHeadClick(actionElement);
+				break;
 			default:
 				break;
 		}
@@ -4583,9 +4952,18 @@
 
 	function onDownloadsInput(event) {
 		var target = event.target;
-		if (target instanceof Element && target.id === 'downloads-search') {
-			applySearchFilter();
+		if (!(target instanceof Element)) {
+			return;
 		}
+		var isSearchField = SEARCH_SCOPES.some(function (scope) {
+			return scope.field === target.id;
+		});
+		if (!isSearchField) {
+			return;
+		}
+		searchState[target.id] = target.value;
+		writeStoredState(SEARCH_STORAGE_KEY, searchState);
+		applySearchFilter();
 	}
 
 	document.addEventListener('DOMContentLoaded', function () {
@@ -4593,6 +4971,14 @@
 		if (!content) {
 			return;
 		}
+
+		// Restored before the first fetch so the opening render already uses
+		// the remembered order and filter, instead of flashing the default
+		// and correcting itself a moment later.
+		sortState = readStoredState(SORT_STORAGE_KEY);
+		searchState = readStoredState(SEARCH_STORAGE_KEY);
+		restoreSearchFields();
+		applySortIndicators();
 
 		installModalResumeHook();
 		wireCollapsePersistence();

@@ -361,6 +361,84 @@ class DownloadsSkeletonRenderTests(unittest.TestCase):
         label_open = html.rindex("<label", 0, start)
         self.assertIn("cds-visually-hidden", html[label_open:start])
 
+    def test_every_table_has_its_own_search_field(self):
+        html = self._render()
+        for field_id in (
+            "deferred-search",
+            "downloads-search",
+            "history-search",
+            "other-search",
+        ):
+            with self.subTest(field_id=field_id):
+                self.assertIn(f'id="{field_id}"', html)
+                # Every field keeps its label out of sight but in the tree.
+                start = html.index(f'for="{field_id}"')
+                label_open = html.rindex("<label", 0, start)
+                self.assertIn("cds-visually-hidden", html[label_open:start])
+
+    def test_sortable_heads_declare_a_key_and_start_unsorted(self):
+        html = self._render()
+        for sort_key in (
+            "name",
+            "crypter",
+            "category",
+            "size",
+            "eta",
+            "progress",
+            "added",
+            "status",
+            "state",
+            "evidence",
+            "next-check",
+            "sweep",
+        ):
+            with self.subTest(sort_key=sort_key):
+                self.assertIn(f'data-sort-key="{sort_key}"', html)
+        self.assertIn('aria-sort="none"', html)
+        # Nothing may ship pre-sorted in the markup: carbon.js owns the live
+        # state and rewrites aria-sort on every render.
+        for rendered in ('aria-sort="ascending"', 'aria-sort="descending"'):
+            self.assertNotIn(rendered, html)
+
+    def test_sort_controls_are_real_buttons_for_keyboard_use(self):
+        html = self._render()
+        self.assertIn('class="cds-table__sort"', html)
+        self.assertIn('data-action="table-sort"', html)
+        # A clickable <th> alone is not reachable by keyboard, so every
+        # sortable head must carry a button.
+        head_count = html.count('data-sort-key="')
+        button_count = html.count('data-action="table-sort"')
+        self.assertEqual(head_count, button_count * 2)
+
+    def test_every_table_declares_the_key_carbon_js_keeps_its_state_under(self):
+        html = self._render()
+        for table_key in (
+            "deferred",
+            "queue",
+            "history",
+            "other-queue",
+            "other-history",
+        ):
+            with self.subTest(table_key=table_key):
+                self.assertIn(f'data-table-key="{table_key}"', html)
+
+    def test_queue_and_history_gained_the_crypter_and_added_columns(self):
+        html = self._render()
+        self.assertIn(">Crypter", html)
+        self.assertIn(">Added", html)
+
+    def test_the_deferred_release_column_stays_second_for_mobile_pinning(self):
+        # .cds-table--sticky-col pins th:first-child and th:nth-child(2) below
+        # 672px; inserting Crypter before Release would pin the wrong column.
+        html = self._render()
+        head_start = html.index('id="deferred-table"')
+        head_end = html.index("</thead>", head_start)
+        head_html = html[head_start:head_end]
+        self.assertLess(
+            head_html.index("deferred-select-all"), head_html.index(">Release")
+        )
+        self.assertLess(head_html.index(">Release"), head_html.index(">Crypter"))
+
     def test_all_four_sections_and_bodies_are_present(self):
         html = self._render()
         for element_id in (
@@ -426,12 +504,24 @@ class DownloadsSkeletonRenderTests(unittest.TestCase):
         # First header is the select-all checkbox cell (selection column);
         # the last is the action column, unlabelled like the Queue and
         # History tables' own action columns - the row's buttons name
-        # themselves, so a repeated column title only adds noise.
-        self.assertEqual(len(headers), 7)
+        # themselves, so a repeated column title only adds noise. Every
+        # header between them is a sort button, so the label is the text
+        # inside the markup rather than the cell's whole content.
+        labels = [re.sub(r"<[^>]*>", "", header).strip() for header in headers]
+        self.assertEqual(len(headers), 9)
         self.assertIn('id="deferred-select-all"', headers[0])
         self.assertEqual(
-            ["Release", "State", "Evidence", "Next check", "Sweep progress", ""],
-            headers[1:],
+            [
+                "Release",
+                "Crypter",
+                "State",
+                "Evidence",
+                "Next check",
+                "Sweep progress",
+                "Added",
+                "",
+            ],
+            labels[1:],
         )
 
     def test_bulk_toolbar_disabled_at_zero_selection(self):
@@ -1345,8 +1435,99 @@ class DownloadRowDesignTests(unittest.TestCase):
 
     def test_filter_reads_the_input_and_still_matches_every_rendered_row(self):
         body = javascript_function_body(self.js, "applySearchFilter")
-        self.assertIn("byId('downloads-search')", body)
-        self.assertIn("'#downloads-content tbody tr[data-package-name]'", body)
+        self.assertIn("SEARCH_SCOPES.forEach(", body)
+        self.assertIn("byId(scope.field)", body)
+        self.assertIn("'tr[data-package-name]'", body)
+        # Every table that renders rows must belong to exactly one scope, or
+        # a filtered table silently keeps showing everything.
+        scopes = self.js[
+            self.js.index("var SEARCH_SCOPES = [") : self.js.index(
+                "function rowMatchesTerm"
+            )
+        ]
+        for body_id in (
+            "deferred-table-body",
+            "queue-table-body",
+            "history-table-body",
+            "other-queue-table-body",
+            "other-history-table-body",
+        ):
+            with self.subTest(body_id=body_id):
+                self.assertEqual(1, scopes.count(f"'{body_id}'"))
+        for field_id in (
+            "deferred-search",
+            "downloads-search",
+            "history-search",
+            "other-search",
+        ):
+            with self.subTest(field_id=field_id):
+                self.assertEqual(1, scopes.count(f"'{field_id}'"))
+
+    def test_the_filter_matches_the_crypter_and_host_as_well_as_the_name(self):
+        # "filecrypt" has to be a usable search term - that is what the
+        # origin columns are for.
+        body = javascript_function_body(self.js, "rowMatchesTerm")
+        self.assertIn("row.dataset.packageName", body)
+        self.assertIn("row.dataset.crypter", body)
+        self.assertIn("row.dataset.mirror", body)
+
+    def test_sorting_reorders_the_data_not_the_rendered_rows(self):
+        # A DOM-level sort would be undone by the next 5s poll, and it would
+        # break selection restore, which matches checkboxes by value.
+        for name, table_key in (
+            ("renderDeferredTable", "'deferred'"),
+            ("renderQueueTable", "'queue'"),
+            ("renderHistoryTable", "'history'"),
+        ):
+            with self.subTest(function=name):
+                body = javascript_function_body(self.js, name)
+                self.assertIn(f"sortRows({table_key}, rows)", body)
+                self.assertLess(body.index("sortRows("), body.index("appendChild("))
+        other = javascript_function_body(self.js, "renderOtherTables")
+        self.assertIn("sortRows('other-queue', otherQueueRows)", other)
+        self.assertIn("sortRows('other-history', otherHistoryRows)", other)
+
+    def test_a_missing_sort_value_sorts_last_in_both_directions(self):
+        # Packages older than the origin record have no added_epoch; a
+        # descending sort must not push everything that matters off the top.
+        body = javascript_function_body(self.js, "sortRows")
+        self.assertIn("aMissing !== bMissing", body)
+        self.assertIn("return aMissing ? 1 : -1", body)
+
+    def test_sorting_is_tri_state_and_returns_to_the_table_default(self):
+        body = javascript_function_body(self.js, "nextSortState")
+        self.assertIn("direction: 'asc'", body)
+        self.assertIn("direction: 'desc'", body)
+        self.assertIn("DEFAULT_SORT[tableKey]", body)
+
+    def test_the_default_column_toggles_instead_of_dead_ending_on_itself(self):
+        # Added is the default for Queue/History (newest first). Falling back
+        # to the default there would return the same state, so clicking that
+        # header would do nothing at all and oldest-first would be
+        # unreachable (measured in the browser before this branch existed).
+        body = javascript_function_body(self.js, "nextSortState")
+        self.assertIn("isDefaultSort(tableKey, state)", body)
+        self.assertIn("state.direction === 'asc' ? 'desc' : 'asc'", body)
+        compare = javascript_function_body(self.js, "isDefaultSort")
+        self.assertIn("fallback.key === state.key", compare)
+        self.assertIn("fallback.direction === state.direction", compare)
+
+    def test_a_sort_click_reorders_without_waiting_for_the_next_poll(self):
+        # loadDownloads() returns early while a poll is in flight, so routing
+        # a sort click through it alone leaves the header unresponsive for up
+        # to a whole refresh interval (measured in the browser).
+        body = javascript_function_body(self.js, "onSortHeadClick")
+        self.assertIn("renderDownloads(lastPayload)", body)
+        render = javascript_function_body(self.js, "renderDownloads")
+        self.assertIn("lastPayload = data", render)
+        self.assertIn("lastPayload = null", render)
+
+    def test_sort_state_is_mirrored_onto_aria_sort(self):
+        body = javascript_function_body(self.js, "applySortIndicators")
+        self.assertIn("'aria-sort'", body)
+        self.assertIn("'descending'", body)
+        self.assertIn("'ascending'", body)
+        self.assertIn("'none'", body)
 
     def test_queue_row_ends_with_a_progress_bar_and_a_percentage(self):
         body = javascript_function_body(self.js, "buildQueueRow")
@@ -1387,11 +1568,51 @@ class DownloadRowDesignTests(unittest.TestCase):
         self.assertIn("buildStatusDot(", body)
         self.assertNotIn("cds-tag cds-tag--' + tone", body)
 
-    def test_deferred_row_names_crypter_and_reason_under_the_release(self):
+    def test_deferred_row_names_crypter_and_reason_before_the_state(self):
+        # The crypter moved from the helper line under the release into its
+        # own sortable column (appendOriginCell), which also carries the
+        # host; the reason is what stays under the release. Both still come
+        # before the state dot, as the design has it.
         body = javascript_function_body(self.js, "buildDeferredRow")
-        self.assertIn("row.crypter_label", body)
+        self.assertIn("appendOriginCell(tr, row)", body)
         self.assertIn("row.reason_label", body)
-        self.assertLess(body.index("row.crypter_label"), body.index("buildStatusDot("))
+        self.assertLess(body.index("row.reason_label"), body.index("buildStatusDot("))
+        self.assertLess(
+            body.index("appendOriginCell(tr, row)"), body.index("buildStatusDot(")
+        )
+
+    def test_every_row_builder_emits_exactly_as_many_cells_as_its_head(self):
+        # A row builder and its table head are edited in two different files;
+        # nothing but this pins them to the same column count, and a mismatch
+        # silently shifts every value one column sideways.
+        html = self._render()
+        for builder, table_id in (
+            ("buildDeferredRow", "deferred-table"),
+            ("buildQueueRow", "queue-table"),
+            ("buildHistoryRow", "history-table"),
+        ):
+            with self.subTest(builder=builder):
+                body = javascript_function_body(self.js, builder)
+                cells = len(re.findall(r"\btr\.appendChild\(", body)) + len(
+                    re.findall(r"\bappend(?:Text|Origin|Added)Cell\(tr\b", body)
+                )
+                self.assertEqual(len(self._head_labels(html, table_id)), cells)
+
+    def test_every_row_builder_carries_the_origin_and_added_cells(self):
+        for builder in ("buildDeferredRow", "buildQueueRow", "buildHistoryRow"):
+            with self.subTest(builder=builder):
+                body = javascript_function_body(self.js, builder)
+                self.assertIn("appendOriginCell(tr, row)", body)
+                self.assertIn("appendAddedCell(tr, row.added_epoch)", body)
+                # The search matches on crypter and host, so both must reach
+                # the row's dataset, not only its rendered cells.
+                self.assertIn("markOriginDataset(tr, row)", body)
+
+    def test_the_origin_cell_never_builds_markup_from_response_data(self):
+        body = javascript_function_body(self.js, "appendOriginCell")
+        self.assertNotIn("innerHTML", body)
+        self.assertIn("buildEl('span', 'cds-origin__name'", body)
+        self.assertIn("buildEl('span', 'cds-origin__host'", body)
 
     def test_deferred_row_shows_evidence_in_mono(self):
         body = javascript_function_body(self.js, "buildDeferredRow")
@@ -1440,31 +1661,39 @@ class DownloadRowDesignTests(unittest.TestCase):
 
     # -- Table heads the client-side rows line up with ---------------------
 
+    def _head_labels(self, html, table_id):
+        table_start = html.index(f'id="{table_id}"')
+        thead_end = html.index("</thead>", table_start)
+        head_html = html[table_start:thead_end]
+        return [
+            re.sub(r"<[^>]*>", "", header).strip()
+            for header in re.findall(r"<th[^>]*>(.*?)</th>", head_html, re.S)
+        ]
+
     def test_queue_table_head_follows_the_design(self):
-        html = self._render()
-        head = (
-            '<th scope="col"></th>'
-            '<th scope="col">Release</th>'
-            '<th scope="col">Category</th>'
-            '<th scope="col">Size</th>'
-            '<th scope="col">ETA</th>'
-            '<th scope="col">Progress</th>'
-            '<th scope="col"></th>'
-        )
         # Queue and Other-queue share one row builder, so both heads have to
-        # carry the same seven columns.
-        self.assertEqual(2, html.count(head))
+        # carry exactly the same columns in the same order - that invariant,
+        # not any particular markup, is what this pins.
+        html = self._render()
+        expected = [
+            "",
+            "Release",
+            "Crypter",
+            "Category",
+            "Size",
+            "ETA",
+            "Progress",
+            "Added",
+            "",
+        ]
+        self.assertEqual(expected, self._head_labels(html, "queue-table"))
+        self.assertEqual(expected, self._head_labels(html, "other-queue-table"))
 
     def test_history_table_head_follows_the_design(self):
         html = self._render()
-        head = (
-            '<th scope="col">Status</th>'
-            '<th scope="col">Release</th>'
-            '<th scope="col">Category</th>'
-            '<th scope="col">Size</th>'
-            '<th scope="col"></th>'
-        )
-        self.assertEqual(2, html.count(head))
+        expected = ["Status", "Release", "Crypter", "Category", "Size", "Added", ""]
+        self.assertEqual(expected, self._head_labels(html, "history-table"))
+        self.assertEqual(expected, self._head_labels(html, "other-history-table"))
 
     def test_queue_tile_head_carries_a_live_counter(self):
         html = self._render()

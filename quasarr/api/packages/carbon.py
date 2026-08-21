@@ -25,6 +25,14 @@ page.
 Security contract: a row here never carries a protected URL, source hostname,
 sweep ID, offer ID, operation ID, or link fingerprint - only the sanitized
 fields the schema below allows.
+
+The one deliberate exception is `mirror`: the bare host of the linkcrypter
+itself, which the CAPTCHA page already shows openly in its "Crypter · Mirror ·
+Links" line. Never a scheme, path, query, credential, or a source/indexer
+hostname. That exception cannot widen, because `_origin_fields()` re-applies
+`package_origin.safe_mirror()` to every stored value before it enters a row -
+the writer's own validation is not trusted to be the only gate, so a row
+written by an older build or edited in storage still cannot smuggle a URL out.
 """
 
 import re
@@ -43,6 +51,8 @@ from quasarr.providers.carbon_templates import (
     protected_captcha_count,
     render_carbon_html,
 )
+from quasarr.providers.package_origin import crypter_label as _origin_crypter_label
+from quasarr.providers.package_origin import read_package_origins, safe_mirror
 
 # Sentinel timeleft values meaning "no known ETA yet" (see downloads/packages
 # format_eta() and the initial "23:59:59" default before any ETA is known).
@@ -112,8 +122,12 @@ _QUEUE_NAME_PREFIXES = (
 
 _DEFERRED_NAME_PREFIXES = (DEFERRED_STATUS_PREFIX, PROTECTED_STATUS_PREFIX)
 
-_CRYPTER_LABELS = {"filecrypt": "Filecrypt", "junkies": "Junkies"}
 _REASON_LABELS = {"ip_block_suspected": "IP access block suspected"}
+
+# The origin block of a row whose package predates the package_origin table,
+# or which Quasarr never created at all (an "other" package). Read-only; every
+# consumer copies out of it rather than mutating it.
+_EMPTY_ORIGIN = {"crypter": "", "mirror": "", "added_epoch": 0}
 
 QUEUE_STATUS_VALUES = frozenset(
     {"waiting_captcha", "downloading", "extracting", "queued"}
@@ -150,6 +164,24 @@ def _scrub_protected_links(text):
         return match.group(0)
 
     return _BARE_HOST_PATTERN.sub(_redact_bare_host, scrubbed)
+
+
+def _origin_fields(package_id, origins, *, crypter_override=""):
+    """The four origin fields of one row.
+
+    `crypter_override` exists for the deferred projection: a live hold names
+    the crypter that is actually blocking right now, which is authoritative
+    over whatever the package was first accepted through. The stored origin
+    still supplies the host and the acceptance time, which no hold carries.
+    """
+    origin = origins.get(package_id) or _EMPTY_ORIGIN
+    crypter = crypter_override or str(origin.get("crypter") or "")
+    return {
+        "crypter": crypter,
+        "crypter_label": _origin_crypter_label(crypter),
+        "mirror": safe_mirror(origin.get("mirror")),
+        "added_epoch": _nonneg_int(origin.get("added_epoch")),
+    }
 
 
 def _nonneg_int(value):
@@ -241,7 +273,7 @@ def _deferred_state(deferred, *, probe_requested):
     return "observing"
 
 
-def _build_queue_row(item):
+def _build_queue_row(item, origins):
     """Project one raw queue item (linkgrabber/downloader/protected) into a
     QueueRow. Defensive against missing/malformed fields: every value falls
     back to a safe default rather than raising.
@@ -262,11 +294,18 @@ def _build_queue_row(item):
         else _format_size_label(mb=mb)
     )
 
+    # The label is for reading, `size_bytes` for sorting - a lexical sort over
+    # "9 MB" and "10 GB" puts them in the wrong order. Protected packages carry
+    # no reliable byte count, so their megabyte figure is converted instead.
+    size_bytes = int(bytes_val) if bytes_val else int((mb or 0) * 1024 * 1024)
+
     return {
         "package_id": str(item.get("nzo_id", "")),
         "name": name,
         "category": str(item.get("cat", "not_quasarr")),
         "size_label": size_label,
+        "size_bytes": max(0, size_bytes),
+        **_origin_fields(str(item.get("nzo_id", "")), origins),
         "eta": eta,
         "eta_unknown": eta_unknown,
         "percentage": _clamp_percentage(item.get("percentage", 0)),
@@ -278,7 +317,7 @@ def _build_queue_row(item):
     }
 
 
-def _build_history_row(item):
+def _build_history_row(item, origins):
     """Project one raw history item (linkgrabber/downloader/failed) into a
     HistoryRow.
     """
@@ -291,12 +330,14 @@ def _build_history_row(item):
         "name": str(item.get("name", "Unknown")),
         "category": str(item.get("category", "not_quasarr")),
         "size_label": _format_size_label(bytes_val=bytes_val),
+        "size_bytes": max(0, int(bytes_val)),
+        **_origin_fields(str(item.get("nzo_id", "")), origins),
         "status": status,
         "error": _scrub_protected_links(str(item.get("fail_message", "") or "")),
     }
 
 
-def _build_deferred_row(item):
+def _build_deferred_row(item, origins):
     """Project one active-hold protected queue item into a DeferredRow.
 
     Only ever called for items whose projected `deferred.active` is True -
@@ -313,7 +354,11 @@ def _build_deferred_row(item):
         "package_id": str(item.get("nzo_id", "")),
         "name": name,
         "state": _deferred_state(deferred, probe_requested=probe_requested),
-        "crypter_label": _label(deferred.get("crypter"), _CRYPTER_LABELS),
+        **_origin_fields(
+            str(item.get("nzo_id", "")),
+            origins,
+            crypter_override=str(deferred.get("crypter") or ""),
+        ),
         "reason_label": _label(deferred.get("reason_code"), _REASON_LABELS),
         "evidence_count": _nonneg_int(deferred.get("evidence_count")),
         "retry_after_epoch": _nonneg_int(deferred.get("retry_after_epoch")),
@@ -354,27 +399,30 @@ def build_package_list_response(shared_state, device, *, auto_start=True):
     the exact PackageListResponse schema.
     """
     downloads = get_packages_for_device(shared_state, device, auto_start=auto_start)
+    # One read for the whole response, never one per row: the table is small
+    # and every section needs it.
+    origins = read_package_origins(shared_state)
 
     deferred_rows = []
     queue_rows = []
     other_queue_rows = []
     for item in downloads.get("queue", []):
         if item.get("cat") == "not_quasarr":
-            other_queue_rows.append(_build_queue_row(item))
+            other_queue_rows.append(_build_queue_row(item, origins))
             continue
         deferred = item.get("deferred")
         if isinstance(deferred, dict) and deferred.get("active") is True:
-            deferred_rows.append(_build_deferred_row(item))
+            deferred_rows.append(_build_deferred_row(item, origins))
         else:
-            queue_rows.append(_build_queue_row(item))
+            queue_rows.append(_build_queue_row(item, origins))
 
     history_rows = []
     other_history_rows = []
     for item in downloads.get("history", []):
         if item.get("category") == "not_quasarr":
-            other_history_rows.append(_build_history_row(item))
+            other_history_rows.append(_build_history_row(item, origins))
         else:
-            history_rows.append(_build_history_row(item))
+            history_rows.append(_build_history_row(item, origins))
 
     linkgrabber = downloads.get(
         "linkgrabber", {"is_collecting": False, "is_stopped": True}
@@ -436,12 +484,54 @@ def _downloads_notices():
     )
 
 
+def _sortable_th(label, sort_key, *, extra_attributes=""):
+    """A column head that can be sorted by clicking or by keyboard.
+
+    `aria-sort` lives on the `th`, which is where assistive technology looks
+    for it, while the button inside carries the action - a clickable `th`
+    alone is not reachable by keyboard. Both are rendered unsorted here:
+    `carbon.js` owns the live sort state (it survives reloads in
+    localStorage) and rewrites `aria-sort` on every render, so shipping a
+    pre-sorted head in the markup would only fight it.
+    """
+    attributes = f" {extra_attributes}" if extra_attributes else ""
+    return (
+        f'<th scope="col" aria-sort="none" data-sort-key="{sort_key}"{attributes}>'
+        f'<button class="cds-table__sort" type="button" data-action="table-sort" '
+        f'data-sort-key="{sort_key}">{label}'
+        '<span class="cds-table__sort-icon" aria-hidden="true"></span>'
+        "</button></th>"
+    )
+
+
+def _table_search_field(field_id, label):
+    """One search field per table.
+
+    Each lives in its tile's head row, outside the `<tbody>` `carbon.js`
+    replaces on every 5s poll, so a typed value and the input's focus
+    survive every refresh. The placeholder is not a label, so the real one
+    stays in the accessibility tree.
+    """
+    return (
+        '<div class="cds-field cds-field--search">'
+        f'<label class="cds-field__label cds-visually-hidden" for="{field_id}">'
+        f"{label}</label>"
+        f'<input class="cds-field__input" id="{field_id}" type="search" '
+        'placeholder="Search releases" autocomplete="off">'
+        "</div>"
+    )
+
+
 def _deferred_table_skeleton():
     return (
         '<section class="cds-tile" id="downloads-deferred-section" data-state="loading">'
         '<div class="cds-section-header">'
         '<h2 class="cds-tile__heading">Deferred linkcrypter checks</h2>'
-        '<div class="cds-bulk-toolbar" id="deferred-bulk-toolbar">'
+        # Sits in the header row like the Queue and History fields, not on a
+        # line of its own: the same control in the same place on all three
+        # tiles.
+        + _table_search_field("deferred-search", "Filter deferred packages")
+        + '<div class="cds-bulk-toolbar" id="deferred-bulk-toolbar">'
         '<span id="deferred-selection-count" class="cds-field__help">0 selected</span>'
         '<button class="cds-btn cds-btn--tertiary cds-btn--compact" type="button" '
         'data-action="deferred-probe-selected" disabled title="Check selected packages now" '
@@ -456,17 +546,23 @@ def _deferred_table_skeleton():
         "</div></div>"
         '<div id="deferred-action-status" class="cds-field__help" aria-live="polite"></div>'
         '<div class="cds-table-wrap">'
-        '<table class="cds-table cds-table--sticky-col" id="deferred-table">'
+        '<table class="cds-table cds-table--sticky-col" id="deferred-table" '
+        'data-table-key="deferred">'
         '<caption class="cds-visually-hidden">Deferred linkcrypter checks</caption>'
         "<thead><tr>"
         '<th scope="col"><input type="checkbox" id="deferred-select-all" '
         'aria-label="Select all deferred packages"></th>'
-        '<th scope="col">Release</th>'
-        '<th scope="col">State</th>'
-        '<th scope="col">Evidence</th>'
-        '<th scope="col">Next check</th>'
-        '<th scope="col">Sweep progress</th>'
-        '<th scope="col"></th>'
+        # Release stays second: .cds-table--sticky-col pins the first two
+        # columns below 672px, and Crypter in front of it would pin the wrong
+        # one.
+        + _sortable_th("Release", "name")
+        + _sortable_th("Crypter", "crypter")
+        + _sortable_th("State", "state")
+        + _sortable_th("Evidence", "evidence")
+        + _sortable_th("Next check", "next-check")
+        + _sortable_th("Sweep progress", "sweep")
+        + _sortable_th("Added", "added")
+        + '<th scope="col"></th>'
         "</tr></thead>"
         '<tbody id="deferred-table-body"></tbody>'
         "</table></div>"
@@ -487,12 +583,14 @@ def _queue_table_head():
     return (
         "<thead><tr>"
         '<th scope="col"></th>'
-        '<th scope="col">Release</th>'
-        '<th scope="col">Category</th>'
-        '<th scope="col">Size</th>'
-        '<th scope="col">ETA</th>'
-        '<th scope="col">Progress</th>'
-        '<th scope="col"></th>'
+        + _sortable_th("Release", "name")
+        + _sortable_th("Crypter", "crypter")
+        + _sortable_th("Category", "category")
+        + _sortable_th("Size", "size")
+        + _sortable_th("ETA", "eta")
+        + _sortable_th("Progress", "progress")
+        + _sortable_th("Added", "added")
+        + '<th scope="col"></th>'
         "</tr></thead>"
     )
 
@@ -503,11 +601,13 @@ def _history_table_head():
     """
     return (
         "<thead><tr>"
-        '<th scope="col">Status</th>'
-        '<th scope="col">Release</th>'
-        '<th scope="col">Category</th>'
-        '<th scope="col">Size</th>'
-        '<th scope="col"></th>'
+        + _sortable_th("Status", "status")
+        + _sortable_th("Release", "name")
+        + _sortable_th("Crypter", "crypter")
+        + _sortable_th("Category", "category")
+        + _sortable_th("Size", "size")
+        + _sortable_th("Added", "added")
+        + '<th scope="col"></th>'
         "</tr></thead>"
     )
 
@@ -522,15 +622,10 @@ def _queue_table_skeleton():
         '<div class="cds-tile__head-row">'
         '<h2 class="cds-tile__heading">Queue '
         '<span class="cds-tile__count" id="queue-count">(0)</span></h2>'
-        '<div class="cds-field cds-field--search">'
-        '<label class="cds-field__label cds-visually-hidden" for="downloads-search">'
-        "Filter releases by name</label>"
-        '<input class="cds-field__input" id="downloads-search" type="search" '
-        'placeholder="Search releases" autocomplete="off">'
-        "</div>"
-        "</div>"
+        + _table_search_field("downloads-search", "Filter releases by name")
+        + "</div>"
         '<div class="cds-table-wrap">'
-        '<table class="cds-table" id="queue-table">'
+        '<table class="cds-table" id="queue-table" data-table-key="queue">'
         '<caption class="cds-visually-hidden">Active downloads</caption>'
         f"{_queue_table_head()}"
         '<tbody id="queue-table-body"></tbody>'
@@ -543,9 +638,12 @@ def _queue_table_skeleton():
 def _history_table_skeleton():
     return (
         '<section class="cds-tile" id="downloads-history-section" data-state="loading">'
+        '<div class="cds-tile__head-row">'
         '<h2 class="cds-tile__heading">History</h2>'
+        + _table_search_field("history-search", "Filter history by name")
+        + "</div>"
         '<div class="cds-table-wrap">'
-        '<table class="cds-table" id="history-table">'
+        '<table class="cds-table" id="history-table" data-table-key="history">'
         '<caption class="cds-visually-hidden">Recent history</caption>'
         f"{_history_table_head()}"
         '<tbody id="history-table-body"></tbody>'
@@ -562,16 +660,21 @@ def _other_packages_skeleton():
         '<summary id="otherPackagesSummary">Show <span id="downloads-other-count">0</span>'
         " other package(s)</summary>"
         '<div class="cds-tile">'
-        '<h3 class="cds-tile__heading">Other queue</h3>'
+        # One field for both "other" tables: they are one collapsed section
+        # to the reader, and splitting the filter would only make the two
+        # halves disagree.
+        + _table_search_field("other-search", "Filter other packages by name")
+        + '<h3 class="cds-tile__heading">Other queue</h3>'
         '<div class="cds-table-wrap">'
-        '<table class="cds-table" id="other-queue-table">'
+        '<table class="cds-table" id="other-queue-table" data-table-key="other-queue">'
         "<caption>Other packages in progress</caption>"
         f"{_queue_table_head()}"
         '<tbody id="other-queue-table-body"></tbody>'
         "</table></div>"
         '<h3 class="cds-tile__heading">Other history</h3>'
         '<div class="cds-table-wrap">'
-        '<table class="cds-table" id="other-history-table">'
+        '<table class="cds-table" id="other-history-table" '
+        'data-table-key="other-history">'
         "<caption>Other packages history</caption>"
         f"{_history_table_head()}"
         '<tbody id="other-history-table-body"></tbody>'

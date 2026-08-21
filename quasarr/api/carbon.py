@@ -47,6 +47,7 @@ from quasarr.providers.carbon_templates import (
     tile,
     toggle,
 )
+from quasarr.providers.crypter_cooldowns import cooling_crypters
 from quasarr.providers.hostname_issues import get_all_hostname_issues
 from quasarr.providers.notifications.helpers.notification_types import (
     get_notification_type_label,
@@ -145,6 +146,13 @@ def build_dashboard_model(shared_state) -> dict[str, Any]:
 
     stats: Mapping[str, Any] = StatsHelper(shared_state).get_stats()
 
+    # A read of one small table. Wrapped like the other model reads: a
+    # corrupt cooldown row must cost the banner, never the whole Dashboard.
+    try:
+        crypter_cooldown_rows = cooling_crypters(shared_state)
+    except Exception:
+        crypter_cooldown_rows = []
+
     return {
         "jd_connected": bool(jd_status["connected"]),
         "jd_device_name": jd_status["device_name"],
@@ -159,6 +167,7 @@ def build_dashboard_model(shared_state) -> dict[str, Any]:
         "api_key": api_key,
         "internal_address": internal_address,
         "stats": stats,
+        "crypter_cooldowns": crypter_cooldown_rows,
         "show_user": show_logout_link(),
     }
 
@@ -262,6 +271,61 @@ def _dashboard_captcha_banner(model: Mapping[str, Any]) -> str:
     )
 
 
+def _cooldown_epoch(value: Any) -> int:
+    """A deadline that is not a usable epoch renders as 0 rather than as
+    itself - the attribute feeds a countdown, and arbitrary text there would
+    reach the markup unchecked.
+    """
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dashboard_cooldown_banner(model: Mapping[str, Any]) -> str:
+    """A global linkcrypter cooldown, with its deadline counting down live.
+
+    Until now this state was visible nowhere: the Downloads page shows
+    per-package "Cooldown" rows, but nothing said the crypter itself was
+    paused or for how long, so a queue that had simply stopped looked broken.
+
+    Built by hand rather than through notification(): that helper escapes its
+    message, and the countdown has to be a real `<time>` element carrying the
+    epoch. Every interpolated value still goes through _h() or
+    _cooldown_epoch(). The `deferred-countdown` class and
+    `data-retry-after-epoch` attribute are exactly what the Downloads page's
+    ticker already understands, so the Dashboard reuses that formatter
+    instead of growing a second one.
+    """
+    rows = model.get("crypter_cooldowns") or []
+    if not rows:
+        return ""
+
+    # All lines live inside ONE .cds-notification__message. The --inline
+    # modifier makes the section a flex row and gives that class flex: 1, so
+    # a second sibling message would not stack under the first - it would
+    # take half the banner's width and the pair would read as one run-on
+    # sentence. Stacking happens inside the block instead.
+    lines = "".join(
+        '<span class="cds-cooldown-line">'
+        f"<strong>{_h(row.get('label') or row.get('crypter') or 'Linkcrypter')}</strong>"
+        " is paused. Next attempt in "
+        '<time class="deferred-countdown cds-mono" '
+        f'data-retry-after-epoch="{_cooldown_epoch(row.get("retry_after_epoch"))}">'
+        "</time>.</span>"
+        for row in rows
+    )
+    plural = "s" if len(rows) != 1 else ""
+    return (
+        '<section class="cds-notification cds-notification--warning '
+        'cds-notification--inline" role="alert" id="dashboard-cooldown-banner">'
+        '<h2 class="cds-notification__title">Linkcrypter cooldown active</h2>'
+        f'<div class="cds-notification__message">{lines}</div>'
+        f'<a class="cds-btn cds-btn--ghost" href="/packages">View held package{plural} →</a>'
+        "</section>"
+    )
+
+
 def _dashboard_queue_tile() -> str:
     """Empty/loading placeholder filled client-side from
     ``GET /api/packages/list`` after first paint (see carbon.js
@@ -345,7 +409,10 @@ def render_dashboard(shared_state) -> str:
     model = build_dashboard_model(shared_state)
 
     content = (
-        _dashboard_captcha_banner(model)
+        # A paused crypter explains the waiting CAPTCHAs below it, so it
+        # reads first.
+        _dashboard_cooldown_banner(model)
+        + _dashboard_captcha_banner(model)
         + _dashboard_status_tiles(model)
         + grid(
             [

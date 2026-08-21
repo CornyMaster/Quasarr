@@ -171,6 +171,7 @@ class CarbonDashboardModelTests(unittest.TestCase):
             "api_key",
             "internal_address",
             "stats",
+            "crypter_cooldowns",
             "show_user",
         }
         self.assertEqual(expected_keys, set(model.keys()))
@@ -204,6 +205,7 @@ class CarbonDashboardRenderTests(unittest.TestCase):
                 "total_download_attempts": 15,
                 "download_success_rate": 80.0,
             },
+            "crypter_cooldowns": [],
             "show_user": False,
         }
         model.update(model_overrides)
@@ -471,6 +473,160 @@ class CarbonDashboardHeadRequestTests(unittest.TestCase):
             v for name, v in headers if name.lower() == "content-security-policy"
         ]
         self.assertEqual(len(csp_values), 1)
+
+
+class CarbonDashboardCooldownBannerTests(unittest.TestCase):
+    """The Dashboard's answer to "why is nothing moving?".
+
+    A global linkcrypter cooldown pauses every package of that crypter and
+    was previously visible nowhere: the Downloads page showed per-package
+    "Cooldown" states, but nothing said the crypter itself was paused or
+    for how long.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = importlib.import_module("quasarr.api.carbon")
+
+    def test_no_cooldown_renders_no_banner(self):
+        self.assertEqual(
+            "", self.mod._dashboard_cooldown_banner({"crypter_cooldowns": []})
+        )
+
+    def test_a_model_without_the_field_renders_no_banner(self):
+        self.assertEqual("", self.mod._dashboard_cooldown_banner({}))
+
+    def test_banner_names_every_cooling_crypter_with_its_deadline(self):
+        html = self.mod._dashboard_cooldown_banner(
+            {
+                "crypter_cooldowns": [
+                    {
+                        "crypter": "filecrypt",
+                        "label": "FileCrypt",
+                        "retry_after_epoch": 1_700_000_000,
+                    },
+                    {
+                        "crypter": "junkies",
+                        "label": "Junkies",
+                        "retry_after_epoch": 1_700_003_600,
+                    },
+                ]
+            }
+        )
+
+        self.assertIn('id="dashboard-cooldown-banner"', html)
+        self.assertIn("FileCrypt", html)
+        self.assertIn("Junkies", html)
+        self.assertIn('data-retry-after-epoch="1700000000"', html)
+        self.assertIn('data-retry-after-epoch="1700003600"', html)
+        # Reuses the Downloads page's ticking formatter rather than growing
+        # a second one; that formatter keys off this exact class.
+        self.assertIn("deferred-countdown", html)
+        self.assertIn('href="/packages"', html)
+        self.assertIn('role="alert"', html)
+        self.assertIn("cds-notification--warning", html)
+        # Exactly ONE .cds-notification__message, however many crypters are
+        # cooling: --inline makes the section a flex row and gives that class
+        # flex: 1, so sibling messages would split the banner's width side by
+        # side instead of stacking (measured on the rendered page).
+        self.assertEqual(1, html.count('class="cds-notification__message"'))
+        self.assertEqual(2, html.count('class="cds-cooldown-line"'))
+
+    def test_banner_escapes_a_hostile_label(self):
+        html = self.mod._dashboard_cooldown_banner(
+            {
+                "crypter_cooldowns": [
+                    {
+                        "crypter": "x",
+                        "label": "<script>alert(1)</script>",
+                        "retry_after_epoch": 1,
+                    }
+                ]
+            }
+        )
+
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_a_malformed_deadline_never_reaches_the_markup(self):
+        html = self.mod._dashboard_cooldown_banner(
+            {
+                "crypter_cooldowns": [
+                    {"crypter": "filecrypt", "label": "FileCrypt"},
+                    {
+                        "crypter": "junkies",
+                        "label": "Junkies",
+                        "retry_after_epoch": "soon",
+                    },
+                ]
+            }
+        )
+
+        self.assertIn('data-retry-after-epoch="0"', html)
+        self.assertNotIn("soon", html)
+
+    def test_the_banner_countdown_ticks_and_clears_itself_when_spent(self):
+        # The Downloads ticker is scoped to #downloads-content and the
+        # Dashboard does not poll, so without its own ticker the countdown
+        # would never move, and without the hide it would sit at 00:00:00
+        # claiming a block that has expired.
+        js = (
+            importlib.import_module("pathlib")
+            .Path(importlib.import_module("quasarr").__file__)
+            .parent
+            / "static"
+            / "carbon.js"
+        ).read_text(encoding="utf-8")
+        start = js.index("function startCooldownCountdown()")
+        body = js[start : js.index("\n\tdocument.addEventListener", start)]
+
+        self.assertIn("byId('dashboard-cooldown-banner')", body)
+        self.assertIn("window.CarbonTime.updateDeferredCountdowns(banner)", body)
+        self.assertIn("window.CarbonTime.deferredCountdownEpoch(element)", body)
+        self.assertIn("banner.hidden = !live", body)
+        self.assertIn("window.setInterval(tick, 1000)", body)
+        self.assertIn("startCooldownCountdown();", js)
+
+    def test_the_banner_leads_the_page_above_the_captcha_notice(self):
+        renderer = importlib.import_module("quasarr.api.carbon")
+        model = {
+            "jd_connected": True,
+            "jd_device_name": "MyJD",
+            "hostnames_working": 1,
+            "hostnames_total": 1,
+            "hostnames_issue_line": "",
+            "captcha_count": 2,
+            "helper_active": False,
+            "flaresolverr_url": "",
+            "flaresolverr_skipped": False,
+            "flaresolverr_configured": False,
+            "api_key": "test-api-key-value",
+            "internal_address": "http://quasarr.invalid:8080",
+            "stats": {
+                "packages_downloaded": 1,
+                "failed_downloads": 0,
+                "total_captcha_decryptions": 1,
+                "decryption_success_rate": 100.0,
+                "total_download_attempts": 1,
+                "download_success_rate": 100.0,
+            },
+            "crypter_cooldowns": [
+                {
+                    "crypter": "filecrypt",
+                    "label": "FileCrypt",
+                    "retry_after_epoch": 1_700_000_000,
+                }
+            ],
+            "show_user": False,
+        }
+        with mock.patch.object(renderer, "build_dashboard_model", return_value=model):
+            html = renderer.render_dashboard(object())
+
+        # A paused crypter explains the waiting CAPTCHAs below it, so it
+        # reads first.
+        self.assertLess(
+            html.index("dashboard-cooldown-banner"), html.index("Solve CAPTCHA")
+        )
 
 
 if __name__ == "__main__":

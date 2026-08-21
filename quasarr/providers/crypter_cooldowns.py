@@ -102,6 +102,65 @@ def crypter_blocks_deferred(shared_state):
     return mode != LEGACY_CRYPTER_BLOCK_MODE
 
 
+def cooling_crypters(shared_state, *, clock=time.time):
+    """Every linkcrypter currently held in a global cooldown, soonest first.
+
+    A cooldown pauses every package of that crypter, but nothing in the UI
+    said so: the operator projection in `providers/statistics.py` asks
+    `crypter_decision("filecrypt")` by name, so a cooldown on junkies,
+    keeplinks, or tolink was invisible. This enumerates the table instead, so
+    the answer follows whatever actually cooled.
+
+    Read-only and never a transition: each row is decoded through the same
+    `crypter_projection()` the rest of this module uses, so a row caught
+    mid-transition can never be reported from a different read than the one
+    that classified it. A row that is unreadable, or keyed by something that
+    is not a known crypter, is skipped rather than raised - this feeds a
+    banner, and a corrupt value must not be able to take the Dashboard down.
+
+    Returns `[{crypter, label, retry_after_epoch}]`.
+    """
+    if not crypter_blocks_deferred(shared_state):
+        return []
+
+    # Imported here, not at module scope: this module deliberately keeps its
+    # import surface small (see crypter_sweeps' boundary test), and the label
+    # map is only needed on this one presentation-facing path.
+    from quasarr.providers.package_origin import crypter_label
+
+    now = int(clock())
+    try:
+        rows = shared_state.get_db("crypter_cooldowns").retrieve_all_titles()
+    except Exception as error:
+        warn(f"Reading the linkcrypter cooldown table failed: {error}")
+        return []
+
+    service = CrypterCooldownService(shared_state, clock=clock)
+    cooling = []
+    for row in rows or []:
+        try:
+            crypter = normalize_crypter_key(row[0])
+        except (ValueError, IndexError, TypeError):
+            continue
+        try:
+            snapshot = service.crypter_projection(crypter).snapshot
+        except Exception as error:
+            warn(f'Reading the cooldown of linkcrypter "{crypter}" failed: {error}')
+            continue
+        retry_after = _epoch_or_zero(snapshot, "retry_after_epoch")
+        if snapshot.get("state") != "cooldown" or retry_after <= now:
+            continue
+        cooling.append(
+            {
+                "crypter": crypter,
+                "label": crypter_label(crypter),
+                "retry_after_epoch": retry_after,
+            }
+        )
+    cooling.sort(key=lambda entry: entry["retry_after_epoch"])
+    return cooling
+
+
 def normalize_crypter_key(value):
     from quasarr.downloads import protected_crypter_keys
 

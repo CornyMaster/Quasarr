@@ -22,6 +22,7 @@ from quasarr.providers.notifications import (
     update_release_notification,
 )
 from quasarr.providers.notifications.helpers.notification_types import NotificationType
+from quasarr.providers.package_origin import record_package_origin
 from quasarr.providers.statistics import StatsHelper
 from quasarr.providers.terminal_operations import (
     TERMINAL_OPERATION_MARKER,
@@ -570,6 +571,22 @@ def store_protected_links(
     return {"success": True}
 
 
+def _record_origin(shared_state, package_id, crypter, links):
+    """Persist which linkcrypter and host this package came from, once.
+
+    Called from each of process_links()'s three priority branches with that
+    branch's own links, so the record always names the bucket that actually
+    won - never the first link of a mixed result. Writing is create-only, so
+    the auto-decrypt branch falling back into the protected one below leaves
+    the first branch's record (and its `added_epoch`) untouched.
+    """
+    if not links:
+        return
+    first = links[0]
+    url = first[0] if isinstance(first, (list, tuple)) and first else first
+    record_package_origin(shared_state, package_id, crypter, url)
+
+
 def process_links(
     shared_state,
     source_result,
@@ -638,6 +655,7 @@ def process_links(
         info(
             f"Found <g>{len(classified['direct'])}</g> direct hoster links for {title}"
         )
+        _record_origin(shared_state, package_id, "direct", classified["direct"])
         result = handle_direct_links(
             shared_state, classified["direct"], title, password, package_id
         )
@@ -659,6 +677,7 @@ def process_links(
         info(
             f"Found <g>{len(classified['auto'])}</g> auto-decryptable links for {title}"
         )
+        _record_origin(shared_state, package_id, "hide", classified["auto"])
         result = handle_auto_decrypt_links(
             shared_state, classified["auto"], title, password, package_id
         )
@@ -679,6 +698,12 @@ def process_links(
     # PRIORITY 3: Protected (filecrypt, tolink, keeplinks, junkies)
     if classified["protected"]:
         info(f"Found <g>{len(classified['protected'])}</g> protected links for {title}")
+        _record_origin(
+            shared_state,
+            package_id,
+            resolve_protected_crypter_key(classified["protected"][0]) or "unknown",
+            classified["protected"],
+        )
         notification_references = send_tracked_notification(
             shared_state,
             title=title,

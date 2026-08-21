@@ -81,11 +81,14 @@ PACKAGE_LIST_KEYS = {
     "other_history",
 }
 LINKGRABBER_KEYS = {"is_collecting", "is_stopped"}
+# The four fields every row type carries from the persisted package origin.
+ORIGIN_ROW_KEYS = {"crypter", "crypter_label", "mirror", "added_epoch"}
 QUEUE_ROW_KEYS = {
     "package_id",
     "name",
     "category",
     "size_label",
+    "size_bytes",
     "eta",
     "eta_unknown",
     "percentage",
@@ -94,20 +97,20 @@ QUEUE_ROW_KEYS = {
     "is_archive",
     "extraction_status",
     "storage",
-}
+} | ORIGIN_ROW_KEYS
 HISTORY_ROW_KEYS = {
     "package_id",
     "name",
     "category",
     "size_label",
+    "size_bytes",
     "status",
     "error",
-}
+} | ORIGIN_ROW_KEYS
 DEFERRED_ROW_KEYS = {
     "package_id",
     "name",
     "state",
-    "crypter_label",
     "reason_label",
     "evidence_count",
     "retry_after_epoch",
@@ -117,7 +120,7 @@ DEFERRED_ROW_KEYS = {
     "cohort_deadline_epoch",
     "cohort_retest_depth",
     "can_solve_captcha",
-}
+} | ORIGIN_ROW_KEYS
 
 # Any of these appearing verbatim in the serialized response is a leak.
 _FORBIDDEN_PATTERNS = (
@@ -140,8 +143,50 @@ _FORBIDDEN_KEY_NAMES = {
 }
 
 
+# The row builders take the origin mapping as a REQUIRED argument so a caller
+# cannot silently skip the join - an empty origin block is indistinguishable
+# from a forgotten one in the response, and no test would catch it. These
+# wrappers default it to "nothing stored" for the many cases that exercise
+# something other than the origin.
+def _deferred_row(item, origins=None):
+    return carbon._build_deferred_row(item, origins or {})
+
+
+def _queue_row(item, origins=None):
+    return carbon._build_queue_row(item, origins or {})
+
+
+def _history_row(item, origins=None):
+    return carbon._build_history_row(item, origins or {})
+
+
+def _assert_origin_fields_valid(test, row):
+    """The origin block, identical in all three row types.
+
+    `mirror` is the one deliberate exception to the no-hostname rule, so it is
+    checked here rather than trusted: it must be a bare host, never anything
+    carrying a scheme, path, credential, or query.
+    """
+    test.assertIsInstance(row["crypter"], str)
+    test.assertIsInstance(row["crypter_label"], str)
+    test.assertIsInstance(row["mirror"], str)
+    for forbidden in ("://", "/", "@", "?", "#", " "):
+        test.assertNotIn(forbidden, row["mirror"])
+    test.assertIs(type(row["added_epoch"]), int)
+    test.assertNotIsInstance(row["added_epoch"], bool)
+    test.assertGreaterEqual(row["added_epoch"], 0)
+
+
+def _assert_size_bytes_valid(test, row):
+    test.assertIs(type(row["size_bytes"]), int)
+    test.assertNotIsInstance(row["size_bytes"], bool)
+    test.assertGreaterEqual(row["size_bytes"], 0)
+
+
 def _assert_queue_row_valid(test, row):
     test.assertEqual(QUEUE_ROW_KEYS, set(row))
+    _assert_origin_fields_valid(test, row)
+    _assert_size_bytes_valid(test, row)
     test.assertIsInstance(row["package_id"], str)
     test.assertIsInstance(row["name"], str)
     test.assertIsInstance(row["category"], str)
@@ -161,6 +206,8 @@ def _assert_queue_row_valid(test, row):
 
 def _assert_history_row_valid(test, row):
     test.assertEqual(HISTORY_ROW_KEYS, set(row))
+    _assert_origin_fields_valid(test, row)
+    _assert_size_bytes_valid(test, row)
     test.assertIsInstance(row["package_id"], str)
     test.assertIsInstance(row["name"], str)
     test.assertIsInstance(row["category"], str)
@@ -171,6 +218,7 @@ def _assert_history_row_valid(test, row):
 
 def _assert_deferred_row_valid(test, row):
     test.assertEqual(DEFERRED_ROW_KEYS, set(row))
+    _assert_origin_fields_valid(test, row)
     test.assertIsInstance(row["package_id"], str)
     test.assertIsInstance(row["name"], str)
     test.assertIn(row["state"], DEFERRED_STATE_VALUES)
@@ -719,7 +767,10 @@ class SchemaValidatorSelfTests(unittest.TestCase):
                 "package_id": PACKAGE_A,
                 "name": "x",
                 "state": "retest",
-                "crypter_label": "Filecrypt",
+                "crypter": "filecrypt",
+                "crypter_label": "FileCrypt",
+                "mirror": "filecrypt.invalid",
+                "added_epoch": NOW,
                 "reason_label": "IP access block suspected",
                 "evidence_count": 0,
                 "retry_after_epoch": 0,
@@ -873,7 +924,10 @@ class PackageListProjectionTests(unittest.TestCase):
         row = response["deferred"][0]
         self.assertEqual(PACKAGE_A, row["package_id"])
         self.assertEqual("observing", row["state"])
-        self.assertEqual("Filecrypt", row["crypter_label"])
+        # One spelling across the whole UI: the CAPTCHA page's provider map
+        # has always rendered this as "FileCrypt".
+        self.assertEqual("filecrypt", row["crypter"])
+        self.assertEqual("FileCrypt", row["crypter_label"])
         self.assertEqual("IP access block suspected", row["reason_label"])
         self.assertTrue(row["can_solve_captcha"])
 
@@ -1175,7 +1229,7 @@ class PackageListProjectionTests(unittest.TestCase):
 
 
 class DeferredRowStateMappingTests(unittest.TestCase):
-    """Exercises carbon._build_deferred_row() directly against the exact
+    """Exercises _deferred_row() directly against the exact
     post-projection shape get_packages_for_device() attaches to a queue item
     (project_package_defer()'s output - see
     test_deferred_protected_packages.py for that shape pinned end to end).
@@ -1225,12 +1279,12 @@ class DeferredRowStateMappingTests(unittest.TestCase):
         }
 
     def test_provisional_hold_maps_to_observing(self):
-        row = carbon._build_deferred_row(self._item(hold_type="provisional"))
+        row = _deferred_row(self._item(hold_type="provisional"))
         _assert_deferred_row_valid(self, row)
         self.assertEqual("observing", row["state"])
 
     def test_plain_cooldown_maps_to_cooldown(self):
-        row = carbon._build_deferred_row(
+        row = _deferred_row(
             self._item(
                 hold_type="crypter_cooldown",
                 state="cooldown",
@@ -1241,7 +1295,7 @@ class DeferredRowStateMappingTests(unittest.TestCase):
         self.assertEqual("cooldown", row["state"])
 
     def test_queued_probe_takes_precedence_and_maps_to_probe_queued(self):
-        row = carbon._build_deferred_row(
+        row = _deferred_row(
             self._item(
                 hold_type="crypter_cooldown",
                 state="cooldown",
@@ -1258,7 +1312,7 @@ class DeferredRowStateMappingTests(unittest.TestCase):
         # count copied identically onto every held package of that crypter,
         # never a per-package fact, so it must never drive DeferredRow.state
         # by itself. The count is still surfaced on the row unchanged.
-        row = carbon._build_deferred_row(
+        row = _deferred_row(
             self._item(
                 hold_type="crypter_cooldown",
                 state="cooldown",
@@ -1279,7 +1333,7 @@ class DeferredRowStateMappingTests(unittest.TestCase):
         # Same pin as above, but on a v2/generation-bound hold (the shape a
         # real cohort transition would leave) rather than a bare count -
         # link_fingerprints alone must not resurrect the removed retest path.
-        row = carbon._build_deferred_row(
+        row = _deferred_row(
             self._item(
                 hold_type="crypter_cooldown",
                 state="cooldown",
@@ -1297,7 +1351,7 @@ class DeferredRowStateMappingTests(unittest.TestCase):
     def test_legacy_hold_under_cooldown_reports_cooldown(self):
         # A legacy (non-generation) cooldown hold carries no link_fingerprints
         # at all and must report the plain cooldown state.
-        row = carbon._build_deferred_row(
+        row = _deferred_row(
             self._item(
                 hold_type="crypter_cooldown",
                 state="cooldown",
@@ -1308,7 +1362,7 @@ class DeferredRowStateMappingTests(unittest.TestCase):
         self.assertEqual("cooldown", row["state"])
 
     def test_malformed_deferred_fields_default_safely(self):
-        row = carbon._build_deferred_row(
+        row = _deferred_row(
             self._item(
                 evidence_count="not-a-number",
                 retry_after_epoch=None,
@@ -1323,10 +1377,15 @@ class DeferredRowStateMappingTests(unittest.TestCase):
         self.assertEqual(1, row["cohort_retest_depth"])  # bool True -> int 1, still >=0
 
     def test_missing_deferred_block_still_builds_a_row_defensively(self):
-        row = carbon._build_deferred_row({"nzo_id": PACKAGE_A, "filename": "x"})
+        row = _deferred_row({"nzo_id": PACKAGE_A, "filename": "x"})
         _assert_deferred_row_valid(self, row)
         self.assertEqual("observing", row["state"])
-        self.assertEqual("Unknown", row["crypter_label"])
+        # A package with neither a live hold nor a stored origin reports no
+        # crypter at all. It used to read "Unknown", an invented word that
+        # looked like a real answer; an empty value lets the row render the
+        # same "not known" dash every other origin-less row shows.
+        self.assertEqual("", row["crypter"])
+        self.assertEqual("", row["crypter_label"])
 
 
 class ScrubProtectedLinksTests(unittest.TestCase):
@@ -1435,6 +1494,113 @@ class PackagesListRouteTests(unittest.TestCase):
         build_response.assert_called_once_with(
             packages_api.shared_state, sentinel_device
         )
+
+
+class OriginProjectionTests(unittest.TestCase):
+    """The persisted package origin joined onto every row type.
+
+    `mirror` is the single field that could carry more than a bare host, so
+    the sanitizing is pinned on the projection itself and not only on the
+    writer - a row written by an older build must not be able to widen the
+    contract.
+    """
+
+    def test_origin_fields_reach_a_queue_row(self):
+        origins = {
+            PACKAGE_A: {
+                "crypter": "filecrypt",
+                "mirror": "filecrypt.invalid",
+                "added_epoch": NOW,
+            }
+        }
+        row = _queue_row(
+            {"nzo_id": PACKAGE_A, "filename": "Synthetic.Release", "bytes": 2048},
+            origins,
+        )
+
+        self.assertEqual("filecrypt", row["crypter"])
+        self.assertEqual("FileCrypt", row["crypter_label"])
+        self.assertEqual("filecrypt.invalid", row["mirror"])
+        self.assertEqual(NOW, row["added_epoch"])
+        self.assertEqual(2048, row["size_bytes"])
+
+    def test_a_protected_row_reports_its_size_in_bytes_from_megabytes(self):
+        # Protected packages carry no reliable byte count, only size_mb - the
+        # sortable column still needs a number, not a formatted label.
+        row = _queue_row(
+            {"nzo_id": PACKAGE_A, "filename": "Synthetic.Release", "mb": 100}, {}
+        )
+
+        self.assertEqual(100 * 1024 * 1024, row["size_bytes"])
+
+    def test_rows_without_an_origin_stay_empty_instead_of_guessing(self):
+        row = _queue_row({"nzo_id": PACKAGE_B, "filename": "Synthetic.Release"}, {})
+
+        self.assertEqual("", row["crypter"])
+        self.assertEqual("", row["crypter_label"])
+        self.assertEqual("", row["mirror"])
+        self.assertEqual(0, row["added_epoch"])
+
+    def test_a_stored_url_can_never_reach_the_mirror_field(self):
+        origins = {
+            PACKAGE_A: {
+                "crypter": "filecrypt",
+                "mirror": "https://filecrypt.invalid/Container/ABC123",
+                "added_epoch": NOW,
+            }
+        }
+        row = _history_row({"nzo_id": PACKAGE_A, "name": "Synthetic.Release"}, origins)
+
+        self.assertEqual("", row["mirror"])
+
+    def test_deferred_prefers_its_live_crypter_over_the_stored_one(self):
+        # The live hold is authoritative; the stored origin only fills the
+        # host, which the hold does not carry.
+        origins = {
+            PACKAGE_A: {
+                "crypter": "junkies",
+                "mirror": "filecrypt.invalid",
+                "added_epoch": NOW,
+            }
+        }
+        row = _deferred_row(
+            {
+                "nzo_id": PACKAGE_A,
+                "filename": "Synthetic.Release",
+                "deferred": {
+                    "active": True,
+                    "crypter": "filecrypt",
+                    "reason_code": "ip_block_suspected",
+                    "hold_type": "crypter_cooldown",
+                },
+            },
+            origins,
+        )
+
+        self.assertEqual("filecrypt", row["crypter"])
+        self.assertEqual("FileCrypt", row["crypter_label"])
+        self.assertEqual("filecrypt.invalid", row["mirror"])
+        self.assertEqual(NOW, row["added_epoch"])
+
+    def test_deferred_falls_back_to_the_stored_crypter_when_the_hold_has_none(self):
+        origins = {
+            PACKAGE_A: {
+                "crypter": "junkies",
+                "mirror": "container.invalid",
+                "added_epoch": NOW,
+            }
+        }
+        row = _deferred_row(
+            {
+                "nzo_id": PACKAGE_A,
+                "filename": "Synthetic.Release",
+                "deferred": {"active": True, "reason_code": "ip_block_suspected"},
+            },
+            origins,
+        )
+
+        self.assertEqual("junkies", row["crypter"])
+        self.assertEqual("Junkies", row["crypter_label"])
 
 
 if __name__ == "__main__":

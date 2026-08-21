@@ -17,6 +17,7 @@ from quasarr.downloads import (
 )
 from quasarr.providers.crypter_cooldowns import (
     CrypterCooldownService,
+    cooling_crypters,
     normalize_crypter_key,
     validate_link_fingerprint,
 )
@@ -54,6 +55,11 @@ class FakeDatabase:
     def retrieve(self, key):
         self.retrieve_count += 1
         return self.rows.get(key)
+
+    def retrieve_all_titles(self):
+        """Same contract as the SQLite table: ordered pairs, or None if empty."""
+        items = [[key, value] for key, value in sorted(self.rows.items())]
+        return items if items else None
 
     def update_store(self, key, value):
         self.rows[key] = value
@@ -676,6 +682,87 @@ class CrypterCooldownServiceTests(unittest.TestCase):
         self.assertEqual(0, self.service.retry_after("filecrypt"))
         self.assertEqual(3, database.retrieve_count)
         self.assertEqual(0, database.mutation_count)
+
+
+class CoolingCryptersProjectionTests(unittest.TestCase):
+    """`cooling_crypters()` - the read-only answer to "is anything paused?".
+
+    The operator projection in providers/statistics.py asks
+    `crypter_decision("filecrypt")` by name; a cooldown on any other crypter
+    is just as blocking and was never surfaced anywhere in the UI. This reads
+    the table itself instead, so the answer follows whatever actually cooled.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock(1_000_000)
+        self.shared_state = FakeSharedState()
+        self.service = CrypterCooldownService(self.shared_state, clock=self.clock)
+
+    def _cool(self, crypter):
+        for index, package_id in enumerate((PACKAGE_A, PACKAGE_B, PACKAGE_C)):
+            self.service.observe(
+                crypter,
+                package_id,
+                hashlib.sha256(f"{crypter}{index}".encode()).hexdigest(),
+                REASON,
+            )
+            self.clock.now += 1
+
+    def test_no_rows_means_nothing_is_cooling(self):
+        self.assertEqual([], cooling_crypters(self.shared_state, clock=self.clock))
+
+    def test_a_cooling_crypter_is_reported_with_its_label_and_deadline(self):
+        self._cool("filecrypt")
+
+        cooling = cooling_crypters(self.shared_state, clock=self.clock)
+
+        self.assertEqual(1, len(cooling))
+        self.assertEqual("filecrypt", cooling[0]["crypter"])
+        self.assertEqual("FileCrypt", cooling[0]["label"])
+        self.assertGreater(cooling[0]["retry_after_epoch"], self.clock.now)
+        self.assertEqual({"crypter", "label", "retry_after_epoch"}, set(cooling[0]))
+
+    def test_every_cooling_crypter_is_reported_soonest_first(self):
+        self._cool("filecrypt")
+        self.clock.now += 3600
+        self._cool("junkies")
+
+        cooling = cooling_crypters(self.shared_state, clock=self.clock)
+
+        self.assertEqual(["filecrypt", "junkies"], [row["crypter"] for row in cooling])
+        deadlines = [row["retry_after_epoch"] for row in cooling]
+        self.assertEqual(sorted(deadlines), deadlines)
+
+    def test_an_observing_crypter_is_not_reported_as_cooling(self):
+        # One observation is a provisional hold on that package, not a global
+        # pause - announcing it would tell the user everything is blocked
+        # when nothing is.
+        self.service.observe("filecrypt", PACKAGE_A, "a" * 64, REASON)
+
+        self.assertEqual([], cooling_crypters(self.shared_state, clock=self.clock))
+
+    def test_an_expired_cooldown_is_not_reported(self):
+        self._cool("filecrypt")
+        cooling = cooling_crypters(self.shared_state, clock=self.clock)
+        self.clock.now = cooling[0]["retry_after_epoch"]
+
+        self.assertEqual([], cooling_crypters(self.shared_state, clock=self.clock))
+
+    def test_legacy_block_mode_reports_nothing(self):
+        self._cool("filecrypt")
+        self.shared_state.values["crypter_block_mode"] = "fail"
+
+        self.assertEqual([], cooling_crypters(self.shared_state, clock=self.clock))
+
+    def test_an_unreadable_or_unknown_row_is_skipped_instead_of_raising(self):
+        self._cool("filecrypt")
+        database = self.shared_state.get_db("crypter_cooldowns")
+        database.rows["not_a_crypter"] = "{}"
+        database.rows["tolink"] = "{not json"
+
+        cooling = cooling_crypters(self.shared_state, clock=self.clock)
+
+        self.assertEqual(["filecrypt"], [row["crypter"] for row in cooling])
 
 
 if __name__ == "__main__":

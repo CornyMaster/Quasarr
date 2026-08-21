@@ -21,6 +21,7 @@ from quasarr.providers.crypter_cooldowns import (
 )
 from quasarr.providers.jd_cache import JDPackageCache
 from quasarr.providers.log import debug, info, trace
+from quasarr.providers.package_origin import forget_package_origin
 from quasarr.providers.terminal_operations import decode_submission_comment
 from quasarr.storage.categories import get_download_category_from_package_id
 
@@ -1221,6 +1222,12 @@ def delete_package(shared_state, package_id, package_title=None, missing_ok=Fals
                     info(f"Deleted package <y>{deleted_title}</y> from DBs")
                     success = True
 
+        if success:
+            # The origin outlives the protected blob on purpose, so nothing
+            # else drops it - a deleted package must not leave its row behind
+            # as the one permanent trace of a release the user removed.
+            forget_package_origin(shared_state, package_id)
+
         return success
 
     except Exception as e:
@@ -1298,6 +1305,7 @@ def delete_database_packages(shared_state, package_ids, expected_type="protected
                 cooldown_service, protected_db, failed_db, package_id
             )
         if reason is None:
+            forget_package_origin(shared_state, package_id)
             deleted.append(package_id)
         else:
             rejected.append({"package_id": package_id, "reason": reason})
